@@ -330,8 +330,8 @@ pub const Note = struct {
 
         pub fn pitch(self: Pitch, accidental: Accidental, octave: i16) RawPitch {
             const value = (octave + 1) * 12 +
-                @intFromEnum(self) +
-                @intFromEnum(accidental);
+                @backingInt(self) +
+                @backingInt(accidental);
 
             std.debug.assert(value >= 0 and value <= 127);
 
@@ -409,7 +409,7 @@ pub const Node = struct {
 
     state: State,
     output_count: u8 = 1,
-    inputs: [max_outlets]Connection = [_]Connection{.{}} ** max_outlets,
+    inputs: [max_outlets]Connection = @splat(.{}),
     cache: Cache = .{},
     process: Process,
 
@@ -478,7 +478,7 @@ pub const Node = struct {
             const output = into[0];
 
             // Get data from each input
-            var inputs = [_]*Buffer{undefined} ** max_outlets;
+            var inputs: [max_outlets]*Buffer = undefined;
             var input_count: usize = 0;
             for (0..inputs.len) |i| {
                 const input = input_outlets[i];
@@ -537,7 +537,7 @@ pub const Node = struct {
             const output = into[0];
 
             // Get data from each input
-            var inputs = [_]*Buffer{undefined} ** max_outlets;
+            var inputs: [max_outlets]*Buffer = undefined;
             var input_count: usize = 0;
             for (0..inputs.len) |i| {
                 const input = input_outlets[i];
@@ -695,8 +695,8 @@ pub const Node = struct {
 
     pub const Mixer = struct {
         gain: f32 = 1,
-        gains: [max_outlets]f32 = [_]f32{1} ** max_outlets,
-        pans: [max_outlets]f32 = [_]f32{0} ** max_outlets,
+        gains: [max_outlets]f32 = @splat(1),
+        pans: [max_outlets]f32 = @splat(0),
 
         pub fn create(mixer: Mixer) Node {
             return .{
@@ -717,11 +717,11 @@ pub const Node = struct {
             const output = into[0];
 
             // Get data from each input
-            var inputs = [_]*Buffer{undefined} ** state.gains.len;
+            var inputs: [state.gains.len]*Buffer = undefined;
             var input_count: usize = 0;
-            var left_gains = [_]f32{0} ** max_outlets;
-            var right_gains = [_]f32{0} ** max_outlets;
-            var mix_gains = [_]f32{0} ** max_outlets;
+            var left_gains: [max_outlets]f32 = @splat(0);
+            var right_gains: [max_outlets]f32 = @splat(0);
+            var mix_gains: [max_outlets]f32 = @splat(0);
             for (0..inputs.len) |i| {
                 const input = input_outlets[i];
                 if (input.isNoop()) continue;

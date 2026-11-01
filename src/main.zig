@@ -146,8 +146,8 @@ fn simpleDSP(dsp: *DSP) !void {
             .{
                 .gain = 0.3,
                 // Both voice at 0.5 gain and first voice 0.5 to the left and second 0.5 to the right
-                .gains = [_]f32{ 0.1, 0.1, 0.6, 0.3 } ++ [_]f32{0} ** (DSP.max_outlets - 4),
-                .pans = [_]f32{ -0.7, 0.7, 0.0, 0.0 } ++ [_]f32{0} ** (DSP.max_outlets - 4),
+                .gains = [_]f32{ 0.1, 0.1, 0.6, 0.3, 0, 0, 0, 0 },
+                .pans = [_]f32{ -0.7, 0.7, 0.0, 0.0, 0, 0, 0, 0 },
             },
         ),
     );

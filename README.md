@@ -1,6 +1,8 @@
 # ZSynth
 
-This is a graph-based DSP: audio processing is built by connecting nodes into a directed graph, allowing oscillators, sequencers, modulation sources, filters, and effects to be composed into a real-time sound pipeline.
+This is a graph-based DSP: audio processing is built by connecting nodes into a
+directed graph, allowing oscillators, sequencers, modulation sources, filters,
+and effects to be composed into a real-time sound pipeline.
 
 ## So far
 
@@ -12,3 +14,11 @@ This is a graph-based DSP: audio processing is built by connecting nodes into a 
 - BitCrusher
 - Noise: white, pink and brown
 - Utility nodes: Add, Multiply, Constant
+
+## TODO
+
+- sampler
+- granular (play tiny amount of samples, seems like a particle system but for
+  audio)
+- pitch shifter
+- resampler
