@@ -4,6 +4,18 @@
     .fingerprint = 0xf94d49bf7096056d,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .zsdl = .{
+            .path = "vendors/zsdl",
+        },
+        .zstbi = .{
+            .path = "vendors/zstbi",
+        },
+        .zpool = .{
+            .path = "vendors/zpool",
+        },
+        .zgui = .{
+            .path = "vendors/zgui",
+        },
         .zaudio = .{
             .url = "git+https://github.com/zig-gamedev/zaudio.git#44ea21152c67c8ba02de5441ac2a5d58c01ad591",
             .hash = "zaudio-0.11.0-dev-_M-91pt8QQDeq8QvBRqa2RZ6EPFLZv2onBXrHaUk9VUS",
