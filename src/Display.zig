@@ -7,43 +7,6 @@ const Assets = @import("assets.zig");
 const Self = @This();
 const assert = std.debug.assert;
 
-// zig fmt: off
-pub const cp437_utf8 = [256][]const u8{
-    "␀", "☺", "☻", "♥", "♦", "♣", "♠", "•",
-    "◘", "○", "◙", "♂", "♀", "♪", "♫", "☼",
-    "►", "◄", "↕", "‼", "¶", "§", "▬", "↨",
-    "↑", "↓", "→", "←", "∟", "↔", "▲", "▼",
-    " ", "!", "\"", "#", "$", "%", "&", "'",
-    "(", ")", "*", "+", ",", "-", ".", "/",
-    "0", "1", "2", "3", "4", "5", "6", "7",
-    "8", "9", ":", ";", "<", "=", ">", "?",
-    "@", "A", "B", "C", "D", "E", "F", "G",
-    "H", "I", "J", "K", "L", "M", "N", "O",
-    "P", "Q", "R", "S", "T", "U", "V", "W",
-    "X", "Y", "Z", "[", "\\", "]", "^", "_",
-    "`", "a", "b", "c", "d", "e", "f", "g",
-    "h", "i", "j", "k", "l", "m", "n", "o",
-    "p", "q", "r", "s", "t", "u", "v", "w",
-    "x", "y", "z", "{", "|", "}", "~", "⌂",
-    "Ç", "ü", "é", "â", "ä", "à", "å", "ç",
-    "ê", "ë", "è", "ï", "î", "ì", "Ä", "Å",
-    "É", "æ", "Æ", "ô", "ö", "ò", "û", "ù",
-    "ÿ", "Ö", "Ü", "¢", "£", "¥", "₧", "ƒ",
-    "á", "í", "ó", "ú", "ñ", "Ñ", "ª", "º",
-    "¿", "⌐", "¬", "½", "¼", "¡", "«", "»",
-    "░", "▒", "▓", "│", "┤", "╡", "╢", "╖",
-    "╕", "╣", "║", "╗", "╝", "╜", "╛", "┐",
-    "└", "┴", "┬", "├", "─", "┼", "╞", "╟",
-    "╚", "╔", "╩", "╦", "╠", "═", "╬", "╧",
-    "╨", "╤", "╥", "╙", "╘", "╒", "╓", "╫",
-    "╪", "┘", "┌", "█", "▄", "▌", "▐", "▀",
-    "α", "ß", "Γ", "π", "Σ", "σ", "µ", "τ",
-    "Φ", "Θ", "Ω", "δ", "∞", "φ", "ε", "∩",
-    "≡", "±", "≥", "≤", "⌠", "⌡", "÷", "≈",
-    "°", "∙", "·", "√", "ⁿ", "²", "■", " ",
-};
-// zig fmt: on
-
 /// Persistent sampler requests used by queued renderer commands.
 const sampler_requests = [_]G.Sampler{.NearestClamp};
 
@@ -186,8 +149,7 @@ pub fn writeWrapped(
     return 0;
 }
 
-/// Count display cells in a string by stripping @RGB...# escape codes.
-/// A doubled ## sequence writes a literal # character.
+/// Count display cells in a string by stripping @RGB escape codes.
 pub fn countStripped(string: []const u8) usize {
     var len: usize = 0;
     var index: usize = 0;
@@ -196,14 +158,6 @@ pub fn countStripped(string: []const u8) usize {
         if (string[index] == '@' and index + 5 <= string.len) {
             // @\x01\xFF\xFF\xFF changes the active color without writing a cell.
             index += 4;
-            continue;
-        }
-
-        if (string[index] == '#') {
-            if (index + 1 < string.len and string[index + 1] == '#') {
-                len += 1;
-                index += 1;
-            }
             continue;
         }
 
@@ -603,7 +557,10 @@ pub const GraphicDisplay = struct {
         var foreground = fg;
         const x = ox;
         var y = oy;
-        var i = @min(self.width - 1, x);
+        if (x >= self.width or y >= self.height)
+            return 0;
+
+        var i = x;
         var s: usize = 0;
         var inc: u32 = 1;
         while (i < self.width and s < str.len and y < self.height) : ({
@@ -630,25 +587,6 @@ pub const GraphicDisplay = struct {
                 }
 
                 s += 5;
-
-                if (s >= str.len)
-                    return y - oy + 1;
-
-                symbol = str[s];
-            }
-
-            // Escape a literal #, since a single # resets inline colors.
-            if (symbol == '#' and s + 1 < str.len and str[s + 1] == '#') {
-                s += 1;
-                symbol = '#';
-            }
-
-            // Reset color
-            else if (symbol == '#') {
-                foreground = fg;
-                background = bg;
-
-                s += 1;
 
                 if (s >= str.len)
                     return y - oy + 1;
@@ -1155,3 +1093,40 @@ pub const Color = struct {
     pub const tab_background_on = Color.amber;
     pub const tab_background_off = Color.port_gore.interpolate(Color.amber, 0.3);
 };
+
+// zig fmt: off
+pub const cp437_utf8 = [256][]const u8{
+    "␀", "☺", "☻", "♥", "♦", "♣", "♠", "•",
+    "◘", "○", "◙", "♂", "♀", "♪", "♫", "☼",
+    "►", "◄", "↕", "‼", "¶", "§", "▬", "↨",
+    "↑", "↓", "→", "←", "∟", "↔", "▲", "▼",
+    " ", "!", "\"", "#", "$", "%", "&", "'",
+    "(", ")", "*", "+", ",", "-", ".", "/",
+    "0", "1", "2", "3", "4", "5", "6", "7",
+    "8", "9", ":", ";", "<", "=", ">", "?",
+    "@", "A", "B", "C", "D", "E", "F", "G",
+    "H", "I", "J", "K", "L", "M", "N", "O",
+    "P", "Q", "R", "S", "T", "U", "V", "W",
+    "X", "Y", "Z", "[", "\\", "]", "^", "_",
+    "`", "a", "b", "c", "d", "e", "f", "g",
+    "h", "i", "j", "k", "l", "m", "n", "o",
+    "p", "q", "r", "s", "t", "u", "v", "w",
+    "x", "y", "z", "{", "|", "}", "~", "⌂",
+    "Ç", "ü", "é", "â", "ä", "à", "å", "ç",
+    "ê", "ë", "è", "ï", "î", "ì", "Ä", "Å",
+    "É", "æ", "Æ", "ô", "ö", "ò", "û", "ù",
+    "ÿ", "Ö", "Ü", "¢", "£", "¥", "₧", "ƒ",
+    "á", "í", "ó", "ú", "ñ", "Ñ", "ª", "º",
+    "¿", "⌐", "¬", "½", "¼", "¡", "«", "»",
+    "░", "▒", "▓", "│", "┤", "╡", "╢", "╖",
+    "╕", "╣", "║", "╗", "╝", "╜", "╛", "┐",
+    "└", "┴", "┬", "├", "─", "┼", "╞", "╟",
+    "╚", "╔", "╩", "╦", "╠", "═", "╬", "╧",
+    "╨", "╤", "╥", "╙", "╘", "╒", "╓", "╫",
+    "╪", "┘", "┌", "█", "▄", "▌", "▐", "▀",
+    "α", "ß", "Γ", "π", "Σ", "σ", "µ", "τ",
+    "Φ", "Θ", "Ω", "δ", "∞", "φ", "ε", "∩",
+    "≡", "±", "≥", "≤", "⌠", "⌡", "÷", "≈",
+    "°", "∙", "·", "√", "ⁿ", "²", "■", " ",
+};
+// zig fmt: on

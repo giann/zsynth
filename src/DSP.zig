@@ -1,6 +1,7 @@
 //! Graph-based small DSP
 const std = @import("std");
 const a = @import("zaudio");
+const Display = @import("Display.zig");
 
 /// Module type containing the DSP graph, node definitions, and audio bridge.
 const DSP = @This();
@@ -52,7 +53,7 @@ pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
     // Install the sentinel node first so every default connection is valid.
     _ = try self.addNode(
         gpa,
-        Node.Noop.create(),
+        Node.Noop.create("noop"),
     );
 
     // Bind the graph source to a sound, leaving playback stopped for the caller.
@@ -84,6 +85,13 @@ pub fn stop(self: *DSP) !void {
     try self.sound.stop();
 }
 
+pub fn toggle(self: *DSP) !void {
+    if (self.sound.isPlaying())
+        try self.sound.stop()
+    else
+        try self.sound.start();
+}
+
 pub fn plug(
     self: *DSP,
     source: Node.Index,
@@ -92,13 +100,28 @@ pub fn plug(
     destination_port: u8,
 ) void {
     // Validate both ends before replacing the destination connection.
-    std.debug.assert(source_output_port < self.nodes.items(.output_count)[source.idx]);
+    const source_tag = std.meta.activeTag(self.nodes.items(.state)[source.idx]);
+    std.debug.assert(source_output_port < node_metadata.get(source_tag).output_count);
     std.debug.assert(destination_port < max_outlets);
 
-    self.nodes.items(.inputs)[destination.idx][destination_port] = .{
+    const inputs = self.nodes.items(.inputs);
+    const output_connected = self.nodes.items(.output_connected);
+    const previous = inputs[destination.idx][destination_port];
+
+    const replacing_same_connection = !previous.isNoop() and
+        previous.node.idx == source.idx and
+        previous.output_port == source_output_port;
+    std.debug.assert(replacing_same_connection or !output_connected[source.idx][source_output_port]);
+
+    if (!previous.isNoop()) {
+        output_connected[previous.node.idx][previous.output_port] = false;
+    }
+
+    inputs[destination.idx][destination_port] = .{
         .node = source,
         .output_port = source_output_port,
     };
+    output_connected[source.idx][source_output_port] = true;
 }
 
 /// Appends a node and returns its stable index in the graph.
@@ -166,7 +189,8 @@ fn getOutput(
 ) !*Buffer {
     // Invalid connections indicate a graph-construction bug.
     std.debug.assert(!connection.isNoop());
-    std.debug.assert(connection.output_port < self.nodes.items(.output_count)[connection.node.idx]);
+    const source_tag = std.meta.activeTag(self.nodes.items(.state)[connection.node.idx]);
+    std.debug.assert(connection.output_port < node_metadata.get(source_tag).output_count);
 
     // Rendering is cached, so repeated requests for this source are cheap.
     try self.renderNode(connection.node, sample_count);
@@ -442,6 +466,15 @@ pub const Note = struct {
 
 /// A processable node in the audio graph.
 pub const Node = struct {
+    /// Static port metadata for a node kind.
+    pub const Metadata = struct {
+        name: []const u8,
+        short_name: []const u8,
+        color: Display.Color,
+        output_count: u8 = 1,
+        input_count: u8 = 1,
+    };
+
     /// Stable index into the DSP node list.
     pub const Index = struct {
         /// Index zero is reserved for the no-op sentinel node.
@@ -488,8 +521,23 @@ pub const Node = struct {
         outputs: []const *Buffer,
     ) ProcessError!void;
 
+    pub const Tag = enum {
+        add,
+        adsr,
+        bit_crusher,
+        constant,
+        mixer,
+        monophonic_sequencer,
+        multimode_filter,
+        multiply,
+        noise,
+        noop,
+        oscillator,
+        output,
+    };
+
     /// Tagged union containing the concrete state for each node kind.
-    pub const State = union(enum) {
+    pub const State = union(Tag) {
         /// Sum node state.
         add: Add,
         /// Envelope generator state.
@@ -518,10 +566,12 @@ pub const Node = struct {
 
     /// Concrete node parameters and mutable runtime state.
     state: State,
-    /// Number of valid output ports.
-    output_count: u8 = 1,
+    /// Display name assigned by the graph owner.
+    name: []const u8,
     /// Connections feeding each input port.
     inputs: [max_outlets]Connection = @splat(.{}),
+    /// Whether each output port is connected to a destination input.
+    output_connected: [max_outlets]bool = @splat(false),
     /// Per-generation output cache.
     cache: Cache = .{},
     /// Function used to render this node's outputs.
@@ -529,10 +579,19 @@ pub const Node = struct {
 
     /// A node that produces silence and represents an unplugged connection.
     pub const Noop = struct {
+        /// Port metadata for the no-op sentinel.
+        pub const metadata = Node.Metadata{
+            .name = "No-op",
+            .short_name = "noop",
+            .color = Display.Color.gray,
+            .input_count = 0,
+        };
+
         /// Creates the graph's no-op sentinel node.
-        pub fn create() Node {
+        pub fn create(name: []const u8) Node {
             return .{
                 .state = .{ .noop = .{} },
+                .name = name,
                 .process = process,
             };
         }
@@ -547,12 +606,20 @@ pub const Node = struct {
 
     /// Root node of the graph; forwards its input into the audio engine.
     pub const Output = struct {
+        /// Port metadata for the graph output node.
+        pub const metadata = Node.Metadata{
+            .name = "Output",
+            .short_name = "out",
+            .color = Display.Color.persimmon,
+        };
+
         /// Creates a graph output node with one input and one output.
-        pub fn create() Node {
+        pub fn create(name: []const u8) Node {
             return .{
                 .state = .{
                     .output = .{},
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -580,12 +647,21 @@ pub const Node = struct {
 
     /// Adds all connected input signals sample by sample.
     pub const Add = struct {
+        /// Port metadata for the addition node.
+        pub const metadata = Node.Metadata{
+            .name = "Add",
+            .short_name = "add",
+            .color = Display.Color.amber,
+            .input_count = max_outlets,
+        };
+
         /// Creates an addition node with all input ports initially unplugged.
-        pub fn create() Node {
+        pub fn create(name: []const u8) Node {
             return .{
                 .state = .{
                     .add = .{},
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -641,12 +717,21 @@ pub const Node = struct {
 
     /// Multiplies all connected input signals sample by sample.
     pub const Multiply = struct {
+        /// Port metadata for the multiplication node.
+        pub const metadata = Node.Metadata{
+            .name = "Multiply",
+            .short_name = "mul",
+            .color = Display.Color.cinnabar,
+            .input_count = max_outlets,
+        };
+
         /// Creates a multiplication node with all input ports initially unplugged.
-        pub fn create() Node {
+        pub fn create(name: []const u8) Node {
             return .{
                 .state = .{
                     .multiply = .{},
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -702,6 +787,14 @@ pub const Node = struct {
 
     /// Emits one constant value on every output sample.
     pub const Constant = struct {
+        /// Port metadata for the constant node.
+        pub const metadata = Node.Metadata{
+            .name = "Constant",
+            .short_name = "cst",
+            .color = Display.Color.golden_rod,
+            .input_count = 0,
+        };
+
         /// User-controlled value emitted by the node.
         pub const Parameters = struct {
             constant: f32 = 0,
@@ -711,11 +804,12 @@ pub const Node = struct {
         parameters: Parameters,
 
         /// Creates a constant node from its output value.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .constant = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -735,6 +829,14 @@ pub const Node = struct {
 
     /// Generates a stereo oscillator with optional frequency and amplitude inputs.
     pub const Oscillator = struct {
+        /// Port metadata for the oscillator node.
+        pub const metadata = Node.Metadata{
+            .name = "Oscillator",
+            .short_name = "osc",
+            .color = Display.Color.curious_blue,
+            .input_count = 2,
+        };
+
         /// Available periodic wave shapes.
         pub const Waveform = enum {
             /// Sine wave.
@@ -768,11 +870,12 @@ pub const Node = struct {
         phase: f32 = 0,
 
         /// Creates an oscillator with a reset phase accumulator.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .oscillator = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -855,6 +958,14 @@ pub const Node = struct {
 
     /// Mixes up to `max_outlets` stereo inputs with gain and pan controls.
     pub const Mixer = struct {
+        /// Port metadata for the mixer node.
+        pub const metadata = Node.Metadata{
+            .name = "Mixer",
+            .short_name = "mix",
+            .color = Display.Color.cerulean,
+            .input_count = max_outlets,
+        };
+
         /// User-controlled mix configuration.
         pub const Parameters = struct {
             /// Master gain applied after summing all inputs.
@@ -869,11 +980,12 @@ pub const Node = struct {
         parameters: Parameters,
 
         /// Creates a mixer from its gain and pan configuration.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .mixer = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -961,6 +1073,15 @@ pub const Node = struct {
 
     /// Emits frequency, gate, and velocity signals from a monophonic note sequence.
     pub const MonophonicSequencer = struct {
+        /// Port metadata for the monophonic sequencer node.
+        pub const metadata = Node.Metadata{
+            .name = "Monophonic Sequencer",
+            .short_name = "seq",
+            .color = Display.Color.feijoa,
+            .input_count = 0,
+            .output_count = 3,
+        };
+
         /// Number of ticks in one quarter note.
         pub const quarter_note_ticks = 960;
 
@@ -984,12 +1105,12 @@ pub const Node = struct {
         last_frequency: f32 = 0,
 
         /// Creates a three-output sequencer with reset playback state.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
-                .output_count = 3,
                 .state = .{
                     .monophonic_sequencer = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -1098,6 +1219,14 @@ pub const Node = struct {
 
     /// Envelope generator driven by a gate signal and optional velocity signal.
     pub const ADSR = struct {
+        /// Port metadata for the envelope node.
+        pub const metadata = Node.Metadata{
+            .name = "ADSR",
+            .short_name = "adsr",
+            .color = Display.Color.fuschia_pink,
+            .input_count = 2,
+        };
+
         /// Curves available for attack, decay, and release transitions.
         pub const Curve = enum {
             /// Constant-rate transition.
@@ -1155,11 +1284,12 @@ pub const Node = struct {
         velocity: f32 = 1,
 
         /// Creates an envelope with an idle runtime state.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .adsr = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -1339,6 +1469,14 @@ pub const Node = struct {
 
     /// Chamberlin-style state-variable filter with runtime cutoff modulation.
     pub const MultimodeFilter = struct {
+        /// Port metadata for the multimode filter node.
+        pub const metadata = Node.Metadata{
+            .name = "Multimode Filter",
+            .short_name = "mmf",
+            .color = Display.Color.havelock_blue,
+            .input_count = 3,
+        };
+
         /// Output response selected by the filter.
         pub const Type = enum {
             /// Attenuates frequencies below the cutoff.
@@ -1369,11 +1507,12 @@ pub const Node = struct {
         band: [2]f32 = .{ 0, 0 },
 
         /// Creates a filter with reset integrator state.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .multimode_filter = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -1455,6 +1594,13 @@ pub const Node = struct {
 
     /// Reduces sample rate and bit depth to create a lo-fi effect.
     pub const BitCrusher = struct {
+        /// Port metadata for the bit-crusher node.
+        pub const metadata = Node.Metadata{
+            .name = "Bit Crusher",
+            .short_name = "bcr",
+            .color = Display.Color.desert,
+        };
+
         /// User-controlled reduction settings.
         pub const Parameters = struct {
             /// Target rate at which new stereo frames are captured.
@@ -1471,11 +1617,12 @@ pub const Node = struct {
         held_frames: u32 = 0,
 
         /// Creates a bit crusher with an empty held frame.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .bit_crusher = .{ .parameters = parameters },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -1528,6 +1675,13 @@ pub const Node = struct {
 
     /// Generates white, pink, or brown stereo noise with amplitude modulation.
     pub const Noise = struct {
+        /// Port metadata for the noise node.
+        pub const metadata = Node.Metadata{
+            .name = "Noise",
+            .short_name = "noi",
+            .color = Display.Color.logan,
+        };
+
         /// Available noise colors.
         pub const Type = enum {
             /// Unfiltered random noise.
@@ -1561,7 +1715,7 @@ pub const Node = struct {
         brown_state: [2]f32 = .{ 0, 0 },
 
         /// Creates a deterministic noise source with reset color-filter state.
-        pub fn create(parameters: Parameters) Node {
+        pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
                     .noise = .{
@@ -1569,6 +1723,7 @@ pub const Node = struct {
                         .random = std.Random.DefaultPrng.init(parameters.seed),
                     },
                 },
+                .name = name,
                 .process = process,
             };
         }
@@ -1637,3 +1792,20 @@ pub const Node = struct {
         }
     };
 };
+
+/// Static port metadata for every node kind.
+pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
+    .init(.{
+    .add = Node.Add.metadata,
+    .adsr = Node.ADSR.metadata,
+    .bit_crusher = Node.BitCrusher.metadata,
+    .constant = Node.Constant.metadata,
+    .mixer = Node.Mixer.metadata,
+    .monophonic_sequencer = Node.MonophonicSequencer.metadata,
+    .multimode_filter = Node.MultimodeFilter.metadata,
+    .multiply = Node.Multiply.metadata,
+    .noise = Node.Noise.metadata,
+    .noop = Node.Noop.metadata,
+    .oscillator = Node.Oscillator.metadata,
+    .output = Node.Output.metadata,
+});

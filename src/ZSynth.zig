@@ -28,6 +28,20 @@ pub const CursorState = struct {
     relative_mode: bool = false,
     /// Whether the software cursor should be written to the display.
     visible: bool = false,
+    /// Whether the transparent cursor overlay needs to be rebuilt.
+    dirty: bool = false,
+    /// Whether the middle mouse button is currently panning the viewport.
+    middle_mouse_down: bool = false,
+    /// Fractional viewport-cell movement retained between mouse events.
+    viewport_pan_remainder: [2]f32 = .{ 0, 0 },
+    /// Whether the left mouse button is currently held for a drag.
+    left_mouse_down: bool = false,
+    /// Whether the pointer moved far enough during the current left drag.
+    left_mouse_moved: bool = false,
+    /// World/display-cell offset from the grabbed object to the pointer.
+    drag_offset: [2]i32 = .{ 0, 0 },
+    /// Last world/display-cell position observed during the drag.
+    drag_position: [2]i32 = .{ 0, 0 },
 };
 
 /// The I/O context shared with the renderer and asset loader.
@@ -38,8 +52,10 @@ audio_engine: *audio.Engine,
 renderer: Renderer,
 /// Character-grid display written by application states.
 display: Display,
+/// Transparent character-grid display used for transient UI overlays.
+ui_display: Display,
 /// Post-processing passes applied in order before presentation.
-post_processing: [3]PostProcessing,
+post_processing: []PostProcessing,
 /// Stack containing the active application state contexts.
 state_stack: StateStack,
 /// Software cursor state, including its position and visibility.
@@ -92,31 +108,20 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
         },
     };
 
-    // Build the ordered sharpen, bloom, and grain post-processing chain.
-    var post_processing: [3]PostProcessing = undefined;
-
-    post_processing[0] = try PostProcessing.sharpenProcess(
-        allocator,
-        &renderer,
-        0.50,
-        screen_width,
-        screen_height,
-    );
-    post_processing[1] = try PostProcessing.bloomProcess(
-        allocator,
-        &renderer,
-        0.85,
-        0.35,
-        screen_width,
-        screen_height,
-    );
-    post_processing[2] = try PostProcessing.grainProcess(
-        allocator,
-        &renderer,
-        .{},
-        screen_width,
-        screen_height,
-    );
+    var ui_display = Display{
+        .impl = .{
+            .graphic = try Display.GraphicDisplay.init(
+                allocator,
+                &renderer,
+                .{
+                    .sheet_asset = .giann_shaded,
+                    .render_width = screen_width,
+                    .render_height = screen_height,
+                },
+            ),
+        },
+    };
+    ui_display.resetTransparent();
 
     // Allocate the state stack before the first editor state is pushed.
     const state_stack = try StateStack.init(allocator);
@@ -129,7 +134,34 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
         .audio_engine = audio_engine,
         .renderer = renderer,
         .display = display,
-        .post_processing = post_processing,
+        .ui_display = ui_display,
+        .post_processing = try allocator.dupe(
+            PostProcessing,
+            &.{
+                try PostProcessing.sharpenProcess(
+                    allocator,
+                    &renderer,
+                    0.50,
+                    screen_width,
+                    screen_height,
+                ),
+                // try PostProcessing.bloomProcess(
+                //     allocator,
+                //     &renderer,
+                //     0.85,
+                //     0.35,
+                //     screen_width,
+                //     screen_height,
+                // ),
+                try PostProcessing.grainProcess(
+                    allocator,
+                    &renderer,
+                    .{},
+                    screen_width,
+                    screen_height,
+                ),
+            },
+        ),
         .state_stack = state_stack,
     };
     // Seed the cursor at the center until the first motion event arrives.
@@ -143,7 +175,21 @@ pub fn start(self: *Self, allocator: std.mem.Allocator) !void {
     _ = try self.state_stack.push(
         allocator,
         .{
-            .context = .{ .synth_editor = .{ .zsynth = self } },
+            .context = .{
+                .synth_editor = .{
+                    .zsynth = self,
+                    .dsp = undefined,
+                    .space = .{
+                        .dsp = undefined,
+                        .viewport = .{
+                            .x = @as(i32, @intCast(self.display.impl.graphic.width / 2)) * -1,
+                            .y = @as(i32, @intCast(self.display.impl.graphic.height / 2)) * -1,
+                            .width = self.display.impl.graphic.width,
+                            .height = self.display.impl.graphic.height,
+                        },
+                    },
+                },
+            },
             .vtable = &SynthEditor.vtable,
         },
     );
@@ -175,21 +221,30 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
                 break;
             }
 
+            // Let states inspect the raw event before typed callbacks receive it.
+            const input_consumed = try self.state_stack.inputEvent(allocator, event);
+
             // Update the software cursor from every motion event.
             if (event.type == .mouse_motion)
                 self.updateMousePosition(event.motion);
 
-            // Keep the fullscreen shortcut at the application level.
-            if (event.type == .key_down and
-                event.key.key == .f and
-                !event.key.repeat and
-                (@backingInt(event.key.mod) & sdl.Keymod.ctrl) != 0)
-            {
-                try self.renderer.toggleFullscreen();
-            }
-
-            // Give enabled states the opportunity to consume the event.
-            _ = try self.state_stack.inputEvent(allocator, event);
+            if (!input_consumed) switch (event.type) {
+                .key_down, .key_up => {
+                    // Keep the fullscreen shortcut at the application level.
+                    if (event.type == .key_down and
+                        event.key.key == .f and
+                        !event.key.repeat and
+                        (@backingInt(event.key.mod) & sdl.Keymod.ctrl) != 0)
+                    {
+                        try self.renderer.toggleFullscreen();
+                    } else {
+                        try self.state_stack.keyUpDown(allocator, event.key);
+                    }
+                },
+                .mouse_motion => try self.state_stack.mouseMoved(allocator, event.motion),
+                .mouse_button_down, .mouse_button_up => try self.state_stack.mouseButton(allocator, event.button),
+                else => {},
+            };
         }
         // Quit states cleanly when SDL reports that the window closed.
         if (should_quit) {
@@ -203,9 +258,17 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
         try self.state_stack.render(allocator, &self.renderer, frame_delta);
         // Overlay the software cursor after the state has redrawn its display.
         try self.writeCursor(allocator);
+        // Composite the transparent UI overlay above the regular display.
+        if (self.ui_display.impl == .graphic)
+            try self.ui_display.impl.graphic.render(
+                allocator,
+                &self.renderer,
+                frame_delta,
+                true,
+            );
 
         // Run every post-processing pass, marking the final pass for presentation.
-        for (&self.post_processing, 0..) |*post, index|
+        for (self.post_processing, 0..) |*post, index|
             try post.render(
                 post,
                 allocator,
@@ -226,11 +289,14 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     // Give the active state a chance to release its DSP graph.
     self.state_stack.quit(allocator, &self.renderer) catch @panic("Could not quit state stack");
     // Destroy post-processing resources before the renderer they reference.
-    for (&self.post_processing) |*post|
+    for (self.post_processing) |*post|
         post.deinit(&self.renderer);
+    allocator.free(self.post_processing);
     // Destroy the display's GPU resources while the renderer is still alive.
     if (self.display.impl == .graphic)
         self.display.impl.graphic.deinit(allocator, &self.renderer);
+    if (self.ui_display.impl == .graphic)
+        self.ui_display.impl.graphic.deinit(allocator, &self.renderer);
     // Release the renderer, GUI backend, and SDL services in dependency order.
     self.renderer.deinit(allocator);
     zgui.deinit();
@@ -257,10 +323,15 @@ fn initializeCursorPosition(self: *Self) void {
     self.cursor.initialized = true;
     self.cursor.relative_mode = self.renderer.relative_mouse_mode;
     self.cursor.visible = true;
+    self.cursor.dirty = true;
 }
 
 /// Updates and clamps the software cursor from an SDL mouse-motion event.
 fn updateMousePosition(self: *Self, event: sdl.MouseMotionEvent) void {
+    const previous_position = self.cursor.position;
+    const previous_relative_mode = self.cursor.relative_mode;
+    const was_initialized = self.cursor.initialized;
+
     // Detect relative-mode changes before choosing absolute or relative motion.
     const relative_mode = self.renderer.relative_mouse_mode;
     if (!self.cursor.initialized or self.cursor.relative_mode != relative_mode) {
@@ -294,16 +365,85 @@ fn updateMousePosition(self: *Self, event: sdl.MouseMotionEvent) void {
             0,
             @as(f32, @floatFromInt(window_height - 1)),
         );
+
+    if (!was_initialized or
+        previous_relative_mode != self.cursor.relative_mode or
+        previous_position[0] != self.cursor.position[0] or
+        previous_position[1] != self.cursor.position[1])
+        self.cursor.dirty = true;
+}
+
+/// Convert a window-space position to a cell in the regular display.
+pub fn displayCellAtWindowPosition(self: *Self, position: [2]f32) ?[2]u32 {
+    if (self.display.impl != .graphic) return null;
+
+    const display = &self.display.impl.graphic;
+    var window_width: c_int = 0;
+    var window_height: c_int = 0;
+    sdl.getWindowSize(self.renderer.window, &window_width, &window_height) catch return null;
+    if (window_width <= 0 or window_height <= 0) return null;
+
+    const source_aspect = @as(f32, @floatFromInt(self.renderer.screen_width)) /
+        @as(f32, @floatFromInt(self.renderer.screen_height));
+    const window_aspect = @as(f32, @floatFromInt(window_width)) /
+        @as(f32, @floatFromInt(window_height));
+    var viewport_x: f32 = 0;
+    var viewport_y: f32 = 0;
+    var viewport_width: f32 = @floatFromInt(window_width);
+    var viewport_height: f32 = @floatFromInt(window_height);
+
+    if (window_aspect > source_aspect) {
+        viewport_width = @as(f32, @floatFromInt(window_height)) * source_aspect;
+        viewport_x = (@as(f32, @floatFromInt(window_width)) - viewport_width) / 2.0;
+    } else {
+        viewport_height = @as(f32, @floatFromInt(window_width)) / source_aspect;
+        viewport_y = (@as(f32, @floatFromInt(window_height)) - viewport_height) / 2.0;
+    }
+
+    if (position[0] < viewport_x or
+        position[1] < viewport_y or
+        position[0] >= viewport_x + viewport_width or
+        position[1] >= viewport_y + viewport_height)
+        return null;
+
+    const source_x = (position[0] - viewport_x) *
+        @as(f32, @floatFromInt(self.renderer.screen_width)) / viewport_width;
+    const source_y = (position[1] - viewport_y) *
+        @as(f32, @floatFromInt(self.renderer.screen_height)) / viewport_height;
+    const cell_width = display.cell_width * display.scale;
+    const cell_height = display.cell_height * display.scale;
+    const origin_x = display.content_origin_x * display.scale;
+    const origin_y = display.content_origin_y * display.scale;
+    if (cell_width == 0 or cell_height == 0 or
+        source_x < @as(f32, @floatFromInt(origin_x)) or
+        source_y < @as(f32, @floatFromInt(origin_y)))
+        return null;
+
+    const cell_x: u32 = @intFromFloat((source_x - @as(f32, @floatFromInt(origin_x))) /
+        @as(f32, @floatFromInt(cell_width)));
+    const cell_y: u32 = @intFromFloat((source_y - @as(f32, @floatFromInt(origin_y))) /
+        @as(f32, @floatFromInt(cell_height)));
+    if (cell_x >= display.width or cell_y >= display.height)
+        return null;
+
+    return .{ cell_x, cell_y };
 }
 
 /// Converts the window-space cursor position to a display cell and draws it.
 fn writeCursor(self: *Self, allocator: std.mem.Allocator) !void {
+    // Rebuild the transparent overlay whenever the cursor moved, including
+    // moves outside the logical display so the old cursor is cleared.
+    if (self.cursor.dirty) {
+        self.ui_display.resetTransparent();
+        self.cursor.dirty = false;
+    }
+
     // Only draw the cursor when the software cursor and graphic display exist.
-    if (!self.cursor.visible or self.display.impl != .graphic)
+    if (!self.cursor.visible or self.ui_display.impl != .graphic)
         return;
 
     // Read the current window size before mapping pixels to logical coordinates.
-    const display = &self.display.impl.graphic;
+    const display = &self.ui_display.impl.graphic;
     var window_width: c_int = 0;
     var window_height: c_int = 0;
     try sdl.getWindowSize(self.renderer.window, &window_width, &window_height);
@@ -360,5 +500,12 @@ fn writeCursor(self: *Self, allocator: std.mem.Allocator) !void {
         return;
 
     // Write the cursor glyph after the state's display content is complete.
-    try self.display.write(allocator, "+", cell_x, cell_y, .mine_shaft, .green_pea);
+    try self.ui_display.write(
+        allocator,
+        "+",
+        cell_x,
+        cell_y,
+        .green_pea,
+        .mine_shaft,
+    );
 }

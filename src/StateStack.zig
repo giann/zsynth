@@ -116,6 +116,48 @@ pub fn inputEvent(self: *Self, gpa: std.mem.Allocator, event: sdl.Event) !bool {
     return false;
 }
 
+/// Dispatches a keyboard event from the topmost enabled state downward.
+pub fn keyUpDown(self: *Self, gpa: std.mem.Allocator, event: sdl.KeyboardEvent) !void {
+    var index = self.stack.len;
+    while (index > 0) : (index -= 1) {
+        if (!self.stack.items(.enabled)[index - 1]) continue;
+        if (try self.stack.items(.vtable)[index - 1].keyUpDown(
+            self,
+            gpa,
+            .{ .idx = index - 1 },
+            event,
+        )) return;
+    }
+}
+
+/// Dispatches mouse motion from the topmost enabled state downward.
+pub fn mouseMoved(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseMotionEvent) !void {
+    var index = self.stack.len;
+    while (index > 0) : (index -= 1) {
+        if (!self.stack.items(.enabled)[index - 1]) continue;
+        if (try self.stack.items(.vtable)[index - 1].mouseMoved(
+            self,
+            gpa,
+            .{ .idx = index - 1 },
+            event,
+        )) return;
+    }
+}
+
+/// Dispatches a mouse-button event from the topmost enabled state downward.
+pub fn mouseButton(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseButtonEvent) !void {
+    var index = self.stack.len;
+    while (index > 0) : (index -= 1) {
+        if (!self.stack.items(.enabled)[index - 1]) continue;
+        if (try self.stack.items(.vtable)[index - 1].mouseButton(
+            self,
+            gpa,
+            .{ .idx = index - 1 },
+            event,
+        )) return;
+    }
+}
+
 /// A state context and the callbacks that operate on it.
 pub const State = struct {
     /// Stable index of a state while it remains in the stack.
@@ -159,6 +201,15 @@ pub const State = struct {
         fn defaultInputEvent(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.Event) anyerror!bool {
             return false;
         }
+        fn defaultKeyUpDown(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.KeyboardEvent) anyerror!bool {
+            return false;
+        }
+        fn defaultMouseMoved(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.MouseMotionEvent) anyerror!bool {
+            return false;
+        }
+        fn defaultMouseButton(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.MouseButtonEvent) anyerror!bool {
+            return false;
+        }
 
         /// Called when the state enters the stack.
         enter: *const fn (*Self, std.mem.Allocator, Index) anyerror!void = defaultEnter,
@@ -172,5 +223,11 @@ pub const State = struct {
         render: *const fn (*Self, std.mem.Allocator, Index, *Renderer, u64) anyerror!void = defaultRender,
         /// Called for input events from the topmost state downward.
         inputEvent: *const fn (*Self, std.mem.Allocator, Index, sdl.Event) anyerror!bool = defaultInputEvent,
+        /// Called for key-down and key-up events that were not consumed raw.
+        keyUpDown: *const fn (*Self, std.mem.Allocator, Index, sdl.KeyboardEvent) anyerror!bool = defaultKeyUpDown,
+        /// Called for mouse-motion events that were not consumed raw.
+        mouseMoved: *const fn (*Self, std.mem.Allocator, Index, sdl.MouseMotionEvent) anyerror!bool = defaultMouseMoved,
+        /// Called for mouse-button events that were not consumed raw.
+        mouseButton: *const fn (*Self, std.mem.Allocator, Index, sdl.MouseButtonEvent) anyerror!bool = defaultMouseButton,
     };
 };
