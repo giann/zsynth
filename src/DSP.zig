@@ -2,33 +2,40 @@
 const std = @import("std");
 const a = @import("zaudio");
 
+/// Module type containing the DSP graph, node definitions, and audio bridge.
 const DSP = @This();
 
+/// Maximum number of interleaved stereo samples rendered in one graph block.
 pub const block_size = 256;
+/// Maximum number of input or output ports exposed by a node.
 pub const max_outlets = 8;
 
-/// Audio engine, not owned by this
+/// Audio engine used to create and control the graph's live sound source.
+/// The engine is owned by the application and must outlive this DSP.
 engine: *a.Engine,
 
-/// Sample rate of audio engine (48kHz)
+/// Sample rate of the audio engine, normally 48 kHz.
 sample_rate: u32,
-/// Graph entry point node
+/// Node whose first output is copied to the audio device.
 output: Node.Index = .{ .idx = 1 },
-/// List of audio nodes
+/// Struct-of-arrays storage for all graph nodes.
 nodes: std.MultiArrayList(Node) = .empty,
 
 /// Generation of the currently rendered audio block.
 render_generation: u64 = 0,
 
-/// DataSource bound this DSP
+/// Audio-library data source that requests rendered graph blocks.
 graph_data_source: GraphDataSource,
 
-/// zaudio Sound in which the DSP is streaming
+/// Audio-library sound backed by `graph_data_source`.
 sound: *a.Sound,
 
+/// Initializes the graph, its live data source, and the audio sound.
 pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
+    // Capture the engine's format so every node renders at the device rate.
     const sample_rate = engine.getSampleRate();
 
+    // Initialize graph-owned fields before creating dependent resources.
     self.* = DSP{
         .engine = engine,
         .sample_rate = sample_rate,
@@ -36,17 +43,19 @@ pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
         .sound = undefined,
     };
 
+    // Create the stereo pull source consumed by the audio library.
     try self.graph_data_source.init(
         2,
         sample_rate,
     );
 
-    // All unplugged stuff point to this thing that does nothing
+    // Install the sentinel node first so every default connection is valid.
     _ = try self.addNode(
         gpa,
         Node.Noop.create(),
     );
 
+    // Bind the graph source to a sound, leaving playback stopped for the caller.
     self.sound = try self.engine.createSoundFromDataSource(
         self.graph_data_source.data_source,
         .{},
@@ -54,17 +63,23 @@ pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
     );
 }
 
+/// Stops and releases every audio resource owned by the graph.
 pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
+    // Stop playback before releasing the sound and its callback source.
     self.sound.stop() catch {};
     self.sound.destroy();
+    // Tear down the callback source before freeing graph storage.
     self.graph_data_source.deinit();
+    // Release all node allocations using the allocator supplied at init time.
     self.nodes.deinit(gpa);
 }
 
+/// Starts streaming rendered graph audio to the sound device.
 pub fn start(self: *DSP) !void {
     try self.sound.start();
 }
 
+/// Stops streaming graph audio without destroying the graph.
 pub fn stop(self: *DSP) !void {
     try self.sound.stop();
 }
@@ -76,6 +91,7 @@ pub fn plug(
     destination: Node.Index,
     destination_port: u8,
 ) void {
+    // Validate both ends before replacing the destination connection.
     std.debug.assert(source_output_port < self.nodes.items(.output_count)[source.idx]);
     std.debug.assert(destination_port < max_outlets);
 
@@ -85,59 +101,74 @@ pub fn plug(
     };
 }
 
+/// Appends a node and returns its stable index in the graph.
 pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     try self.nodes.append(gpa, node);
 
     return .{ .idx = self.nodes.len - 1 };
 }
 
+/// Renders one interleaved stereo block into the audio callback buffer.
 fn stream(self: *DSP, into: []f32) !void {
+    // The callback may request a short block, but never more than one block.
     std.debug.assert(into.len <= block_size * 2);
     std.debug.assert(into.len % 2 == 0);
 
+    // A new generation invalidates all node caches from the previous block.
     self.render_generation += 1;
+    // Render only the configured output; dependencies are evaluated lazily.
     try self.renderNode(self.output, @intCast(into.len));
 
+    // Copy the completed graph output to the audio library's destination.
     const output_buffer = &self.nodes.items(.cache)[self.output.idx].outputs[0];
     @memcpy(into, output_buffer.samples[0..into.len]);
 }
 
+/// Evaluates one node and all of its dependencies for the requested sample count.
 fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     const cache = &self.nodes.items(.cache)[node.idx];
 
+    // Reuse a result already rendered during this generation and block size.
     if (cache.generation == self.render_generation and
         cache.sample_count == sample_count)
         return;
 
+    // Clear every output so partially written ports cannot expose stale audio.
     const active_sample_count: usize = @intCast(sample_count);
     for (&cache.outputs) |*output| {
         output.sample_count = sample_count;
         @memset(output.samples[0..active_sample_count], 0);
     }
 
+    // Adapt inline cache storage to the process callback's slice interface.
     var outputs: [max_outlets]*Buffer = undefined;
     for (&cache.outputs, 0..) |*output, i| {
         outputs[i] = output;
     }
 
+    // The node recursively requests any connected inputs during processing.
     try self.nodes.items(.process)[node.idx](
         self,
         node,
         outputs[0..],
     );
 
+    // Publish the completed cache only after processing succeeds.
     cache.sample_count = sample_count;
     cache.generation = self.render_generation;
 }
 
+/// Resolves a connection by rendering its source and returning the requested port.
 fn getOutput(
     self: *DSP,
     connection: Node.Connection,
     sample_count: u32,
 ) !*Buffer {
+    // Invalid connections indicate a graph-construction bug.
     std.debug.assert(!connection.isNoop());
     std.debug.assert(connection.output_port < self.nodes.items(.output_count)[connection.node.idx]);
 
+    // Rendering is cached, so repeated requests for this source are cheap.
     try self.renderNode(connection.node, sample_count);
 
     return &self.nodes.items(.cache)[connection.node.idx].outputs[
@@ -145,16 +176,24 @@ fn getOutput(
     ];
 }
 
+/// Releases the data-source wrapper without freeing the application-owned base.
 // Needed because zaudio.DataSource.destroy() assumes zaudio-owned allocation but base is owned on our side
 extern fn ma_data_source_uninit(source: *a.DataSource) void;
 
+/// Bridges the pull-based audio callback to the pull-based DSP graph renderer.
 const GraphDataSource = struct {
+    /// Embedded base required by the audio-library data-source ABI.
     base: a.DataSourceBase,
+    /// Opaque data-source handle passed to the audio library.
     data_source: *a.DataSource,
+    /// Number of channels exposed to the audio library.
     channels: u32,
+    /// Sample rate exposed to the audio library.
     sample_rate: u32,
+    /// Number of frames successfully delivered so far.
     cursor: u64 = 0,
 
+    /// Callback table installed on the audio-library data source.
     const vtable = a.DataSource.VTable{
         .onRead = onRead,
         .onSeek = onSeek,
@@ -165,11 +204,13 @@ const GraphDataSource = struct {
         .flags = .{},
     };
 
+    /// Creates the audio-library data source around this wrapper.
     pub fn init(
         self: *GraphDataSource,
         channels: u32,
         sample_rate: u32,
     ) !void {
+        // Reset callback-visible state before handing the wrapper to the library.
         self.* = .{
             .base = undefined,
             .data_source = undefined,
@@ -177,16 +218,19 @@ const GraphDataSource = struct {
             .sample_rate = sample_rate,
         };
 
+        // Register the static callback table and allocate the opaque handle.
         var config = a.DataSource.Config.init();
         config.vtable = &vtable;
 
         self.data_source = try a.DataSource.create(config, &self.base);
     }
 
+    /// Uninitializes the audio-library data source.
     pub fn deinit(self: *GraphDataSource) void {
         ma_data_source_uninit(self.data_source);
     }
 
+    /// Recovers the containing wrapper from an audio-library callback handle.
     fn fromDataSource(data_source: *a.DataSource) *GraphDataSource {
         return @fieldParentPtr(
             "base",
@@ -197,6 +241,7 @@ const GraphDataSource = struct {
         );
     }
 
+    /// Fills the callback buffer by rendering one or more bounded graph blocks.
     fn onRead(
         ds: *a.DataSource,
         frames_out: ?*anyopaque,
@@ -206,25 +251,28 @@ const GraphDataSource = struct {
         const self = fromDataSource(ds);
         const dsp: *DSP = @fieldParentPtr("graph_data_source", self);
 
-        // This source is live and does not support seeking.
+        // A null destination is a size/query request unsupported by this live source.
         if (frames_out == null)
             return .not_implemented;
 
         const output: [*]f32 = @ptrCast(@alignCast(frames_out.?));
 
-        // This must fill exactly frame_count frames.
+        // This source is stereo and must fill exactly the requested frame count.
         if (self.channels != 2)
             return .invalid_args;
 
+        // Split large audio-library requests into graph-sized chunks.
         var remaining_frames: usize = @intCast(frame_count);
         var offset_samples: usize = 0;
         while (remaining_frames > 0) {
+            // Convert the selected frame count to interleaved sample count.
             const chunk_frames: usize = if (remaining_frames < block_size)
                 remaining_frames
             else
                 block_size;
             const chunk_samples = chunk_frames * 2;
 
+            // Render directly into the corresponding callback-buffer slice.
             dsp.stream(
                 output[offset_samples .. offset_samples + chunk_samples],
             ) catch |err| {
@@ -233,16 +281,19 @@ const GraphDataSource = struct {
                 return .generic_error;
             };
 
+            // Advance both counters after a successful chunk.
             remaining_frames -= chunk_frames;
             offset_samples += chunk_samples;
         }
 
+        // Report the complete request only after every chunk succeeded.
         self.cursor += frame_count;
         frames_read.* = frame_count;
 
         return .success;
     }
 
+    /// Rejects seeking because this data source represents a live graph.
     fn onSeek(
         _: *a.DataSource,
         _: u64,
@@ -250,6 +301,7 @@ const GraphDataSource = struct {
         return .not_implemented;
     }
 
+    /// Reports the fixed float32 stereo format and sample rate.
     fn onGetDataFormat(
         ds: *a.DataSource,
         format: ?*a.Format,
@@ -260,6 +312,7 @@ const GraphDataSource = struct {
     ) callconv(.c) a.Result {
         const self = fromDataSource(ds);
 
+        // Each optional output is independently supported by the callback ABI.
         if (format) |value| value.* = .float32;
         if (channels) |value| value.* = self.channels;
         if (sample_rate) |value| value.* = self.sample_rate;
@@ -267,6 +320,7 @@ const GraphDataSource = struct {
         return .success;
     }
 
+    /// Reports the number of frames already produced.
     fn onGetCursor(
         ds: *a.DataSource,
         cursor: ?*u64,
@@ -277,6 +331,7 @@ const GraphDataSource = struct {
         return .success;
     }
 
+    /// Reports no finite length because the graph is a live source.
     fn onGetLength(
         _: *a.DataSource,
         _: ?*u64,
@@ -285,6 +340,7 @@ const GraphDataSource = struct {
         return .not_implemented;
     }
 
+    /// Accepts the looping setting because the live source has no finite loop.
     fn onSetLooping(
         _: *a.DataSource,
         _: a.Bool32,
@@ -293,58 +349,84 @@ const GraphDataSource = struct {
     }
 };
 
+/// Fixed-size interleaved audio storage used for node outputs.
 const Buffer = struct {
+    /// Stereo-interleaved samples, with capacity for one graph block.
     samples: [block_size * 2]f32,
-    // Number of valid interleaved f32 samples in `samples`.
+    /// Number of valid interleaved samples in `samples`.
     sample_count: u32 = block_size * 2,
 
+    /// Creates a buffer and fills its complete capacity with one value.
     pub fn init(default: f32, sample_count: u32) Buffer {
         var buffer = Buffer{
             .samples = undefined,
             .sample_count = sample_count,
         };
 
+        // Initialize the entire capacity so unused portions are deterministic.
         @memset(buffer.samples[0..], default);
 
         return buffer;
     }
 };
 
+/// Musical note data consumed by a monophonic sequencer.
 pub const Note = struct {
+    /// MIDI-compatible seven-bit pitch representation.
     pub const RawPitch = u7;
 
+    /// Semitone offset applied to a natural pitch.
     pub const Accidental = enum(i8) {
+        /// One semitone below the natural pitch.
         flat = -1,
+        /// The natural pitch with no offset.
         natural = 0,
+        /// One semitone above the natural pitch.
         sharp = 1,
     };
 
+    /// Natural note names represented as semitone offsets within an octave.
     pub const Pitch = enum(i8) {
+        /// C natural.
         c = 0,
+        /// D natural.
         d = 2,
+        /// E natural.
         e = 4,
+        /// F natural.
         f = 5,
+        /// G natural.
         g = 7,
+        /// A natural.
         a = 9,
+        /// B natural.
         b = 11,
 
+        /// Converts a note name, accidental, and octave into a MIDI pitch.
         pub fn pitch(self: Pitch, accidental: Accidental, octave: i16) RawPitch {
+            // Combine octave, natural pitch, and accidental into a MIDI number.
             const value = (octave + 1) * 12 +
                 @backingInt(self) +
                 @backingInt(accidental);
 
+            // Reject values outside the representable MIDI range.
             std.debug.assert(value >= 0 and value <= 127);
 
+            // The assertion makes this narrowing conversion safe.
             return @intCast(value);
         }
     };
 
-    /// null means rest
+    /// MIDI pitch, or null for a rest.
     pitch: ?RawPitch,
+    /// Tick at which the note begins.
     start_tick: u64,
+    /// Duration of the note in ticks.
     duration_ticks: u64,
+    /// Normalized note velocity.
     velocity: f32 = 1,
 
+    /// Converts the MIDI pitch to frequency in hertz.
     fn frequency(self: Note) f32 {
         return if (self.pitch) |pitch|
             440 *
@@ -358,63 +440,96 @@ pub const Note = struct {
     }
 };
 
+/// A processable node in the audio graph.
 pub const Node = struct {
+    /// Stable index into the DSP node list.
     pub const Index = struct {
+        /// Index zero is reserved for the no-op sentinel node.
         pub const noop = Index{ .idx = 0 };
 
+        /// Position in the DSP node list.
         idx: usize,
 
+        /// Returns whether this index refers to the no-op sentinel.
         pub fn isNoop(self: Index) bool {
             return self.idx == 0;
         }
     };
 
+    /// One directed edge from a source node output to a destination input.
     pub const Connection = struct {
+        /// Source node, or the no-op sentinel when unplugged.
         node: Index = .noop,
+        /// Output port read from the source node.
         output_port: u8 = 0,
 
+        /// Returns whether this input is currently unplugged.
         pub fn isNoop(self: Connection) bool {
             return self.node.isNoop();
         }
     };
 
-    /// When node has multiple outputs, we compute all of them once, then serve this cache to other ports when requested
+    /// Per-node output cache for the current render generation.
     pub const Cache = struct {
+        /// Generation in which these outputs were rendered.
         generation: u64 = 0,
+        /// Number of valid samples in each cached output.
         sample_count: u32 = 0,
+        /// Cached output buffers for all possible ports.
         outputs: [max_outlets]Buffer = undefined,
     };
 
+    /// Error set reserved for node processing failures.
     pub const ProcessError = error{};
+    /// Signature implemented by every node's audio-processing function.
     pub const Process = *const fn (
         dsp: *DSP,
         node: Index,
         outputs: []const *Buffer,
     ) ProcessError!void;
 
+    /// Tagged union containing the concrete state for each node kind.
     pub const State = union(enum) {
+        /// Sum node state.
         add: Add,
+        /// Envelope generator state.
         adsr: ADSR,
+        /// Sample-rate and bit-depth reduction state.
         bit_crusher: BitCrusher,
+        /// Constant-value source state.
         constant: Constant,
+        /// Multi-input mixer state.
         mixer: Mixer,
+        /// Monophonic note sequencer state.
         monophonic_sequencer: MonophonicSequencer,
+        /// State-variable filter state.
         multimode_filter: MultimodeFilter,
+        /// Product node state.
         multiply: Multiply,
+        /// Colored-noise generator state.
         noise: Noise,
+        /// Unplugged-input sentinel state.
         noop: Noop,
+        /// Oscillator state.
         oscillator: Oscillator,
+        /// Graph output forwarding state.
         output: Output,
     };
 
+    /// Concrete node parameters and mutable runtime state.
     state: State,
+    /// Number of valid output ports.
     output_count: u8 = 1,
+    /// Connections feeding each input port.
     inputs: [max_outlets]Connection = @splat(.{}),
+    /// Per-generation output cache.
     cache: Cache = .{},
+    /// Function used to render this node's outputs.
     process: Process,
 
-    /// A node that does nothing (any non-initialize input/output of new node point to it)
+    /// A node that produces silence and represents an unplugged connection.
     pub const Noop = struct {
+        /// Creates the graph's no-op sentinel node.
         pub fn create() Node {
             return .{
                 .state = .{ .noop = .{} },
@@ -422,6 +537,7 @@ pub const Node = struct {
             };
         }
 
+        /// Leaves all output samples at the values supplied by the renderer.
         fn process(
             _: *DSP,
             _: Index,
@@ -429,8 +545,9 @@ pub const Node = struct {
         ) ProcessError!void {}
     };
 
-    /// Root node of the graph, forwards its input into the audio engine
+    /// Root node of the graph; forwards its input into the audio engine.
     pub const Output = struct {
+        /// Creates a graph output node with one input and one output.
         pub fn create() Node {
             return .{
                 .state = .{
@@ -440,16 +557,19 @@ pub const Node = struct {
             };
         }
 
+        /// Copies the connected source buffer into the output buffer.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
-            // Just forward input
+            // Read the one input connection assigned to the output node.
             const input = dsp.nodes.items(.inputs)[node.idx][0];
 
+            // An unconnected output remains silent after the renderer's clear.
             if (input.isNoop()) return;
 
+            // Render the source at the same size, then copy its valid samples.
             const source = try dsp.getOutput(input, into[0].sample_count);
             @memcpy(
                 into[0].samples[0..into[0].sample_count],
@@ -458,8 +578,9 @@ pub const Node = struct {
         }
     };
 
-    /// Add inputs
+    /// Adds all connected input signals sample by sample.
     pub const Add = struct {
+        /// Creates an addition node with all input ports initially unplugged.
         pub fn create() Node {
             return .{
                 .state = .{
@@ -469,6 +590,7 @@ pub const Node = struct {
             };
         }
 
+        /// Resolves inputs, sums vector-sized chunks, then sums the tail scalarly.
         fn process(
             dsp: *DSP,
             node: Index,
@@ -477,7 +599,7 @@ pub const Node = struct {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const output = into[0];
 
-            // Get data from each input
+            // Resolve every connected input before entering the sample loop.
             var inputs: [max_outlets]*Buffer = undefined;
             var input_count: usize = 0;
             for (0..inputs.len) |i| {
@@ -488,7 +610,7 @@ pub const Node = struct {
                 input_count += 1;
             }
 
-            // Sum with SIMD
+            // Sum complete SIMD vectors for the common fast path.
             var offset: usize = 0;
             if (std.simd.suggestVectorLength(f32)) |lanes| {
                 const V = @Vector(lanes, f32);
@@ -505,7 +627,7 @@ pub const Node = struct {
                 }
             }
 
-            // Sum tail
+            // Sum any samples that did not fill a complete SIMD vector.
             while (offset < output.sample_count) : (offset += 1) {
                 var sum: f32 = 0;
 
@@ -517,8 +639,9 @@ pub const Node = struct {
         }
     };
 
-    /// Multiply inputs
+    /// Multiplies all connected input signals sample by sample.
     pub const Multiply = struct {
+        /// Creates a multiplication node with all input ports initially unplugged.
         pub fn create() Node {
             return .{
                 .state = .{
@@ -528,6 +651,7 @@ pub const Node = struct {
             };
         }
 
+        /// Resolves inputs, multiplies vector-sized chunks, then handles the tail.
         fn process(
             dsp: *DSP,
             node: Index,
@@ -536,7 +660,7 @@ pub const Node = struct {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const output = into[0];
 
-            // Get data from each input
+            // Resolve every connected input before entering the sample loop.
             var inputs: [max_outlets]*Buffer = undefined;
             var input_count: usize = 0;
             for (0..inputs.len) |i| {
@@ -547,7 +671,7 @@ pub const Node = struct {
                 input_count += 1;
             }
 
-            // Multiply with SIMD
+            // Multiply complete SIMD vectors for the common fast path.
             var offset: usize = 0;
             if (std.simd.suggestVectorLength(f32)) |lanes| {
                 const V = @Vector(lanes, f32);
@@ -564,7 +688,7 @@ pub const Node = struct {
                 }
             }
 
-            // Multiply tail
+            // Multiply any samples that did not fill a complete SIMD vector.
             while (offset < output.sample_count) : (offset += 1) {
                 var result: f32 = 0;
 
@@ -576,18 +700,27 @@ pub const Node = struct {
         }
     };
 
+    /// Emits one constant value on every output sample.
     pub const Constant = struct {
-        constant: f32 = 0,
+        /// User-controlled value emitted by the node.
+        pub const Parameters = struct {
+            constant: f32 = 0,
+        };
 
-        pub fn create(constant: f32) Node {
+        /// Immutable configuration used by the process function.
+        parameters: Parameters,
+
+        /// Creates a constant node from its output value.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
-                    .constant = .{ .constant = constant },
+                    .constant = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Fills the output buffer with the configured constant.
         fn process(
             dsp: *DSP,
             node: Index,
@@ -595,47 +728,68 @@ pub const Node = struct {
         ) ProcessError!void {
             @memset(
                 into[0].samples[0..],
-                dsp.nodes.items(.state)[node.idx].constant.constant,
+                dsp.nodes.items(.state)[node.idx].constant.parameters.constant,
             );
         }
     };
 
-    /// Simple oscillator
+    /// Generates a stereo oscillator with optional frequency and amplitude inputs.
     pub const Oscillator = struct {
+        /// Available periodic wave shapes.
         pub const Waveform = enum {
+            /// Sine wave.
             sine,
+            /// Sawtooth ramp from -1 to +1.
             sawtooth,
+            /// Triangle wave.
             triangle,
+            /// Bipolar square wave.
             square,
         };
 
+        /// One full cycle in radians.
         const tau: f32 = @floatCast(std.math.tau);
 
-        waveform: Waveform,
-        phase: f32 = 0,
-        phase_offset: f32 = 0,
-        default_frequency: f32,
-        default_amplitude: f32,
+        /// User-controlled oscillator configuration.
+        pub const Parameters = struct {
+            /// Wave shape used for each generated sample.
+            waveform: Waveform,
+            /// Phase added to the running phase before waveform evaluation.
+            phase_offset: f32 = 0,
+            /// Frequency used when no frequency input is connected.
+            default_frequency: f32,
+            /// Amplitude used when no amplitude input is connected.
+            default_amplitude: f32,
+        };
 
-        pub fn create(oscillator: Oscillator) Node {
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// Mutable phase accumulator, in radians.
+        phase: f32 = 0,
+
+        /// Creates an oscillator with a reset phase accumulator.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
-                    .oscillator = oscillator,
+                    .oscillator = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Renders one stereo block, applying optional per-sample modulation.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
+            // Load graph connections and persistent oscillator state.
             const state = &dsp.nodes.items(.state)[node.idx].oscillator;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const frequency_connection = input_outlets[0];
             const amplitude_connection = input_outlets[1];
 
+            // Resolve optional modulation sources once for this block.
             const frequency_buffer: ?*Buffer = if (frequency_connection.isNoop())
                 null
             else
@@ -645,10 +799,13 @@ pub const Node = struct {
             else
                 try dsp.getOutput(amplitude_connection, into[0].sample_count);
 
+            // Convert the engine rate to float for phase integration.
             const sample_rate: f32 = @floatFromInt(dsp.sample_rate);
+            const parameters = state.parameters;
 
             std.debug.assert(into[0].sample_count % 2 == 0);
             const frame_count: usize = @intCast(into[0].sample_count / 2);
+            // Generate one value per stereo frame and duplicate it to both channels.
             for (0..frame_count) |frame| {
                 const sample_index = frame * 2;
                 const frequency_input = if (frequency_buffer) |buffer|
@@ -659,13 +816,15 @@ pub const Node = struct {
                     buffer.samples[sample_index]
                 else
                     null;
-                const frequency = frequency_input orelse state.default_frequency;
-                const amplitude = amplitude_input orelse state.default_amplitude;
-                const phase = state.phase + state.phase_offset;
+                // Use modulation when present, otherwise use the configured defaults.
+                const frequency = frequency_input orelse parameters.default_frequency;
+                const amplitude = amplitude_input orelse parameters.default_amplitude;
+                const phase = state.phase + parameters.phase_offset;
+                // Normalize phase to one cycle for discontinuous waveforms.
                 const phase_in_cycles = phase / tau;
                 const normalized_phase: f32 = phase_in_cycles - @floor(phase_in_cycles);
 
-                const unit_sample: f32 = switch (state.waveform) {
+                const unit_sample: f32 = switch (parameters.waveform) {
                     .sine => @sin(phase),
                     // Ramps from -1 to +1, then jumps back to -1.
                     .sawtooth => 2 * normalized_phase - 1,
@@ -674,12 +833,13 @@ pub const Node = struct {
                     // Starts high and changes to low halfway through the cycle.
                     .square => if (normalized_phase < 0.5) 1 else -1,
                 };
+                // Apply amplitude and write a mono value into both stereo channels.
                 const sample = amplitude * unit_sample;
 
                 into[0].samples[sample_index] = sample;
                 into[0].samples[sample_index + 1] = sample;
 
-                // Integrate the instantaneous frequency into phase so
+                // Integrate frequency into phase so
                 // frequency modulation works correctly across frames.
                 state.phase += tau * frequency / sample_rate;
 
@@ -693,20 +853,32 @@ pub const Node = struct {
         }
     };
 
+    /// Mixes up to `max_outlets` stereo inputs with gain and pan controls.
     pub const Mixer = struct {
-        gain: f32 = 1,
-        gains: [max_outlets]f32 = @splat(1),
-        pans: [max_outlets]f32 = @splat(0),
+        /// User-controlled mix configuration.
+        pub const Parameters = struct {
+            /// Master gain applied after summing all inputs.
+            gain: f32 = 1,
+            /// Per-input gain values.
+            gains: [max_outlets]f32 = @splat(1),
+            /// Per-input pan values, from -1 left to +1 right.
+            pans: [max_outlets]f32 = @splat(0),
+        };
 
-        pub fn create(mixer: Mixer) Node {
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+
+        /// Creates a mixer from its gain and pan configuration.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
-                    .mixer = mixer,
+                    .mixer = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Resolves inputs, applies constant-power panning, and sums the mix.
         fn process(
             dsp: *DSP,
             node: Index,
@@ -715,9 +887,10 @@ pub const Node = struct {
             const state = &dsp.nodes.items(.state)[node.idx].mixer;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const output = into[0];
+            const parameters = state.parameters;
 
-            // Get data from each input
-            var inputs: [state.gains.len]*Buffer = undefined;
+            // Resolve connected inputs and precompute their channel gains.
+            var inputs: [max_outlets]*Buffer = undefined;
             var input_count: usize = 0;
             var left_gains: [max_outlets]f32 = @splat(0);
             var right_gains: [max_outlets]f32 = @splat(0);
@@ -728,18 +901,18 @@ pub const Node = struct {
 
                 inputs[input_count] = try dsp.getOutput(input, output.sample_count);
 
-                // Pan input
-                const angle = (state.pans[i] + 1) * std.math.pi / 4;
+                // Convert pan into constant-power left/right gains.
+                const angle = (parameters.pans[i] + 1) * std.math.pi / 4;
                 left_gains[input_count] = @cos(angle);
                 right_gains[input_count] = @sin(angle);
-                mix_gains[input_count] = state.gains[i];
+                mix_gains[input_count] = parameters.gains[i];
 
                 input_count += 1;
             }
 
             std.debug.assert(output.sample_count % 2 == 0);
 
-            // Mix and pan them together with SIMD
+            // Mix complete SIMD vectors, preserving the interleaved channel gains.
             var offset: usize = 0;
             if (std.simd.suggestVectorLength(f32)) |lanes| {
                 const V = @Vector(lanes, f32);
@@ -748,7 +921,7 @@ pub const Node = struct {
                     var result: V = @splat(0);
 
                     for (0..input_count) |i| {
-                        // Create an interleaved vector of gains
+                        // Create an interleaved vector of left/right gains.
                         var gains: V = undefined;
                         inline for (0..lanes) |lane|
                             gains[lane] = (if (lane % 2 == 0) left_gains[i] else right_gains[i]) *
@@ -759,11 +932,11 @@ pub const Node = struct {
                         result += input * gains;
                     }
 
-                    output.samples[offset..][0..lanes].* = @bitCast(result * @as(V, @splat(state.gain)));
+                    output.samples[offset..][0..lanes].* = @bitCast(result * @as(V, @splat(parameters.gain)));
                 }
             }
 
-            // Mix and pan together tail
+            // Process the remaining stereo frames that do not fill a SIMD vector.
             while (offset < output.sample_count) : (offset += 2) {
                 var left: f32 = 0;
                 var right: f32 = 0;
@@ -774,73 +947,91 @@ pub const Node = struct {
                     const sample_left = input.samples[offset] * left_gains[i];
                     const sample_right = input.samples[offset + 1] * right_gains[i];
 
-                    // Mix it with the rest
+                    // Accumulate this input into the left and right sums.
                     left += sample_left * mix_gains[i];
                     right += sample_right * mix_gains[i];
                 }
 
-                // Write the mixed signal and apply mixer gain
-                output.samples[offset] = left * state.gain;
-                output.samples[offset + 1] = right * state.gain;
+                // Write the summed stereo frame and apply master gain.
+                output.samples[offset] = left * parameters.gain;
+                output.samples[offset + 1] = right * parameters.gain;
             }
         }
     };
 
+    /// Emits frequency, gate, and velocity signals from a monophonic note sequence.
     pub const MonophonicSequencer = struct {
-        /// Amount of ticks for a quater note
+        /// Number of ticks in one quarter note.
         pub const quarter_note_ticks = 960;
 
-        bpm: u8 = 120,
-        notes: []const Note,
-        /// Current position in ticks
+        /// User-controlled sequence playback configuration.
+        pub const Parameters = struct {
+            /// Playback tempo in beats per minute.
+            bpm: u8 = 120,
+            /// Ordered note events to play.
+            notes: []const Note,
+            /// Whether playback wraps at the final note.
+            loop: bool = true,
+        };
+
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// Current position in ticks.
         position: f64 = 0,
+        /// Index of the note currently being searched or played.
         note_index: usize = 0,
-        loop: bool = true,
-        /// We continue to emit last not frequency with amplitude and gate at 0 in gaps so that ADSR can work
+        /// Last played frequency, retained through gaps and after non-looping playback.
         last_frequency: f32 = 0,
 
-        pub fn create(sequencer: MonophonicSequencer) Node {
+        /// Creates a three-output sequencer with reset playback state.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .output_count = 3,
                 .state = .{
-                    .monophonic_sequencer = sequencer,
+                    .monophonic_sequencer = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Converts a musical duration from ticks to rounded interleaved samples.
         fn ticksToSamples(self: *MonophonicSequencer, ticks: u64, sample_rate: u32) u64 {
             const samples_f64 =
                 @as(f64, @floatFromInt(ticks)) *
                 60.0 *
                 @as(f64, @floatFromInt(sample_rate)) /
-                (@as(f64, @floatFromInt(self.bpm)) *
+                (@as(f64, @floatFromInt(self.parameters.bpm)) *
                     @as(f64, @floatFromInt(quarter_note_ticks)));
 
             return @intFromFloat(@round(samples_f64));
         }
 
+        /// Advances the sequence and emits frequency, gate, and velocity per frame.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].monophonic_sequencer;
+            const parameters = state.parameters;
 
+            // Convert one audio frame into musical ticks at the configured tempo.
             const ticks_per_frame: f64 =
-                @as(f64, @floatFromInt(state.bpm)) *
+                @as(f64, @floatFromInt(parameters.bpm)) *
                 @as(f64, @floatFromInt(quarter_note_ticks)) /
                 (60.0 * @as(f64, @floatFromInt(dsp.sample_rate)));
 
+            // The graph uses interleaved stereo samples, so frames are pairs.
             std.debug.assert(into[0].sample_count % 2 == 0);
             const frame_count: usize = @intCast(into[0].sample_count / 2);
 
-            std.debug.assert(state.notes.len > 0);
+            std.debug.assert(parameters.notes.len > 0);
+            // Compute the end of the final note for loop and stop handling.
             const sequence_end = @as(
                 f64,
                 @floatFromInt(
-                    state.notes[state.notes.len - 1].start_tick +
-                        state.notes[state.notes.len - 1].duration_ticks,
+                    parameters.notes[parameters.notes.len - 1].start_tick +
+                        parameters.notes[parameters.notes.len - 1].duration_ticks,
                 ),
             );
 
@@ -851,9 +1042,9 @@ pub const Node = struct {
                 var gate: f32 = 0;
                 var velocity: f32 = 0;
 
-                // Sequence ended?
+                // Wrap or silence when the playback cursor passes the sequence end.
                 if (state.position >= sequence_end) {
-                    if (state.loop) { // Go back to start
+                    if (parameters.loop) { // Go back to start
                         // Some amount of time past when the sequence should have starte again might have passed
                         // So we dont set position at 0 but at the remainder
                         state.position = @mod(state.position, sequence_end);
@@ -869,10 +1060,10 @@ pub const Node = struct {
                     }
                 }
 
-                // Select current note
+                // Advance the note cursor until it reaches the current tick.
                 const tick: u64 = @intFromFloat(state.position);
-                while (state.note_index < state.notes.len) {
-                    const note = state.notes[state.note_index];
+                while (state.note_index < parameters.notes.len) {
+                    const note = parameters.notes[state.note_index];
                     // If inside note's tick range, select this note
                     if (tick < note.start_tick or
                         tick - note.start_tick < note.duration_ticks)
@@ -880,9 +1071,9 @@ pub const Node = struct {
                     state.note_index += 1;
                 }
 
-                // If in note, apply frequency, gate and velocity
-                if (state.note_index < state.notes.len) {
-                    const note = state.notes[state.note_index];
+                // Emit note values when the cursor is inside a pitched note.
+                if (state.note_index < parameters.notes.len) {
+                    const note = parameters.notes[state.note_index];
                     if (tick >= note.start_tick and note.pitch != null) {
                         frequency = note.frequency();
                         state.last_frequency = frequency;
@@ -891,7 +1082,7 @@ pub const Node = struct {
                     }
                 } // else it's a gap and values are already at 0
 
-                // Interleave left/right
+                // Duplicate each control value across the stereo frame.
                 into[0].samples[sample_index] = frequency;
                 into[0].samples[sample_index + 1] = frequency;
                 into[1].samples[sample_index] = gate;
@@ -899,74 +1090,108 @@ pub const Node = struct {
                 into[2].samples[sample_index] = velocity;
                 into[2].samples[sample_index + 1] = velocity;
 
-                // Advance position in ticks
+                // Advance playback by one audio frame.
                 state.position += ticks_per_frame;
             }
         }
     };
 
+    /// Envelope generator driven by a gate signal and optional velocity signal.
     pub const ADSR = struct {
+        /// Curves available for attack, decay, and release transitions.
         pub const Curve = enum {
+            /// Constant-rate transition.
             linear,
+            /// Slow-starting, fast-ending transition.
             exponential,
+            /// Fast-starting, slow-ending transition.
             logarithmic,
         };
 
+        /// Runtime stage of the envelope state machine.
         const Stage = enum {
+            /// No gate and no audible envelope level.
             idle,
+            /// Rising toward the peak level.
             attack,
+            /// Falling toward the sustain level.
             decay,
+            /// Holding the sustain level while gated.
             sustain,
+            /// Falling toward zero after the gate is released.
             release,
         };
 
-        attack: f32 = 0,
-        attack_curve: Curve = .exponential,
-        decay: f32 = 0,
-        decay_curve: Curve = .exponential,
-        sustain: f32 = 1,
-        release: f32 = 1,
-        release_curve: Curve = .exponential,
+        /// User-controlled envelope timing and level configuration.
+        pub const Parameters = struct {
+            /// Attack duration in seconds.
+            attack: f32 = 0,
+            /// Shape of the attack transition.
+            attack_curve: Curve = .exponential,
+            /// Decay duration in seconds.
+            decay: f32 = 0,
+            /// Shape of the decay transition.
+            decay_curve: Curve = .exponential,
+            /// Held level after decay, clamped to 0..1.
+            sustain: f32 = 1,
+            /// Release duration in seconds.
+            release: f32 = 1,
+            /// Shape of the release transition.
+            release_curve: Curve = .exponential,
+        };
 
-        // Current state
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+
+        /// Current state-machine stage.
         stage: Stage = .idle,
+        /// Time spent in the current stage.
         stage_elapsed: f32 = 0,
+        /// Level at the beginning of the current stage.
         stage_start_level: f32 = 0,
+        /// Current unscaled envelope level.
         level: f32 = 0,
+        /// Velocity latched while the gate is held.
         velocity: f32 = 1,
 
-        pub fn create(adsr: ADSR) Node {
+        /// Creates an envelope with an idle runtime state.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
-                    .adsr = adsr,
+                    .adsr = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Runs the envelope state machine for one stereo audio block.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
+            // Resolve persistent state and the two control inputs.
             const state = &dsp.nodes.items(.state)[node.idx].adsr;
+            const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const gate_connection = input_outlets[0];
             const velocity_connection = input_outlets[1];
 
-            // Gate is required
+            // Resolve the required gate signal.
             std.debug.assert(!gate_connection.isNoop());
             const gate_buffer = try dsp.getOutput(gate_connection, into[0].sample_count);
 
-            // Velocity is optional
+            // Resolve optional velocity modulation; unity is the default.
             const velocity_buffer = if (velocity_connection.isNoop())
                 null
             else
                 try dsp.getOutput(velocity_connection, into[0].sample_count);
 
+            // Clamp the sustain level once because it is constant for the block.
             std.debug.assert(into[0].sample_count % 2 == 0);
             const frame_count: usize = @intCast(into[0].sample_count / 2);
-            const sustain = @max(0.0, @min(1.0, state.sustain));
+            const sustain = @max(0.0, @min(1.0, parameters.sustain));
+            // Advance the state machine once for each stereo frame.
             for (0..frame_count) |frame| {
                 const sample_index = frame * 2;
 
@@ -977,6 +1202,7 @@ pub const Node = struct {
                     1;
                 const gate_on = gate >= 0.5;
 
+                // First update the stage transitions from the current gate.
                 if (gate_on) {
                     // Velocity is a note property. Latch it while the note is
                     // held so a zero velocity output during a gap does not
@@ -998,29 +1224,33 @@ pub const Node = struct {
                     state.stage_start_level = state.level;
                 }
 
+                // Then advance the active stage by one sample period.
                 const sample_rate: f32 = @floatFromInt(dsp.sample_rate);
                 const delta_time = 1.0 / sample_rate;
 
+                // Evaluate the level and transition when a stage completes.
                 switch (state.stage) {
+                    // Silence the envelope while it is idle.
                     .idle => {
                         state.level = 0;
                     },
+                    // Rise from the stage start level to the peak.
                     .attack => {
-                        if (state.attack <= 0) {
+                        if (parameters.attack <= 0) {
                             state.level = 1;
                             state.stage = .decay;
                             state.stage_elapsed = 0;
                             state.stage_start_level = 1;
                         } else {
-                            const progress = @min(1.0, state.stage_elapsed / state.attack);
+                            const progress = @min(1.0, state.stage_elapsed / parameters.attack);
                             state.level = interpolate(
-                                state.attack_curve,
+                                parameters.attack_curve,
                                 state.stage_start_level,
                                 1,
                                 progress,
                             );
                             state.stage_elapsed += delta_time;
-                            if (state.stage_elapsed >= state.attack) {
+                            if (state.stage_elapsed >= parameters.attack) {
                                 state.level = 1;
                                 state.stage = .decay;
                                 state.stage_elapsed = 0;
@@ -1028,22 +1258,23 @@ pub const Node = struct {
                             }
                         }
                     },
+                    // Fall from the peak to the configured sustain level.
                     .decay => {
-                        if (state.decay <= 0) {
+                        if (parameters.decay <= 0) {
                             state.level = sustain;
                             state.stage = .sustain;
                             state.stage_elapsed = 0;
                             state.stage_start_level = state.level;
                         } else {
-                            const progress = @min(1.0, state.stage_elapsed / state.decay);
+                            const progress = @min(1.0, state.stage_elapsed / parameters.decay);
                             state.level = interpolate(
-                                state.decay_curve,
+                                parameters.decay_curve,
                                 1,
                                 sustain,
                                 progress,
                             );
                             state.stage_elapsed += delta_time;
-                            if (state.stage_elapsed >= state.decay) {
+                            if (state.stage_elapsed >= parameters.decay) {
                                 state.level = sustain;
                                 state.stage = .sustain;
                                 state.stage_elapsed = 0;
@@ -1051,25 +1282,27 @@ pub const Node = struct {
                             }
                         }
                     },
+                    // Hold the sustain level until the gate falls.
                     .sustain => {
                         state.level = sustain;
                     },
+                    // Fall from the latched level back to silence.
                     .release => {
-                        if (state.release <= 0) {
+                        if (parameters.release <= 0) {
                             state.level = 0;
                             state.stage = .idle;
                             state.stage_elapsed = 0;
                             state.stage_start_level = 0;
                         } else {
-                            const progress = @min(1.0, state.stage_elapsed / state.release);
+                            const progress = @min(1.0, state.stage_elapsed / parameters.release);
                             state.level = interpolate(
-                                state.release_curve,
+                                parameters.release_curve,
                                 state.stage_start_level,
                                 0,
                                 progress,
                             );
                             state.stage_elapsed += delta_time;
-                            if (state.stage_elapsed >= state.release) {
+                            if (state.stage_elapsed >= parameters.release) {
                                 state.level = 0;
                                 state.stage = .idle;
                                 state.stage_elapsed = 0;
@@ -1079,15 +1312,19 @@ pub const Node = struct {
                     },
                 }
 
+                // Apply the latched velocity and duplicate the result to stereo.
                 const output = state.level * state.velocity;
                 into[0].samples[sample_index] = output;
                 into[0].samples[sample_index + 1] = output;
             }
         }
 
+        /// Shapes a normalized transition between two envelope levels.
         fn interpolate(curve: Curve, from: f32, to: f32, progress: f32) f32 {
+            // Clamp progress before applying the selected curve.
             const t = @max(0.0, @min(1.0, progress));
             const steepness: f32 = 5;
+            // Map linear progress to the requested perceptual response.
             const shaped = switch (curve) {
                 .linear => t,
                 // Slow at the beginning, fast at the end.
@@ -1095,41 +1332,64 @@ pub const Node = struct {
                 // Fast at the beginning, slow at the end.
                 .logarithmic => (1 - @exp(-steepness * t)) / (1 - @exp(-steepness)),
             };
+            // Interpolate the actual envelope level using the shaped progress.
             return from + (to - from) * shaped;
         }
     };
 
+    /// Chamberlin-style state-variable filter with runtime cutoff modulation.
     pub const MultimodeFilter = struct {
+        /// Output response selected by the filter.
         pub const Type = enum {
+            /// Attenuates frequencies below the cutoff.
             high_pass,
+            /// Attenuates frequencies above the cutoff.
             low_pass,
+            /// Passes a band around the cutoff.
             band_pass,
+            /// Rejects a band around the cutoff.
             notch,
         };
 
-        type: Type,
-        default_cutoff: f32,
-        default_resonance: f32,
+        /// User-controlled filter configuration.
+        pub const Parameters = struct {
+            /// Filter response type.
+            type: Type,
+            /// Cutoff in hertz when no cutoff input is connected.
+            default_cutoff: f32,
+            /// Resonance amount when no resonance input is connected.
+            default_resonance: f32,
+        };
+
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// Low-pass integrator state for left and right channels.
         low: [2]f32 = .{ 0, 0 },
+        /// Band-pass integrator state for left and right channels.
         band: [2]f32 = .{ 0, 0 },
 
-        pub fn create(filter: MultimodeFilter) Node {
+        /// Creates a filter with reset integrator state.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
-                    .multimode_filter = filter,
+                    .multimode_filter = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Filters one interleaved stereo block with optional modulation inputs.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
+            // Resolve persistent filter state and the three possible inputs.
             const state = &dsp.nodes.items(.state)[node.idx].multimode_filter;
+            const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
 
+            // Audio input is required; cutoff and resonance are optional.
             std.debug.assert(!input_outlets[0].isNoop());
             const audio_buffer = try dsp.getOutput(
                 input_outlets[0],
@@ -1144,8 +1404,10 @@ pub const Node = struct {
             else
                 null;
 
+            // Use the engine rate to convert cutoff to the filter coefficient.
             const sample_rate: f32 = @floatFromInt(dsp.sample_rate);
 
+            // Update the two-channel filter state one interleaved sample at a time.
             for (0..into[0].sample_count) |sample| {
                 const channel = sample % 2;
                 const audio = audio_buffer.samples[sample];
@@ -1153,13 +1415,14 @@ pub const Node = struct {
                 const cutoff = if (cutoff_buffer) |buffer|
                     buffer.samples[sample]
                 else
-                    state.default_cutoff;
+                    parameters.default_cutoff;
 
                 const resonance = if (resonance_buffer) |buffer|
                     buffer.samples[sample]
                 else
-                    state.default_resonance;
+                    parameters.default_resonance;
 
+                // Clamp modulation inputs to stable ranges before calculating `f`.
                 // This is a Chamberlin-style state-variable filter. `f`
                 // controls how quickly the filter moves, while `damping`
                 // controls the resonance around the cutoff.
@@ -1172,13 +1435,15 @@ pub const Node = struct {
                     damping = @min(damping, 2 / f - f * 0.5);
                 damping = @max(0.001, damping);
 
+                // Integrate the low, high, band, and notch responses.
                 const notch = audio - damping * state.band[channel];
                 state.low[channel] += f * state.band[channel];
                 const high = notch - state.low[channel];
                 state.band[channel] += f * high;
                 const notch_output = high + state.low[channel];
 
-                into[0].samples[sample] = switch (state.type) {
+                // Select the configured response from the updated state.
+                into[0].samples[sample] = switch (parameters.type) {
                     .low_pass => state.low[channel],
                     .high_pass => high,
                     .band_pass => state.band[channel],
@@ -1188,37 +1453,54 @@ pub const Node = struct {
         }
     };
 
+    /// Reduces sample rate and bit depth to create a lo-fi effect.
     pub const BitCrusher = struct {
-        target_sample_rate: u32 = 8_000,
-        bit_depth: u5 = 8,
+        /// User-controlled reduction settings.
+        pub const Parameters = struct {
+            /// Target rate at which new stereo frames are captured.
+            target_sample_rate: u32 = 8_000,
+            /// Number of bits used for quantization.
+            bit_depth: u5 = 8,
+        };
+
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// Most recently captured stereo frame.
         last_sample: [2]f32 = .{ 0, 0 },
+        /// Number of source frames represented by `last_sample`.
         held_frames: u32 = 0,
 
-        pub fn create(crusher: BitCrusher) Node {
+        /// Creates a bit crusher with an empty held frame.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
-                    .bit_crusher = crusher,
+                    .bit_crusher = .{ .parameters = parameters },
                 },
                 .process = process,
             };
         }
 
+        /// Captures, quantizes, and holds stereo frames at the reduced settings.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
+            // Derive quantization and frame-hold settings from the configuration.
             const output = into[0];
             const state = &dsp.nodes.items(.state)[node.idx].bit_crusher;
-            const levels: f32 = @floatFromInt((@as(u32, 1) << state.bit_depth) - 1);
-            const frames_to_hold = dsp.sample_rate / state.target_sample_rate;
+            const parameters = state.parameters;
+            const levels: f32 = @floatFromInt((@as(u32, 1) << parameters.bit_depth) - 1);
+            const frames_to_hold = dsp.sample_rate / parameters.target_sample_rate;
 
+            // Resolve the required source buffer before processing frames.
             const input = dsp.nodes.items(.inputs)[node.idx][0];
             std.debug.assert(!input.isNoop());
             const input_buffer = try dsp.getOutput(input, output.sample_count);
 
             std.debug.assert(output.sample_count % 2 == 0);
             const frame_count: usize = @intCast(output.sample_count / 2);
+            // Process complete stereo frames so both channels share a hold period.
             for (0..frame_count) |frame| {
                 const sample_index = frame * 2;
 
@@ -1229,12 +1511,14 @@ pub const Node = struct {
                     state.last_sample[1] = input_buffer.samples[sample_index + 1];
                 }
 
+                // Normalize, quantize, and map each held channel back to [-1, 1].
                 for (0..2) |channel| {
                     const normalized = (state.last_sample[channel] + 1) * 0.5;
                     const quantized = @round(normalized * levels) / levels;
                     output.samples[sample_index + channel] = quantized * 2 - 1;
                 }
 
+                // Advance the hold counter and capture a new frame when it expires.
                 state.held_frames += 1;
                 if (state.held_frames >= frames_to_hold)
                     state.held_frames = 0;
@@ -1242,68 +1526,88 @@ pub const Node = struct {
         }
     };
 
+    /// Generates white, pink, or brown stereo noise with amplitude modulation.
     pub const Noise = struct {
+        /// Available noise colors.
         pub const Type = enum {
+            /// Unfiltered random noise.
             white,
+            /// High-frequency-weighted noise shaped toward a 1/f spectrum.
             pink,
+            /// Integrated low-frequency noise.
             brown,
         };
 
-        pub const Config = struct {
+        /// User-controlled noise configuration.
+        pub const Parameters = struct {
+            /// Seed used to initialize the deterministic random stream.
             seed: u64,
+            /// Noise color.
             type: Type = .white,
+            /// Amplitude used when no amplitude input is connected.
             amplitude: f32 = 1,
         };
 
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// Persistent pseudo-random generator.
         random: std.Random.Xoshiro256,
-        default_amplitude: f32,
+        /// Per-channel filter state for pink noise.
         pink_state: [2][6]f32 = .{
             .{ 0, 0, 0, 0, 0, 0 },
             .{ 0, 0, 0, 0, 0, 0 },
         },
+        /// Per-channel integrator state for brown noise.
         brown_state: [2]f32 = .{ 0, 0 },
-        type: Type,
 
-        pub fn create(config: Config) Node {
+        /// Creates a deterministic noise source with reset color-filter state.
+        pub fn create(parameters: Parameters) Node {
             return .{
                 .state = .{
                     .noise = .{
-                        .random = std.Random.DefaultPrng.init(config.seed),
-                        .default_amplitude = config.amplitude,
-                        .type = config.type,
+                        .parameters = parameters,
+                        .random = std.Random.DefaultPrng.init(parameters.seed),
                     },
                 },
                 .process = process,
             };
         }
 
+        /// Generates one stereo block and applies optional amplitude modulation.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
+            // Resolve persistent generator/filter state and the optional amplitude input.
             const state = &dsp.nodes.items(.state)[node.idx].noise;
+            const parameters = state.parameters;
             const amplitude_connection = dsp.nodes.items(.inputs)[node.idx][0];
             const amplitude_buffer = if (amplitude_connection.isNoop())
                 null
             else
                 try dsp.getOutput(amplitude_connection, into[0].sample_count);
 
+            // Generate interleaved stereo samples so color state stays channel-local.
             std.debug.assert(into[0].sample_count % 2 == 0);
             for (0..into[0].sample_count) |sample| {
+                // Prefer modulation input; otherwise use the configured amplitude.
                 const amplitude = if (amplitude_buffer) |buffer|
                     buffer.samples[sample]
                 else
-                    state.default_amplitude;
+                    parameters.amplitude;
 
+                // Start every color from a shared uniformly distributed sample.
                 const white_noise = state.random.random().float(f32) * 2 - 1;
                 const channel = sample % 2;
-                const noise = switch (state.type) {
+                // Apply the selected color filter, updating only that channel's state.
+                const noise = switch (parameters.type) {
                     .white => white_noise,
                     .pink => blk: {
                         // Paul Kellet's lightweight pink-noise filter. The
                         // state is kept per channel because the buffer is
                         // stereo-interleaved.
+                        // Run the six-pole pink-noise approximation.
                         var filters = &state.pink_state[channel];
                         filters[0] = 0.99886 * filters[0] + white_noise * 0.0555179;
                         filters[1] = 0.99332 * filters[1] + white_noise * 0.0750759;
@@ -1319,6 +1623,7 @@ pub const Node = struct {
                     .brown => blk: {
                         // A leaky integrator produces the strong low-frequency
                         // emphasis characteristic of brown/red noise.
+                        // Integrate and clamp the low-frequency brown-noise signal.
                         state.brown_state[channel] =
                             (state.brown_state[channel] + white_noise * 0.02) / 1.02;
                         const brown = state.brown_state[channel] * 3.5;
@@ -1326,6 +1631,7 @@ pub const Node = struct {
                     },
                 };
 
+                // Scale the colored sample and write it to the interleaved buffer.
                 into[0].samples[sample] = noise * amplitude;
             }
         }

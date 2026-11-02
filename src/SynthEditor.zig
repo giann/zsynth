@@ -212,7 +212,7 @@ fn simpleDSP(dsp: *DSP, allocator: std.mem.Allocator) !void {
     // Emit single 440 value
     const constant = try dsp.addNode(
         allocator,
-        DSP.Node.Constant.create(440),
+        DSP.Node.Constant.create(.{ .constant = 440 }),
     );
 
     // Add so LFO modulates voice frequency instead of replace it
