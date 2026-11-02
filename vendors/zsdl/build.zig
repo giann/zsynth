@@ -1,0 +1,179 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
+    const target = b.standardTargetOptions(.{});
+
+    _ = b.addModule("zsdl3", .{
+        .root_source_file = b.path("src/sdl3.zig"),
+    });
+
+    {
+        const test_step = b.step("test", "Run bindings tests");
+        const install_sdl3_step = prebuilt_sdl3.install(b, target.result, .bin, .{});
+        if (install_sdl3_step) |s| b.getInstallStep().dependOn(s);
+
+        { // Test SDL3 bindings
+            const zsdl3_tests = addTests(test_step, target, optimize, "zsdl3-tests", "src/sdl3.zig", install_sdl3_step);
+            link_SDL3_libs_testing(zsdl3_tests);
+            prebuilt_sdl3.addLibraryPathsTo(zsdl3_tests);
+        }
+    }
+}
+
+fn link_SDL3_libs_testing(compile_step: *std.Build.Step.Compile) void {
+    switch (compile_step.rootModuleTarget().os.tag) {
+        .windows => {
+            compile_step.root_module.linkSystemLibrary("SDL3", .{});
+        },
+        .linux => {
+            compile_step.root_module.linkSystemLibrary("SDL3", .{});
+            compile_step.root_module.addRPathSpecial("$ORIGIN");
+        },
+        .macos => {
+            compile_step.root_module.linkFramework("SDL3", .{});
+            compile_step.root_module.addRPathSpecial("@executable_path");
+        },
+        else => {},
+    }
+}
+
+/// Deprecated. Refer to README for linking instructions.
+pub fn link_SDL3(compile_step: *std.Build.Step.Compile) void {
+    _ = compile_step;
+    @compileError("link_SDL3 no longer supported. Refer to README for linking instructions.");
+
+    // link_SDL3 is no longer supported for linking, as it assumes too much
+    // about the build environment. You should instead copy the relevant link
+    // calls from the README into your build.zig file and adjust as necessary.
+}
+
+/// Deprecated. We're going to build SDL from source instead. Rebuilt repo's will be archived.
+pub const prebuilt_sdl3 = struct {
+    pub fn addLibraryPathsTo(compile_step: *std.Build.Step.Compile) void {
+        const b = compile_step.step.owner;
+        const target = compile_step.rootModuleTarget();
+        switch (target.os.tag) {
+            .windows => {
+                if (target.cpu.arch.isX86()) {
+                    if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
+                        compile_step.root_module.addLibraryPath(sdl3_prebuilt.path("bin"));
+                    }
+                }
+            },
+            .linux => {
+                if (target.cpu.arch.isX86()) {
+                    if (b.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+                        compile_step.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
+                    }
+                }
+            },
+            .macos => {
+                if (b.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
+                    compile_step.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+                }
+            },
+            else => {},
+        }
+    }
+
+    pub fn install(
+        b: *std.Build,
+        target: std.Target,
+        install_dir: std.Build.InstallDir,
+        aux_libs: packed struct {
+            // TODO
+        },
+    ) ?*std.Build.Step {
+        _ = aux_libs;
+        switch (target.os.tag) {
+            .windows => {
+                if (target.cpu.arch.isX86()) {
+                    if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
+                        return &b.addInstallFileWithDir(
+                            sdl3_prebuilt.path("bin/SDL3.dll"),
+                            install_dir,
+                            "SDL3.dll",
+                        ).step;
+                    }
+                }
+            },
+            .linux => {
+                if (target.cpu.arch.isX86()) {
+                    if (b.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+                        var sdl3_install_step = b.step("install-sdl3-linux", "");
+                        sdl3_install_step.dependOn(&b.addInstallFileWithDir(
+                            sdl3_prebuilt.path("lib/libSDL3.so"),
+                            install_dir,
+                            "libSDL3.so",
+                        ).step);
+                        sdl3_install_step.dependOn(&b.addInstallFileWithDir(
+                            sdl3_prebuilt.path("lib/libSDL3.so"),
+                            install_dir,
+                            "libSDL3.so.0",
+                        ).step);
+                        return sdl3_install_step;
+                    }
+                }
+            },
+            .macos => {
+                if (b.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
+                    return &b.addInstallDirectory(.{
+                        .source_dir = sdl3_prebuilt.path("Frameworks/SDL3.framework"),
+                        .install_dir = install_dir,
+                        .install_subdir = "SDL3.framework",
+                    }).step;
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+};
+
+fn addTests(
+    test_step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    name: []const u8,
+    root_src_path: []const u8,
+    run_after: ?*std.Build.Step,
+) *std.Build.Step.Compile {
+    const b = test_step.owner;
+    const tests = b.addTest(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root_src_path),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install = b.addInstallArtifact(tests, .{});
+
+    const run = b.addRunArtifact(tests);
+    if (target.result.os.tag == .windows) {
+        run.setCwd(.{
+            .cwd_relative = "zig-out/bin",
+        });
+    }
+
+    if (run_after) |s| run.step.dependOn(s);
+    run.step.dependOn(&install.step);
+    test_step.dependOn(&run.step);
+    return tests;
+}
+
+fn addTestsAux(
+    test_step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    name: []const u8,
+    root_src_path: []const u8,
+    parent_module_name: []const u8,
+    parent_module: *std.Build.Module,
+    run_after: ?*std.Build.Step,
+) *std.Build.Step.Compile {
+    const tests = addTests(test_step, target, optimize, name, root_src_path, run_after);
+    tests.root_module.addImport(parent_module_name, parent_module);
+    return tests;
+}

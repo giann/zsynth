@@ -1,0 +1,4 @@
+assets/fonts filter=lfs diff=lfs merge=lfs -text
+vendors/sdl3_prebuilt_macos/** filter=lfs diff=lfs merge=lfs -text
+vendors/sdl3_prebuilt_x86_64_linux_gnu/** filter=lfs diff=lfs merge=lfs -text
+vendors/sdl3_prebuilt_x86_64_windows_gnu/** filter=lfs diff=lfs merge=lfs -text
