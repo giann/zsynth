@@ -21,6 +21,8 @@ sample_rate: u32,
 output: Node.Index = .{ .idx = 1 },
 /// Struct-of-arrays storage for all graph nodes.
 nodes: std.MultiArrayList(Node) = .empty,
+/// Synchronizes graph mutation with the audio callback's graph traversal.
+graph_mutex: std.atomic.Mutex = .unlocked,
 
 /// Generation of the currently rendered audio block.
 render_generation: u64 = 0,
@@ -68,6 +70,8 @@ pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
 pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
     // Stop playback before releasing the sound and its callback source.
     self.sound.stop() catch {};
+    self.lockGraph();
+    defer self.unlockGraph();
     self.sound.destroy();
     // Tear down the callback source before freeing graph storage.
     self.graph_data_source.deinit();
@@ -99,6 +103,9 @@ pub fn plug(
     destination: Node.Index,
     destination_port: u8,
 ) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
     // Validate both ends before replacing the destination connection.
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[source.idx]);
     std.debug.assert(source_output_port < node_metadata.get(source_tag).output_count);
@@ -124,7 +131,55 @@ pub fn plug(
     output_connected[source.idx][source_output_port] = true;
 }
 
-/// Appends a node and returns its stable index in the graph.
+/// Removes a node and repairs all graph references affected by the swap.
+pub fn remove(self: *DSP, node: Node.Index) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (node.isNoop() or node.idx >= self.nodes.len)
+        return;
+
+    const last_index = self.nodes.len - 1;
+    const removing_output = self.output.idx == node.idx;
+
+    // Unplug every input owned by the removed node.
+    const removed_inputs = self.nodes.items(.inputs)[node.idx];
+    const output_connected = self.nodes.items(.output_connected);
+    for (removed_inputs) |connection| {
+        if (!connection.isNoop())
+            output_connected[connection.node.idx][connection.output_port] = false;
+    }
+
+    // Remove every edge whose source is the node being removed.
+    const inputs = self.nodes.items(.inputs);
+    for (inputs) |*node_inputs| {
+        for (node_inputs) |*connection| {
+            if (connection.node.idx == node.idx) {
+                connection.* = .{};
+            }
+        }
+    }
+
+    self.nodes.swapRemove(node.idx);
+
+    if (removing_output) {
+        self.output = .noop;
+    } else if (self.output.idx == last_index) {
+        self.output = .{ .idx = node.idx };
+    }
+
+    // The last node moved into the removed slot. Rewrite references to its old index.
+    if (node.idx != last_index) {
+        for (self.nodes.items(.inputs)) |*node_inputs| {
+            for (node_inputs) |*connection| {
+                if (!connection.isNoop() and connection.node.idx == last_index)
+                    connection.node = .{ .idx = node.idx };
+            }
+        }
+    }
+}
+
+/// Appends a node and returns its index in the graph.
 pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     try self.nodes.append(gpa, node);
 
@@ -133,6 +188,9 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
 
 /// Renders one interleaved stereo block into the audio callback buffer.
 fn stream(self: *DSP, into: []f32) !void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
     // The callback may request a short block, but never more than one block.
     std.debug.assert(into.len <= block_size * 2);
     std.debug.assert(into.len % 2 == 0);
@@ -145,6 +203,15 @@ fn stream(self: *DSP, into: []f32) !void {
     // Copy the completed graph output to the audio library's destination.
     const output_buffer = &self.nodes.items(.cache)[self.output.idx].outputs[0];
     @memcpy(into, output_buffer.samples[0..into.len]);
+}
+
+fn lockGraph(self: *DSP) void {
+    while (!self.graph_mutex.tryLock())
+        std.atomic.spinLoopHint();
+}
+
+fn unlockGraph(self: *DSP) void {
+    self.graph_mutex.unlock();
 }
 
 /// Evaluates one node and all of its dependencies for the requested sample count.
@@ -475,7 +542,7 @@ pub const Node = struct {
         input_count: u8 = 1,
     };
 
-    /// Stable index into the DSP node list.
+    /// Index into the DSP node list.
     pub const Index = struct {
         /// Index zero is reserved for the no-op sentinel node.
         pub const noop = Index{ .idx = 0 };

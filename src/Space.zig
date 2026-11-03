@@ -45,7 +45,7 @@ const PathCell = struct {
     path_count: u32 = 0,
 };
 
-const VisualNode = struct {
+pub const VisualNode = struct {
     pub const Index = DSP.Node.Index;
 
     dsp_node: DSP.Node.Index,
@@ -157,6 +157,33 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.occupied.deinit(gpa);
     self.path_occupied.deinit(gpa);
     self.astar.deinit(gpa);
+}
+
+/// Removes a visual node and rebuilds the spatial and routing state.
+pub fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
+    if (node.isNoop() or node.idx >= self.nodes.len)
+        return;
+
+    self.clearPaths(gpa);
+    self.path_occupied.clearRetainingCapacity();
+
+    if (self.selected_node) |selected| {
+        if (selected.idx == node.idx) {
+            self.selected_node = null;
+        } else if (selected.idx == self.nodes.len - 1) {
+            self.selected_node = .{ .idx = node.idx };
+        }
+    }
+
+    const last_index = self.nodes.len - 1;
+    self.nodes.swapRemove(node.idx);
+    if (node.idx != last_index)
+        self.nodes.items(.dsp_node)[node.idx] = .{ .idx = node.idx };
+    self.updateGraphBounds();
+
+    _ = try self.rebuildOccupancy(gpa);
+
+    try self.computePaths(gpa);
 }
 
 pub fn write(

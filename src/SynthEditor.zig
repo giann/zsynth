@@ -6,6 +6,7 @@ const StateStack = @import("StateStack.zig");
 const ZSynth = @import("ZSynth.zig");
 const Renderer = @import("Renderer.zig");
 const Space = @import("Space.zig");
+const VisualNode = Space.VisualNode;
 
 const Self = @This();
 
@@ -101,19 +102,13 @@ fn keyUpDown(
     const delta: i32 = if ((modifiers & sdl.Keymod.shift) != 0) 5 else 1;
 
     switch (event.key) {
-        .d => if ((modifiers & sdl.Keymod.ctrl) != 0) {
-            if (self.zsynth.display.impl == .graphic) {
-                var stdout_buffer: [4096]u8 = undefined;
-                var stdout = std.Io.File.stdout().writer(self.zsynth.io, &stdout_buffer);
-                try self.zsynth.display.impl.graphic.dump(&stdout.interface);
-                stdout.flush() catch return error.WriteFailed;
-            }
-        } else return false,
         .up => try self.moveViewport(gpa, 0, -delta),
         .down => try self.moveViewport(gpa, 0, delta),
         .left => try self.moveViewport(gpa, -delta, 0),
         .right => try self.moveViewport(gpa, delta, 0),
         .space => try self.dsp.toggle(),
+        .d => if (self.space.selected_node) |selected|
+            try self.remove(gpa, selected),
         .escape => {
             self.space.selected_node = null;
             try self.write(gpa);
@@ -279,6 +274,13 @@ fn render(
     // Submit the graphic display only when that display backend is active.
     if (self.zsynth.display.impl == .graphic)
         try self.zsynth.display.impl.graphic.render(gpa, renderer, dt, true);
+}
+
+/// Removes a DSP node and its synchronized visual representation.
+fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
+    self.dsp.remove(node);
+    try self.space.remove(gpa, node);
+    try self.write(gpa);
 }
 
 /// Notes used by the melodic demonstration sequencer.
