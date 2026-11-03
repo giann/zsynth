@@ -254,6 +254,11 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
 
         // Acquire the command buffer used by this frame's GPU work.
         const cmd_buffer = try sdl.acquireGPUCommandBuffer(self.renderer.device);
+        // Clear transient UI content before editor states redraw their overlays.
+        if (self.cursor.dirty) {
+            self.ui_display.resetTransparent();
+            self.cursor.dirty = false;
+        }
         // Let states write their display and rendering commands.
         try self.state_stack.render(allocator, &self.renderer, frame_delta);
         // Overlay the software cursor after the state has redrawn its display.
@@ -431,13 +436,6 @@ pub fn displayCellAtWindowPosition(self: *Self, position: [2]f32) ?[2]u32 {
 
 /// Converts the window-space cursor position to a display cell and draws it.
 fn writeCursor(self: *Self, allocator: std.mem.Allocator) !void {
-    // Rebuild the transparent overlay whenever the cursor moved, including
-    // moves outside the logical display so the old cursor is cleared.
-    if (self.cursor.dirty) {
-        self.ui_display.resetTransparent();
-        self.cursor.dirty = false;
-    }
-
     // Only draw the cursor when the software cursor and graphic display exist.
     if (!self.cursor.visible or self.ui_display.impl != .graphic)
         return;
@@ -498,9 +496,6 @@ fn writeCursor(self: *Self, allocator: std.mem.Allocator) !void {
         @as(f32, @floatFromInt(cell_height)));
     if (cell_x >= display.width or cell_y >= display.height)
         return;
-
-    if (self.state_stack.synthEditor()) |editor|
-        try editor.space.writeUiOverlay(allocator, &self.ui_display, cell_x, cell_y);
 
     // Write the cursor glyph after the state's display content is complete.
     try self.ui_display.write(

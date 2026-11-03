@@ -11,6 +11,9 @@ const VisualNode = Space.VisualNode;
 
 const Self = @This();
 
+/// Number of parameter rows available after applying the pane padding.
+const parameters_pane_padding: u32 = 1;
+
 /// Runtime owning the display, renderer, and audio engine used by this state.
 zsynth: *ZSynth,
 /// DSP graph constructed when the editor enters the state stack.
@@ -80,6 +83,122 @@ fn deinit(self: *Self, gpa: std.mem.Allocator) void {
 fn write(self: *Self, gpa: std.mem.Allocator) !void {
     self.zsynth.display.reset();
     try self.space.write(gpa, &self.zsynth.display);
+}
+
+/// Draws the selected node's reflected parameters in the bottom UI pane.
+fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
+    const display = &self.zsynth.ui_display;
+    if (display.impl != .graphic) return;
+
+    const graphic = &display.impl.graphic;
+    const selected = self.space.selected_node orelse return;
+    if (selected.isNoop() or selected.idx >= self.dsp.nodes.len) return;
+
+    if (graphic.height < 2 or graphic.width <= parameters_pane_padding * 2)
+        return;
+
+    const state = self.dsp.nodes.items(.state)[selected.idx];
+    switch (state) {
+        inline else => |node_state| {
+            if (!@hasField(@TypeOf(node_state), "parameters")) return;
+            try writeReflectedParameters(
+                gpa,
+                display,
+                node_state.parameters,
+                graphic.height,
+                graphic.width,
+            );
+        },
+    }
+}
+
+/// Formats one reflected parameter value, collapsing non-scalar values.
+fn formatParameterValue(buffer: []u8, value: anytype) []const u8 {
+    var result: []const u8 = "...";
+    switch (@typeInfo(@TypeOf(value))) {
+        .bool, .int, .float => {
+            result = std.fmt.bufPrint(buffer, "{}", .{value}) catch "...";
+        },
+        .@"enum" => {
+            result = std.fmt.bufPrint(buffer, "{s}", .{@tagName(value)}) catch "...";
+        },
+        else => {},
+    }
+    return result;
+}
+
+/// Writes reflected parameter fields in padded, row-limited columns.
+fn writeReflectedParameters(
+    gpa: std.mem.Allocator,
+    display: *Display,
+    parameters: anytype,
+    display_height: u32,
+    display_width: u32,
+) !void {
+    const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
+    var items: [field_names.len]Display.LabelValue = undefined;
+    var value_buffers: [field_names.len][64]u8 = undefined;
+
+    inline for (field_names, 0..) |field_name, index| {
+        const value = @field(parameters, field_name);
+        const value_color: Display.Color = switch (@typeInfo(@TypeOf(value))) {
+            .int, .float => .golden_rod,
+            .@"enum" => .science_blue,
+            else => .white,
+        };
+        const formatted_value = formatParameterValue(&value_buffers[index], value);
+        items[index] = .{
+            .label = field_name,
+            .value = formatted_value,
+            .value_color = value_color,
+        };
+    }
+
+    const pane_height = @min(
+        display_height,
+        @as(u32, @intCast(field_names.len)) + 2,
+    );
+    if (pane_height <= 2) return;
+    const row_count = @min(
+        @as(u32, @intCast(field_names.len)),
+        pane_height - 2,
+    );
+    const content_width = Display.labelValueColumnsWidth(&items, row_count);
+    if (content_width == 0) return;
+
+    const pane_width = @min(display_width, content_width + parameters_pane_padding * 2);
+    const pane_top = display_height - pane_height;
+    try display.fill(
+        gpa,
+        .ebony,
+        .white,
+        ' ',
+        0,
+        pane_top,
+        pane_width,
+        pane_height,
+    );
+    try display.writeBox(
+        gpa,
+        0,
+        pane_top,
+        pane_width,
+        pane_height,
+        .ebony,
+        .port_gore,
+        .single,
+    );
+
+    try display.writeLabelValueColumns(
+        gpa,
+        &items,
+        parameters_pane_padding,
+        pane_top + parameters_pane_padding,
+        pane_width,
+        row_count,
+        .ebony,
+        .apple,
+    );
 }
 
 /// Moves the viewport and redraws the complete visible space.
@@ -354,6 +473,14 @@ fn render(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     // Redraw text before the runtime overlays the software cursor.
     try self.write(gpa);
+    // Draw selected-node parameters in the editor-owned transparent overlay.
+    try self.writeSelectedParametersPane(gpa);
+    // Draw outlet labels before the runtime adds the generic cursor glyph.
+    if (self.zsynth.cursor.visible and self.zsynth.ui_display.impl == .graphic) {
+        if (self.zsynth.displayCellAtWindowPosition(self.zsynth.cursor.position)) |cell| {
+            try self.space.writeUiOverlay(gpa, &self.zsynth.ui_display, cell[0], cell[1]);
+        }
+    }
     // Submit the graphic display only when that display backend is active.
     if (self.zsynth.display.impl == .graphic)
         try self.zsynth.display.impl.graphic.render(gpa, renderer, dt, true);

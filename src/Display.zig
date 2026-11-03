@@ -18,6 +18,16 @@ pub const Border = enum {
     double,
 };
 
+/// A label/value pair rendered with independently colored text.
+pub const LabelValue = struct {
+    /// Text shown before the separator.
+    label: []const u8,
+    /// Text shown after the separator.
+    value: []const u8,
+    /// Foreground color used for the value text.
+    value_color: Color,
+};
+
 pub const Impl = union(enum) {
     headless: void,
     graphic: GraphicDisplay,
@@ -91,6 +101,95 @@ pub fn fill(
 ) !void {
     if (self.impl == .graphic)
         try self.impl.graphic.fill(gpa, bg, fg, char, x, y, width, height);
+}
+
+/// Writes label/value pairs in padded columns with vertically aligned values.
+pub fn writeLabelValueColumns(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    items: []const LabelValue,
+    x: u32,
+    y: u32,
+    width: u32,
+    row_count: u32,
+    bg: Color,
+    label_color: Color,
+) !void {
+    if (items.len == 0 or row_count == 0 or x >= width) return;
+
+    const rows = @min(row_count, @as(u32, @intCast(items.len)));
+    var column_x = x;
+    var item_index: usize = 0;
+    while (item_index < items.len and column_x < width) {
+        const column_end = @min(item_index + @as(usize, @intCast(rows)), items.len);
+        var label_width: u32 = 0;
+        var column_width: u32 = 0;
+
+        for (item_index..column_end) |index|
+            label_width = @max(label_width, @as(u32, @intCast(countStripped(items[index].label))));
+
+        for (item_index..column_end) |index|
+            column_width = @max(
+                column_width,
+                label_width + 2 + @as(u32, @intCast(countStripped(items[index].value))),
+            );
+
+        for (item_index..column_end) |index| {
+            const row = @as(u32, @intCast(index - item_index));
+            const item = items[index];
+            const label_width_for_item = @as(u32, @intCast(countStripped(item.label)));
+            try self.write(gpa, item.label, column_x, y + row, bg, label_color);
+            try self.write(
+                gpa,
+                ": ",
+                column_x + label_width_for_item,
+                y + row,
+                bg,
+                label_color,
+            );
+            try self.write(
+                gpa,
+                item.value,
+                column_x + label_width + 2,
+                y + row,
+                bg,
+                item.value_color,
+            );
+        }
+
+        item_index = column_end;
+        column_x += column_width + 1;
+    }
+}
+
+/// Returns the width needed by padded label/value columns.
+pub fn labelValueColumnsWidth(items: []const LabelValue, row_count: u32) u32 {
+    if (items.len == 0 or row_count == 0) return 0;
+
+    const rows = @min(row_count, @as(u32, @intCast(items.len)));
+    var width: u32 = 0;
+    var item_index: usize = 0;
+    while (item_index < items.len) {
+        const column_end = @min(item_index + @as(usize, @intCast(rows)), items.len);
+        var label_width: u32 = 0;
+        var column_width: u32 = 0;
+
+        for (item_index..column_end) |index|
+            label_width = @max(label_width, @as(u32, @intCast(countStripped(items[index].label))));
+
+        for (item_index..column_end) |index|
+            column_width = @max(
+                column_width,
+                label_width + 2 + @as(u32, @intCast(countStripped(items[index].value))),
+            );
+
+        width += column_width;
+        item_index = column_end;
+        if (item_index < items.len)
+            width += 1;
+    }
+
+    return width;
 }
 
 /// Converts an amount and capacity into a sixteen-cell bar width.

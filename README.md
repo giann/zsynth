@@ -21,8 +21,21 @@ and effects to be composed into a real-time sound pipeline.
 
 ## TODO
 
+- save/load
+- interact with node properties
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for
   audio)
 - pitch shifter
 - resampler
+
+## Controls and UI elements
+
+- meter (••••○○○○)
+- knob
+- number input
+- label input
+- dial
+
+The idea: you design the DSP graph and then you have can draw your UI with
+prefab elements to make your own synth that looks how you want

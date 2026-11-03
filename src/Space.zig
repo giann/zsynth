@@ -5,6 +5,18 @@ const Display = @import("Display.zig");
 
 const Self = @This();
 
+viewport: Viewport,
+dsp: *DSP,
+nodes: std.MultiArrayList(VisualNode) = .empty,
+selected_node: ?VisualNode.Index = null,
+graph_north_west: Position = .{ .x = 0, .y = 0 },
+graph_south_east: Position = .{ .x = 0, .y = 0 },
+// Keep track of occupied positions
+occupied: std.AutoHashMapUnmanaged(Position, VisualNode.Index) = .empty,
+// Keep track of directions already used by computed paths
+path_occupied: std.AutoHashMapUnmanaged(Position, u4) = .empty,
+astar: AStar(Self, PathCriteria) = .{},
+
 const Viewport = struct {
     x: i32,
     y: i32,
@@ -139,18 +151,6 @@ fn writeUiText(
         x > std.math.maxInt(u32) or y > std.math.maxInt(u32)) return;
     try display.write(gpa, text, @intCast(x), @intCast(y), .black, color);
 }
-
-viewport: Viewport,
-dsp: *DSP,
-nodes: std.MultiArrayList(VisualNode) = .empty,
-selected_node: ?VisualNode.Index = null,
-graph_north_west: Position = .{ .x = 0, .y = 0 },
-graph_south_east: Position = .{ .x = 0, .y = 0 },
-// Keep track of occupied positions
-occupied: std.AutoHashMapUnmanaged(Position, VisualNode.Index) = .empty,
-// Keep track of directions already used by computed paths
-path_occupied: std.AutoHashMapUnmanaged(Position, u4) = .empty,
-astar: AStar(Self, PathCriteria) = .{},
 
 /// Move the unbounded viewport by an integer number of space cells.
 pub fn moveViewport(self: *Self, dx: i32, dy: i32) void {

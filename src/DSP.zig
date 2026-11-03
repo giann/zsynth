@@ -572,6 +572,19 @@ pub const Note = struct {
 
 /// A processable node in the audio graph.
 pub const Node = struct {
+    /// Concrete node parameters and mutable runtime state.
+    state: State,
+    /// Display name assigned by the graph owner.
+    name: []const u8,
+    /// Connections feeding each input port.
+    inputs: [max_outlets]Connection = @splat(.{}),
+    /// Whether each output port is connected to a destination input.
+    output_connected: [max_outlets]bool = @splat(false),
+    /// Per-generation output cache.
+    cache: Cache = .{},
+    /// Function used to render this node's outputs.
+    process: Process,
+
     /// Static metadata for one node input or output.
     pub const OutletMetadata = struct {
         name: []const u8 = "",
@@ -679,19 +692,6 @@ pub const Node = struct {
         /// Graph output forwarding state.
         output: Output,
     };
-
-    /// Concrete node parameters and mutable runtime state.
-    state: State,
-    /// Display name assigned by the graph owner.
-    name: []const u8,
-    /// Connections feeding each input port.
-    inputs: [max_outlets]Connection = @splat(.{}),
-    /// Whether each output port is connected to a destination input.
-    output_connected: [max_outlets]bool = @splat(false),
-    /// Per-generation output cache.
-    cache: Cache = .{},
-    /// Function used to render this node's outputs.
-    process: Process,
 
     /// A node that produces silence and represents an unplugged connection.
     pub const Noop = struct {
@@ -2130,17 +2130,19 @@ pub const Node = struct {
 
 /// Static port metadata for every node kind.
 pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
-    .init(.{
-    .add = Node.Add.metadata,
-    .adsr = Node.ADSR.metadata,
-    .bit_crusher = Node.BitCrusher.metadata,
-    .constant = Node.Constant.metadata,
-    .mixer = Node.Mixer.metadata,
-    .monophonic_sequencer = Node.MonophonicSequencer.metadata,
-    .multimode_filter = Node.MultimodeFilter.metadata,
-    .multiply = Node.Multiply.metadata,
-    .noise = Node.Noise.metadata,
-    .noop = Node.Noop.metadata,
-    .oscillator = Node.Oscillator.metadata,
-    .output = Node.Output.metadata,
-});
+    .init(
+    .{
+        .add = Node.Add.metadata,
+        .adsr = Node.ADSR.metadata,
+        .bit_crusher = Node.BitCrusher.metadata,
+        .constant = Node.Constant.metadata,
+        .mixer = Node.Mixer.metadata,
+        .monophonic_sequencer = Node.MonophonicSequencer.metadata,
+        .multimode_filter = Node.MultimodeFilter.metadata,
+        .multiply = Node.Multiply.metadata,
+        .noise = Node.Noise.metadata,
+        .noop = Node.Noop.metadata,
+        .oscillator = Node.Oscillator.metadata,
+        .output = Node.Output.metadata,
+    },
+);
