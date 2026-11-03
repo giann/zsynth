@@ -1,5 +1,9 @@
 # ZSynth
 
+<p align="center">
+    <img src="https://github.com/giann/zsynth/blob/main/screenshot.png">
+</p>
+
 This is a graph-based DSP: audio processing is built by connecting nodes into a
 directed graph, allowing oscillators, sequencers, modulation sources, filters,
 and effects to be composed into a real-time sound pipeline.
@@ -22,11 +26,3 @@ and effects to be composed into a real-time sound pipeline.
   audio)
 - pitch shifter
 - resampler
-
-### ASCII UI
-
-Something like this would be great:
-
-<p align="center">
-    <img src="https://github.com/giann/zsynth/blob/main/ui.png">
-</p>

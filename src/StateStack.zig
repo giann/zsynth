@@ -34,6 +34,15 @@ pub fn isCurrent(self: Self, state: State.Index) bool {
         false;
 }
 
+/// Return the editor owned by the active state, including editor overlays.
+pub fn synthEditor(self: *Self) ?*SynthEditor {
+    const state = self.current() orelse return null;
+    return switch (self.stack.items(.context)[state.idx]) {
+        .synth_editor => |*editor| editor,
+        .outlet_connection => |connection| connection.editor,
+    };
+}
+
 /// Appends a state, enters it, and returns its stack index.
 pub fn push(self: *Self, gpa: std.mem.Allocator, new_state: State) !State.Index {
     // Refuse to grow beyond the fixed capacity reserved by this stack.
@@ -177,12 +186,16 @@ pub const State = struct {
     pub const ContextTag = enum {
         /// The synth editor state.
         synth_editor,
+        /// Temporary state used while connecting two DSP outlets.
+        outlet_connection,
     };
 
     /// Union containing the concrete data for a supported state.
     pub const Context = union(ContextTag) {
         /// The synth editor context.
         synth_editor: SynthEditor,
+        /// The active outlet connection context.
+        outlet_connection: SynthEditor.OutletConnection,
     };
 
     /// Lifecycle and dispatch callbacks for a state context.

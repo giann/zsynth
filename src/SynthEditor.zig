@@ -6,6 +6,7 @@ const StateStack = @import("StateStack.zig");
 const ZSynth = @import("ZSynth.zig");
 const Renderer = @import("Renderer.zig");
 const Space = @import("Space.zig");
+const Display = @import("Display.zig");
 const VisualNode = Space.VisualNode;
 
 const Self = @This();
@@ -85,6 +86,7 @@ fn write(self: *Self, gpa: std.mem.Allocator) !void {
 fn moveViewport(self: *Self, gpa: std.mem.Allocator, dx: i32, dy: i32) !void {
     if (dx == 0 and dy == 0) return;
     self.space.moveViewport(dx, dy);
+    self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
 
@@ -111,6 +113,7 @@ fn keyUpDown(
             try self.remove(gpa, selected),
         .escape => {
             self.space.selected_node = null;
+            self.zsynth.cursor.dirty = true;
             try self.write(gpa);
         },
         else => return false,
@@ -128,19 +131,50 @@ fn mouseButton(
 ) anyerror!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
+    if (event.button == 3 and event.down) {
+        if (self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y })) |cell| {
+            const world = self.space.worldPositionAtDisplayCell(cell[0], cell[1]);
+            if (self.space.outletAt(world)) |outlet|
+                try self.disconnectOutlet(gpa, outlet);
+        }
+        return true;
+    }
+
     if (event.button == 1) {
         self.zsynth.cursor.left_mouse_down = event.down;
         self.zsynth.cursor.left_mouse_moved = false;
 
         if (event.down) {
             const cell = self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
+            if (cell) |display_cell| {
+                const world = self.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
+                if (self.space.outletAt(world)) |outlet| {
+                    self.zsynth.cursor.left_mouse_down = false;
+                    _ = self.space.revealNode(outlet.node);
+                    self.zsynth.cursor.dirty = true;
+                    const connection_position = self.space.worldPositionAtDisplayCell(
+                        display_cell[0],
+                        display_cell[1],
+                    );
+                    try self.beginOutletConnection(
+                        state_stack,
+                        gpa,
+                        outlet,
+                        connection_position,
+                    );
+                    return true;
+                }
+            }
+
             self.space.selected_node = if (cell) |display_cell|
                 self.space.nodeAtDisplayCell(display_cell[0], display_cell[1])
             else
                 null;
+            self.zsynth.cursor.dirty = true;
 
             if (cell) |display_cell| if (self.space.selected_node) |node| {
                 if (!node.isNoop()) {
+                    _ = self.space.revealNode(node);
                     const world = self.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
                     const position = self.space.nodePosition(node);
                     self.zsynth.cursor.drag_offset = .{
@@ -166,6 +200,55 @@ fn mouseButton(
     self.zsynth.cursor.middle_mouse_down = event.down;
     self.zsynth.cursor.viewport_pan_remainder = .{ 0, 0 };
     return true;
+}
+
+/// Enter the temporary state used while connecting an outlet to another outlet.
+fn beginOutletConnection(
+    self: *Self,
+    state_stack: *StateStack,
+    gpa: std.mem.Allocator,
+    outlet: Space.Outlet,
+    mouse_position: Space.Position,
+) !void {
+    self.space.selected_node = outlet.node;
+    _ = try state_stack.push(gpa, .{
+        .context = .{ .outlet_connection = .{
+            .editor = self,
+            .outlet = outlet,
+            .mouse_position = mouse_position,
+        } },
+        .vtable = &OutletConnection.vtable,
+    });
+}
+
+/// Connect two outlets after normalizing their input and output roles.
+fn connectOutlets(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    first: Space.Outlet,
+    second: Space.Outlet,
+) !void {
+    if (first.node.idx == second.node.idx or first.direction == second.direction)
+        return;
+
+    const output = if (first.direction == .output) first else second;
+    const input = if (first.direction == .input) first else second;
+
+    // An output can feed only one input, so replace its existing connection.
+    self.dsp.disconnectOutput(output.node, output.port);
+    self.dsp.plug(output.node, output.port, input.node, input.port);
+    try self.space.computePaths(gpa);
+    try self.write(gpa);
+}
+
+/// Remove the connection attached to an outlet.
+fn disconnectOutlet(self: *Self, gpa: std.mem.Allocator, outlet: Space.Outlet) !void {
+    switch (outlet.direction) {
+        .input => self.dsp.disconnectInput(outlet.node, outlet.port),
+        .output => self.dsp.disconnectOutput(outlet.node, outlet.port),
+    }
+    try self.space.computePaths(gpa);
+    try self.write(gpa);
 }
 
 /// Converts middle-button mouse motion into whole-cell viewport movement.
@@ -280,6 +363,7 @@ fn render(
 fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
     self.dsp.remove(node);
     try self.space.remove(gpa, node);
+    self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
 
@@ -619,3 +703,163 @@ fn simpleDSP(self: *Self, allocator: std.mem.Allocator) !void {
     // Compute link paths after the complete graph and all visual nodes exist.
     try self.space.computePaths(allocator);
 }
+
+/// Overlay state used to connect one DSP outlet to another.
+pub const OutletConnection = struct {
+    editor: *Self,
+    outlet: Space.Outlet,
+    mouse_position: Space.Position,
+    preview_path: ?Space.Path = null,
+
+    pub const vtable = StateStack.State.VTable{
+        .enter = OutletConnection.enter,
+        .leave = OutletConnection.leave,
+        .quit = OutletConnection.quit,
+        .render = OutletConnection.render,
+        .keyUpDown = OutletConnection.keyUpDown,
+        .mouseMoved = OutletConnection.mouseMoved,
+        .mouseButton = OutletConnection.mouseButton,
+    };
+
+    fn enter(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+    ) anyerror!void {
+        const context = stateContext(state_stack, state);
+        try context.updatePreview(gpa);
+    }
+
+    fn leave(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        _: *Renderer,
+        state: StateStack.State.Index,
+    ) anyerror!void {
+        stateContext(state_stack, state).clearPreview(gpa);
+    }
+
+    fn quit(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        _: *Renderer,
+        state: StateStack.State.Index,
+    ) anyerror!void {
+        stateContext(state_stack, state).clearPreview(gpa);
+    }
+
+    fn render(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        _: *Renderer,
+        _: u64,
+    ) anyerror!void {
+        // The editor rendered the base display first; this state only overlays the preview.
+        const context = stateContext(state_stack, state);
+        if (context.preview_path) |path|
+            try context.editor.space.writePreviewPath(
+                gpa,
+                &context.editor.zsynth.display,
+                path,
+            );
+    }
+
+    fn keyUpDown(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        event: sdl.KeyboardEvent,
+    ) anyerror!bool {
+        if (!event.down) return true;
+        if (event.key == .escape) {
+            const context = stateContext(state_stack, state);
+            try state_stack.pop(gpa, &context.editor.zsynth.renderer);
+        } else if (event.key == .d) {
+            const context = stateContext(state_stack, state);
+            try context.editor.disconnectOutlet(gpa, context.outlet);
+            try state_stack.pop(gpa, &context.editor.zsynth.renderer);
+        }
+        return true;
+    }
+
+    fn mouseMoved(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        event: sdl.MouseMotionEvent,
+    ) anyerror!bool {
+        const context = stateContext(state_stack, state);
+        if (context.editor.zsynth.displayCellAtWindowPosition(.{ event.x, event.y })) |cell| {
+            context.mouse_position = context.editor.space.worldPositionAtDisplayCell(cell[0], cell[1]);
+            try context.updatePreview(gpa);
+        }
+        return true;
+    }
+
+    fn mouseButton(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        event: sdl.MouseButtonEvent,
+    ) anyerror!bool {
+        const context = stateContext(state_stack, state);
+        const cell = context.editor.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
+        const clicked = if (cell) |display_cell|
+            context.editor.space.outletAt(
+                context.editor.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]),
+            )
+        else
+            null;
+
+        if (event.button == 3 and event.down) {
+            try state_stack.pop(gpa, &context.editor.zsynth.renderer);
+            return true;
+        }
+
+        if (event.button != 1 or !event.down) return true;
+        const target = clicked orelse return true;
+        if (target.node.idx == context.outlet.node.idx or
+            target.direction == context.outlet.direction)
+            return true;
+
+        try context.editor.connectOutlets(gpa, context.outlet, target);
+        try state_stack.pop(gpa, &context.editor.zsynth.renderer);
+        return true;
+    }
+
+    fn stateContext(state_stack: *StateStack, state: StateStack.State.Index) *OutletConnection {
+        return &state_stack.stack.items(.context)[state.idx].outlet_connection;
+    }
+
+    fn updatePreview(self: *OutletConnection, gpa: std.mem.Allocator) !void {
+        self.clearPreview(gpa);
+        const mouse_target = if (self.editor.space.outletAt(self.mouse_position)) |outlet|
+            outlet.anchor
+        else
+            self.mouse_position;
+        const from = if (self.outlet.direction == .output)
+            self.outlet.anchor
+        else
+            mouse_target;
+        const to = if (self.outlet.direction == .output)
+            mouse_target
+        else
+            self.outlet.anchor;
+        if (try self.editor.space.previewPath(gpa, from, to)) |path| {
+            var colored_path = path;
+            colored_path.color = if (self.outlet.direction == .output)
+                self.editor.space.nodeColor(self.outlet.node)
+            else
+                Display.Color.curious_blue;
+            self.preview_path = colored_path;
+        }
+    }
+
+    fn clearPreview(self: *OutletConnection, gpa: std.mem.Allocator) void {
+        if (self.preview_path) |path| {
+            Space.deinitPath(path, gpa);
+            self.preview_path = null;
+        }
+    }
+};

@@ -82,14 +82,14 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
     // Create the GPU renderer and its logical 640x360 window.
     var renderer = try Renderer.init(screen_width, screen_height, false, 1);
 
-    // Attach the window to the GPU device and prefer immediate presentation.
+    // Attach the window to the GPU device and synchronize presentation to the display.
     try sdl.claimWindowForGPUDevice(renderer.device, renderer.window);
-    if (sdl.windowSupportsGPUPresentMode(renderer.device, renderer.window, .immediate)) {
+    if (sdl.windowSupportsGPUPresentMode(renderer.device, renderer.window, .vsync)) {
         try sdl.setGPUSwapchainParameters(
             renderer.device,
             renderer.window,
             .sdr,
-            .immediate,
+            .vsync,
         );
     }
 
@@ -498,6 +498,9 @@ fn writeCursor(self: *Self, allocator: std.mem.Allocator) !void {
         @as(f32, @floatFromInt(cell_height)));
     if (cell_x >= display.width or cell_y >= display.height)
         return;
+
+    if (self.state_stack.synthEditor()) |editor|
+        try editor.space.writeUiOverlay(allocator, &self.ui_display, cell_x, cell_y);
 
     // Write the cursor glyph after the state's display content is complete.
     try self.ui_display.write(

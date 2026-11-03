@@ -50,8 +50,95 @@ pub const VisualNode = struct {
 
     dsp_node: DSP.Node.Index,
     position: Position,
+    /// Whether this node can contribute to the configured DSP output.
+    output_reachable: bool = false,
     paths: [DSP.max_outlets]?Path = @splat(null),
 };
+
+pub const Outlet = struct {
+    pub const Kind = enum { input, output };
+
+    node: VisualNode.Index,
+    direction: Kind,
+    port: u8,
+    anchor: Position,
+};
+
+/// Return the static metadata associated with a visual outlet.
+pub fn outletMetadata(self: *Self, outlet: Outlet) DSP.Node.OutletMetadata {
+    const state = self.dsp.nodes.items(.state)[outlet.node.idx];
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    return switch (outlet.direction) {
+        .input => metadata.inputs[outlet.port],
+        .output => metadata.outputs[outlet.port],
+    };
+}
+
+/// Draw transient outlet labels on the transparent UI display.
+pub fn writeUiOverlay(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    display: *Display,
+    cell_x: u32,
+    cell_y: u32,
+) !void {
+    if (self.selected_node) |node|
+        try self.writeSelectedOutletLabels(gpa, display, node);
+
+    const hovered = self.outletAt(self.worldPositionAtDisplayCell(cell_x, cell_y)) orelse return;
+    const metadata = self.outletMetadata(hovered);
+    const label_x = @as(i64, cell_x) - @as(i64, @intCast(metadata.short_name.len / 2));
+    try writeUiText(
+        gpa,
+        display,
+        label_x,
+        @as(i64, cell_y) + 1,
+        metadata.short_name,
+        metadata.color,
+    );
+}
+
+fn writeSelectedOutletLabels(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    display: *Display,
+    node: VisualNode.Index,
+) !void {
+    if (node.isNoop()) return;
+
+    const footprint = self.nodeFootprint(node);
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const screen_left = @as(i64, footprint.x) - @as(i64, self.viewport.x);
+    const screen_top = @as(i64, footprint.y) - @as(i64, self.viewport.y);
+
+    for (0..metadata.input_count) |port| {
+        const outlet = metadata.inputs[port];
+        const y = screen_top + self.outletYOffset(footprint, metadata.input_count, port);
+        const x = screen_left - @as(i64, @intCast(outlet.short_name.len));
+        try writeUiText(gpa, display, x, y, outlet.short_name, outlet.color);
+    }
+
+    for (0..metadata.output_count) |port| {
+        const outlet = metadata.outputs[port];
+        const y = screen_top + self.outletYOffset(footprint, metadata.output_count, port);
+        const x = screen_left + @as(i64, @intCast(footprint.width));
+        try writeUiText(gpa, display, x, y, outlet.short_name, outlet.color);
+    }
+}
+
+fn writeUiText(
+    gpa: std.mem.Allocator,
+    display: *Display,
+    x: i64,
+    y: i64,
+    text: []const u8,
+    color: Display.Color,
+) !void {
+    if (text.len == 0 or x < 0 or y < 0 or
+        x > std.math.maxInt(u32) or y > std.math.maxInt(u32)) return;
+    try display.write(gpa, text, @intCast(x), @intCast(y), .black, color);
+}
 
 viewport: Viewport,
 dsp: *DSP,
@@ -69,6 +156,55 @@ astar: AStar(Self, PathCriteria) = .{},
 pub fn moveViewport(self: *Self, dx: i32, dy: i32) void {
     self.viewport.x += dx;
     self.viewport.y += dy;
+}
+
+/// Shift the viewport minimally so a node and its selected labels are visible.
+pub fn revealNode(self: *Self, node: VisualNode.Index) bool {
+    if (node.isNoop()) return false;
+
+    const footprint = self.nodeFootprint(node);
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    var input_label_width: i64 = 0;
+    for (0..metadata.input_count) |port|
+        input_label_width = @max(input_label_width, @as(i64, @intCast(metadata.inputs[port].short_name.len)));
+    var output_label_width: i64 = 0;
+    for (0..metadata.output_count) |port|
+        output_label_width = @max(output_label_width, @as(i64, @intCast(metadata.outputs[port].short_name.len)));
+
+    const required_left = @as(i64, footprint.x) - input_label_width - 1;
+    const required_top = @as(i64, footprint.y);
+    const required_right = @as(i64, footprint.x) + @as(i64, footprint.width) + output_label_width;
+    const required_bottom = @as(i64, footprint.y) + @as(i64, footprint.height);
+    const viewport_left = @as(i64, self.viewport.x);
+    const viewport_top = @as(i64, self.viewport.y);
+    const viewport_width = @as(i64, self.viewport.width);
+    const viewport_height = @as(i64, self.viewport.height);
+
+    var viewport_x = viewport_left;
+    if (required_right - required_left <= viewport_width) {
+        if (required_left < viewport_left)
+            viewport_x = required_left
+        else if (required_right > viewport_left + viewport_width)
+            viewport_x = required_right - viewport_width;
+    } else {
+        viewport_x = required_left;
+    }
+
+    var viewport_y = viewport_top;
+    if (required_bottom - required_top <= viewport_height) {
+        if (required_top < viewport_top)
+            viewport_y = required_top
+        else if (required_bottom > viewport_top + viewport_height)
+            viewport_y = required_bottom - viewport_height;
+    } else {
+        viewport_y = required_top;
+    }
+
+    const changed = viewport_x != viewport_left or viewport_y != viewport_top;
+    self.viewport.x = @intCast(viewport_x);
+    self.viewport.y = @intCast(viewport_y);
+    return changed;
 }
 
 /// Convert a display cell to its world-space position.
@@ -151,6 +287,25 @@ fn searchBound(self: *Self) SearchBound {
     };
 }
 
+fn searchBoundFor(self: *Self, from: Position, to: Position) SearchBound {
+    const north_west = Position{
+        .x = @min(self.graph_north_west.x, @min(from.x, to.x)),
+        .y = @min(self.graph_north_west.y, @min(from.y, to.y)),
+    };
+    const south_east = Position{
+        .x = @max(self.graph_south_east.x, @max(from.x, to.x)),
+        .y = @max(self.graph_south_east.y, @max(from.y, to.y)),
+    };
+    const width = @as(i64, south_east.x) - @as(i64, north_west.x) + 1;
+    const height = @as(i64, south_east.y) - @as(i64, north_west.y) + 1;
+    return .{
+        .left = @as(i64, north_west.x) - width,
+        .top = @as(i64, north_west.y) - height,
+        .right = @as(i64, south_east.x) + width,
+        .bottom = @as(i64, south_east.y) + height,
+    };
+}
+
 pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.clearPaths(gpa);
     self.nodes.deinit(gpa);
@@ -201,6 +356,46 @@ pub fn write(
             try self.writeOutgoingPaths(gpa, display, node, .ebony);
         }
     }
+
+    try self.writeOutputTail(gpa, display);
+}
+
+/// Draws the fixed external-audio marker beyond the configured output node.
+fn writeOutputTail(self: *Self, gpa: std.mem.Allocator, display: *Display) !void {
+    const output = self.dsp.output;
+    if (output.isNoop() or output.idx >= self.nodes.len) return;
+
+    const footprint = self.nodeFootprint(output);
+    const state = self.dsp.nodes.items(.state)[output.idx];
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const output_y = @as(i64, footprint.y) + @as(i64, @intCast(
+        self.outletYOffset(footprint, metadata.output_count, 0),
+    )) - @as(i64, self.viewport.y);
+    const tail_start_x = @as(i64, footprint.x) + @as(i64, @intCast(footprint.width)) -
+        @as(i64, self.viewport.x);
+    const color = self.nodeColor(output);
+    const line_glyph = [_]u8{0xC4};
+    const marker = [_]u8{ 0x11, 0xF0 };
+
+    // Keep the tail aligned with the output port while clipping each cell.
+    for (0..3) |offset| {
+        const x = tail_start_x + @as(i64, @intCast(offset));
+        if (x >= 0 and output_y >= 0 and
+            x <= std.math.maxInt(u32) and output_y <= std.math.maxInt(u32))
+            try display.write(gpa, &line_glyph, @intCast(x), @intCast(output_y), .black, color);
+    }
+    for (marker, 0..) |glyph, offset| {
+        const x = tail_start_x + 3 + @as(i64, @intCast(offset));
+        const glyph_bytes = [_]u8{glyph};
+        if (x >= 0 and output_y >= 0 and
+            x <= std.math.maxInt(u32) and output_y <= std.math.maxInt(u32))
+            try display.write(gpa, &glyph_bytes, @intCast(x), @intCast(output_y), .black, color);
+    }
+}
+
+/// Returns whether a node can reach the DSP graph's configured output.
+fn isOutputReachable(self: *Self, node: VisualNode.Index) bool {
+    return self.nodes.items(.output_reachable)[node.idx];
 }
 
 pub fn writeNode(
@@ -229,6 +424,7 @@ fn writeNodeBody(
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
     const name = self.dsp.nodes.items(.name)[node.idx];
     const content_width = footprint.width - 2;
+    const node_color = self.nodeColor(node);
 
     // Clear the complete footprint first, clipping cells outside the display.
     for (0..footprint.width) |dx| {
@@ -248,9 +444,9 @@ fn writeNodeBody(
         const top_x = x + local_x;
         const bottom_y = y + @as(i64, @intCast(footprint.height - 1));
         if (top_x >= 0 and y >= 0)
-            try display.write(gpa, &top_glyph, @intCast(top_x), @intCast(y), background, metadata.color);
+            try display.write(gpa, &top_glyph, @intCast(top_x), @intCast(y), background, node_color);
         if (top_x >= 0 and bottom_y >= 0)
-            try display.write(gpa, &bottom_glyph, @intCast(top_x), @intCast(bottom_y), background, metadata.color);
+            try display.write(gpa, &bottom_glyph, @intCast(top_x), @intCast(bottom_y), background, node_color);
     }
     for (1..footprint.height - 1) |dy| {
         const local_y = @as(i64, @intCast(dy));
@@ -258,9 +454,9 @@ fn writeNodeBody(
         const left_y = y + local_y;
         const right_x = x + @as(i64, @intCast(footprint.width - 1));
         if (x >= 0 and left_y >= 0)
-            try display.write(gpa, &glyph, @intCast(x), @intCast(left_y), background, metadata.color);
+            try display.write(gpa, &glyph, @intCast(x), @intCast(left_y), background, node_color);
         if (right_x >= 0 and left_y >= 0)
-            try display.write(gpa, &glyph, @intCast(right_x), @intCast(left_y), background, metadata.color);
+            try display.write(gpa, &glyph, @intCast(right_x), @intCast(left_y), background, node_color);
     }
 
     const displayed_metadata_name = metadata.short_name[0..@min(metadata.short_name.len, content_width)];
@@ -286,14 +482,18 @@ fn writeNodeBody(
     const inputs = self.dsp.nodes.items(.inputs)[node.idx];
     for (0..metadata.input_count) |port| {
         const outlet_y = y + @as(i64, @intCast(self.outletYOffset(footprint, metadata.input_count, port)));
-        const color = if (inputs[port].isNoop()) Display.Color.gray else Display.Color.green;
+        const color = if (!self.isOutputReachable(node) or inputs[port].isNoop())
+            Display.Color.gray
+        else
+            Display.Color.green;
         if (x >= 0 and outlet_y >= 0)
             try display.write(gpa, &outlet, @intCast(x), @intCast(outlet_y), background, color);
     }
 
     for (0..metadata.output_count) |port| {
         const outlet_y = y + @as(i64, @intCast(self.outletYOffset(footprint, metadata.output_count, port)));
-        const color = if (self.dsp.nodes.items(.output_connected)[node.idx][port])
+        const color = if (self.isOutputReachable(node) and
+            self.dsp.nodes.items(.output_connected)[node.idx][port])
             Display.Color.green
         else
             Display.Color.gray;
@@ -363,8 +563,12 @@ fn writePath(
         }
     }
 
-    for (path.points) |point| {
-        const symbol = glyphForDirections(point.directions);
+    for (path.points, 0..) |point, index| {
+        const directions = if (point.directions != 0)
+            point.directions
+        else
+            pathPointDirections(path, index);
+        const symbol = glyphForDirections(directions);
         const screen_x = @as(i64, point.position.x) - @as(i64, self.viewport.x);
         const screen_y = @as(i64, point.position.y) - @as(i64, self.viewport.y);
         const glyph = [_]u8{symbol};
@@ -378,6 +582,31 @@ fn writePath(
     const arrow = [_]u8{0x1A};
     if (arrow_x >= 0 and arrow_y >= 0)
         try display.write(gpa, &arrow, @intCast(arrow_x), @intCast(arrow_y), background, link_color);
+}
+
+/// Draws a temporary path without making it part of the persistent graph.
+pub fn writePreviewPath(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    display: *Display,
+    path: Path,
+) !void {
+    try self.writePath(gpa, display, path, .black);
+}
+
+fn pathPointDirections(path: Path, index: usize) u4 {
+    var directions: u4 = 0;
+    if (index > 0)
+        directions |= directionForStep(.{
+            .x = path.points[index - 1].position.x - path.points[index].position.x,
+            .y = path.points[index - 1].position.y - path.points[index].position.y,
+        });
+    if (index + 1 < path.points.len)
+        directions |= directionForStep(.{
+            .x = path.points[index + 1].position.x - path.points[index].position.x,
+            .y = path.points[index + 1].position.y - path.points[index].position.y,
+        });
+    return if (directions == 0) Direction.right else directions;
 }
 
 fn glyphForDirections(directions: u4) u8 {
@@ -433,6 +662,12 @@ pub fn nodeFootprint(self: *Self, node: VisualNode.Index) Bound {
     };
 }
 
+pub fn nodeColor(self: *Self, node: VisualNode.Index) Display.Color {
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    if (!self.isOutputReachable(node)) return Display.Color.gray;
+    return DSP.node_metadata.get(std.meta.activeTag(state)).color;
+}
+
 fn outletYOffset(_: *Self, footprint: Bound, outlet_count: u8, port: usize) i32 {
     if (outlet_count == 1)
         return @intCast(footprint.height / 2);
@@ -453,6 +688,43 @@ pub fn nodeAt(self: *Self, position: Position) ?VisualNode.Index {
         const bottom = top + @as(i64, footprint.height);
         if (x >= left and x < right and y >= top and y < bottom)
             return .{ .idx = node_index };
+    }
+
+    return null;
+}
+
+/// Return the outlet glyph at a world-space position, if any.
+pub fn outletAt(self: *Self, position: Position) ?Outlet {
+    for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
+        if (node.isNoop()) continue;
+
+        const visual_node = VisualNode.Index{ .idx = node_index };
+        const footprint = self.nodeFootprint(visual_node);
+        const state = self.dsp.nodes.items(.state)[node_index];
+        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+
+        for (0..metadata.input_count) |port| {
+            const y = footprint.y + self.outletYOffset(footprint, metadata.input_count, port);
+            if (position.x == footprint.x and position.y == y)
+                return .{
+                    .node = visual_node,
+                    .direction = .input,
+                    .port = @intCast(port),
+                    .anchor = .{ .x = footprint.x - 2, .y = y },
+                };
+        }
+
+        for (0..metadata.output_count) |port| {
+            const y = footprint.y + self.outletYOffset(footprint, metadata.output_count, port);
+            if (position.x == footprint.x + @as(i32, @intCast(footprint.width - 1)) and
+                position.y == y)
+                return .{
+                    .node = visual_node,
+                    .direction = .output,
+                    .port = @intCast(port),
+                    .anchor = .{ .x = footprint.x + @as(i32, @intCast(footprint.width)), .y = y },
+                };
+        }
     }
 
     return null;
@@ -597,8 +869,25 @@ pub fn deinitPath(path: Path, gpa: std.mem.Allocator) void {
     gpa.free(path.points);
 }
 
+/// Find a temporary route without adding it to persistent path occupancy.
+pub fn previewPath(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    from: Position,
+    to: Position,
+) !?Path {
+    self.updateGraphBounds();
+    self.astar.reset();
+    return try self.astar.search(gpa, self, .{
+        .from = from,
+        .to = to,
+        .bound = self.searchBoundFor(from, to),
+    });
+}
+
 /// Compute one path for every connected input in the visual graph.
 pub fn computePaths(self: *Self, gpa: std.mem.Allocator) !void {
+    self.computeOutputReachability();
     self.updateGraphBounds();
     const bound = self.searchBound();
     self.clearPaths(gpa);
@@ -617,6 +906,32 @@ pub fn computePaths(self: *Self, gpa: std.mem.Allocator) !void {
     }
 
     try self.addPathJunctions(gpa);
+}
+
+/// Rebuilds the reverse-reachability cache for the configured DSP output.
+fn computeOutputReachability(self: *Self) void {
+    const node_count = self.dsp.nodes.len;
+    const output_reachable = self.nodes.items(.output_reachable);
+    @memset(output_reachable, false);
+
+    if (self.dsp.output.idx >= node_count) return;
+    output_reachable[self.dsp.output.idx] = true;
+
+    // Repeatedly propagate reachability from destinations to their sources.
+    // This converges for cycles as well as ordinary acyclic DSP graphs.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (self.dsp.nodes.items(.inputs), 0..) |node_inputs, destination_idx| {
+            if (!output_reachable[destination_idx]) continue;
+            for (node_inputs) |connection| {
+                if (connection.isNoop() or connection.node.idx >= node_count) continue;
+                if (output_reachable[connection.node.idx]) continue;
+                output_reachable[connection.node.idx] = true;
+                changed = true;
+            }
+        }
+    }
 }
 
 fn computePathForInput(
@@ -661,9 +976,7 @@ fn computePathForInput(
     })) |path| {
         var colored_path = path;
         colored_path.source = source;
-        colored_path.color = DSP.node_metadata.get(
-            std.meta.activeTag(source_state),
-        ).color;
+        colored_path.color = self.nodeColor(source);
         try self.occupyPath(gpa, colored_path);
         self.nodes.items(.paths)[destination.idx][input_port] = colored_path;
     }

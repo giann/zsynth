@@ -108,8 +108,11 @@ pub fn plug(
 
     // Validate both ends before replacing the destination connection.
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[source.idx]);
-    std.debug.assert(source_output_port < node_metadata.get(source_tag).output_count);
-    std.debug.assert(destination_port < max_outlets);
+    const source_metadata = node_metadata.get(source_tag);
+    const destination_tag = std.meta.activeTag(self.nodes.items(.state)[destination.idx]);
+    const destination_metadata = node_metadata.get(destination_tag);
+    std.debug.assert(source_output_port < source_metadata.output_count);
+    std.debug.assert(destination_port < destination_metadata.input_count);
 
     const inputs = self.nodes.items(.inputs);
     const output_connected = self.nodes.items(.output_connected);
@@ -129,6 +132,42 @@ pub fn plug(
         .output_port = source_output_port,
     };
     output_connected[source.idx][source_output_port] = true;
+}
+
+/// Disconnects the edge feeding one input port.
+pub fn disconnectInput(self: *DSP, destination: Node.Index, destination_port: u8) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (destination.idx >= self.nodes.len or destination_port >= max_outlets)
+        return;
+
+    const inputs = self.nodes.items(.inputs);
+    const output_connected = self.nodes.items(.output_connected);
+    const previous = inputs[destination.idx][destination_port];
+    if (!previous.isNoop())
+        output_connected[previous.node.idx][previous.output_port] = false;
+    inputs[destination.idx][destination_port] = .{};
+}
+
+/// Disconnects every edge leaving one output port.
+pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (source.idx >= self.nodes.len or source_output_port >= max_outlets)
+        return;
+
+    const inputs = self.nodes.items(.inputs);
+    for (inputs) |*node_inputs| {
+        for (node_inputs) |*connection| {
+            if (!connection.isNoop() and
+                connection.node.idx == source.idx and
+                connection.output_port == source_output_port)
+                connection.* = .{};
+        }
+    }
+    self.nodes.items(.output_connected)[source.idx][source_output_port] = false;
 }
 
 /// Removes a node and repairs all graph references affected by the swap.
@@ -533,11 +572,21 @@ pub const Note = struct {
 
 /// A processable node in the audio graph.
 pub const Node = struct {
+    /// Static metadata for one node input or output.
+    pub const OutletMetadata = struct {
+        name: []const u8 = "",
+        short_name: []const u8 = "",
+        unit: []const u8 = "",
+        color: Display.Color = .transparent,
+    };
+
     /// Static port metadata for a node kind.
     pub const Metadata = struct {
         name: []const u8,
         short_name: []const u8,
         color: Display.Color,
+        inputs: [max_outlets]OutletMetadata = @splat(.{}),
+        outputs: [max_outlets]OutletMetadata = @splat(.{}),
         output_count: u8 = 1,
         input_count: u8 = 1,
     };
@@ -650,7 +699,17 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "No-op",
             .short_name = "noop",
-            .color = Display.Color.gray,
+            .color = .gray,
+            .outputs = .{
+                .{ .name = "output", .short_name = "out", .color = .gray },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = 0,
         };
 
@@ -677,7 +736,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Output",
             .short_name = "out",
-            .color = Display.Color.persimmon,
+            .color = .persimmon,
+            .inputs = .{
+                .{ .name = "audio", .short_name = "in", .color = .persimmon },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "audio", .short_name = "out", .color = .persimmon },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
         };
 
         /// Creates a graph output node with one input and one output.
@@ -718,7 +797,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Add",
             .short_name = "add",
-            .color = Display.Color.amber,
+            .color = .amber,
+            .inputs = .{
+                .{ .name = "input 1", .short_name = "in1", .color = .amber },
+                .{ .name = "input 2", .short_name = "in2", .color = .amber },
+                .{ .name = "input 3", .short_name = "in3", .color = .amber },
+                .{ .name = "input 4", .short_name = "in4", .color = .amber },
+                .{ .name = "input 5", .short_name = "in5", .color = .amber },
+                .{ .name = "input 6", .short_name = "in6", .color = .amber },
+                .{ .name = "input 7", .short_name = "in7", .color = .amber },
+                .{ .name = "input 8", .short_name = "in8", .color = .amber },
+            },
+            .outputs = .{
+                .{ .name = "sum", .short_name = "sum", .color = .amber },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = max_outlets,
         };
 
@@ -788,7 +887,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Multiply",
             .short_name = "mul",
-            .color = Display.Color.cinnabar,
+            .color = .cinnabar,
+            .inputs = .{
+                .{ .name = "input 1", .short_name = "in1", .color = .cinnabar },
+                .{ .name = "input 2", .short_name = "in2", .color = .cinnabar },
+                .{ .name = "input 3", .short_name = "in3", .color = .cinnabar },
+                .{ .name = "input 4", .short_name = "in4", .color = .cinnabar },
+                .{ .name = "input 5", .short_name = "in5", .color = .cinnabar },
+                .{ .name = "input 6", .short_name = "in6", .color = .cinnabar },
+                .{ .name = "input 7", .short_name = "in7", .color = .cinnabar },
+                .{ .name = "input 8", .short_name = "in8", .color = .cinnabar },
+            },
+            .outputs = .{
+                .{ .name = "product", .short_name = "prod", .color = .cinnabar },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = max_outlets,
         };
 
@@ -858,7 +977,17 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Constant",
             .short_name = "cst",
-            .color = Display.Color.golden_rod,
+            .color = .golden_rod,
+            .outputs = .{
+                .{ .name = "value", .short_name = "val", .color = .golden_rod },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = 0,
         };
 
@@ -900,7 +1029,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Oscillator",
             .short_name = "osc",
-            .color = Display.Color.curious_blue,
+            .color = .curious_blue,
+            .inputs = .{
+                .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .curious_blue },
+                .{ .name = "amplitude", .short_name = "amp", .color = .curious_blue },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "audio", .short_name = "out", .color = .curious_blue },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = 2,
         };
 
@@ -1029,7 +1178,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Mixer",
             .short_name = "mix",
-            .color = Display.Color.cerulean,
+            .color = .cerulean,
+            .inputs = .{
+                .{ .name = "input 1", .short_name = "in1", .color = .cerulean },
+                .{ .name = "input 2", .short_name = "in2", .color = .cerulean },
+                .{ .name = "input 3", .short_name = "in3", .color = .cerulean },
+                .{ .name = "input 4", .short_name = "in4", .color = .cerulean },
+                .{ .name = "input 5", .short_name = "in5", .color = .cerulean },
+                .{ .name = "input 6", .short_name = "in6", .color = .cerulean },
+                .{ .name = "input 7", .short_name = "in7", .color = .cerulean },
+                .{ .name = "input 8", .short_name = "in8", .color = .cerulean },
+            },
+            .outputs = .{
+                .{ .name = "mix", .short_name = "mix", .color = .cerulean },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = max_outlets,
         };
 
@@ -1144,7 +1313,17 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Monophonic Sequencer",
             .short_name = "seq",
-            .color = Display.Color.feijoa,
+            .color = .feijoa,
+            .outputs = .{
+                .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
+                .{ .name = "gate", .short_name = "gate", .color = .feijoa },
+                .{ .name = "velocity", .short_name = "vel", .color = .feijoa },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = 0,
             .output_count = 3,
         };
@@ -1290,7 +1469,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "ADSR",
             .short_name = "adsr",
-            .color = Display.Color.fuschia_pink,
+            .color = .fuschia_pink,
+            .inputs = .{
+                .{ .name = "gate", .short_name = "gate", .color = .fuschia_pink },
+                .{ .name = "velocity", .short_name = "vel", .color = .fuschia_pink },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "envelope", .short_name = "env", .color = .fuschia_pink },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = 2,
         };
 
@@ -1374,9 +1573,11 @@ pub const Node = struct {
             const gate_connection = input_outlets[0];
             const velocity_connection = input_outlets[1];
 
-            // Resolve the required gate signal.
-            std.debug.assert(!gate_connection.isNoop());
-            const gate_buffer = try dsp.getOutput(gate_connection, into[0].sample_count);
+            // A severed gate means gate-off, allowing the envelope to release safely.
+            const gate_buffer = if (gate_connection.isNoop())
+                null
+            else
+                try dsp.getOutput(gate_connection, into[0].sample_count);
 
             // Resolve optional velocity modulation; unity is the default.
             const velocity_buffer = if (velocity_connection.isNoop())
@@ -1392,7 +1593,10 @@ pub const Node = struct {
             for (0..frame_count) |frame| {
                 const sample_index = frame * 2;
 
-                const gate = gate_buffer.samples[sample_index];
+                const gate = if (gate_buffer) |buffer|
+                    buffer.samples[sample_index]
+                else
+                    0;
                 const velocity = if (velocity_buffer) |buffer|
                     buffer.samples[sample_index]
                 else
@@ -1540,7 +1744,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Multimode Filter",
             .short_name = "mmf",
-            .color = Display.Color.havelock_blue,
+            .color = .havelock_blue,
+            .inputs = .{
+                .{ .name = "audio", .short_name = "in", .color = .havelock_blue },
+                .{ .name = "cutoff", .short_name = "cut", .unit = "Hz", .color = .havelock_blue },
+                .{ .name = "resonance", .short_name = "res", .color = .havelock_blue },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "audio", .short_name = "out", .color = .havelock_blue },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .input_count = 3,
         };
 
@@ -1595,8 +1819,10 @@ pub const Node = struct {
             const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
 
-            // Audio input is required; cutoff and resonance are optional.
-            std.debug.assert(!input_outlets[0].isNoop());
+            // A severed audio input leaves the already-cleared output silent.
+            if (input_outlets[0].isNoop()) return;
+
+            // Cutoff and resonance are optional.
             const audio_buffer = try dsp.getOutput(
                 input_outlets[0],
                 into[0].sample_count,
@@ -1665,7 +1891,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Bit Crusher",
             .short_name = "bcr",
-            .color = Display.Color.desert,
+            .color = .desert,
+            .inputs = .{
+                .{ .name = "audio", .short_name = "in", .color = .desert },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "audio", .short_name = "out", .color = .desert },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
         };
 
         /// User-controlled reduction settings.
@@ -1707,9 +1953,11 @@ pub const Node = struct {
             const levels: f32 = @floatFromInt((@as(u32, 1) << parameters.bit_depth) - 1);
             const frames_to_hold = dsp.sample_rate / parameters.target_sample_rate;
 
-            // Resolve the required source buffer before processing frames.
+            // A severed source leaves the already-cleared output silent.
             const input = dsp.nodes.items(.inputs)[node.idx][0];
-            std.debug.assert(!input.isNoop());
+            if (input.isNoop()) return;
+
+            // Resolve the source buffer before processing frames.
             const input_buffer = try dsp.getOutput(input, output.sample_count);
 
             std.debug.assert(output.sample_count % 2 == 0);
@@ -1746,7 +1994,27 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Noise",
             .short_name = "noi",
-            .color = Display.Color.logan,
+            .color = .logan,
+            .inputs = .{
+                .{ .name = "amplitude", .short_name = "amp", .color = .logan },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "noise", .short_name = "out", .color = .logan },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
         };
 
         /// Available noise colors.
