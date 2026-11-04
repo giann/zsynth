@@ -33,9 +33,7 @@ pub const SampleTap = struct {
     /// Queue type used to publish blocks to independent main-thread readers.
     pub const Queue = SpmcQueue(Block);
 
-    /// Inline queue storage owned by this SampleTap.
-    storage: [sample_tap_capacity]Queue.Slot = undefined,
-    /// Queue descriptor referencing `storage`; it owns no memory.
+    /// Queue descriptor owning its heap-allocated ring storage.
     queue: Queue = undefined,
 };
 
@@ -97,6 +95,8 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
     self.sound.destroy();
     // Tear down the callback source before freeing graph storage.
     self.graph_data_source.deinit();
+    for (self.nodes.items(.sample_tap)) |*sample_tap|
+        sample_tap.queue.deinit(gpa);
     // Release all node storage using the allocator supplied at init time.
     self.nodes.deinit(gpa);
 }
@@ -109,6 +109,11 @@ pub fn start(self: *DSP) !void {
 /// Stops streaming graph audio without destroying the graph.
 pub fn stop(self: *DSP) !void {
     try self.sound.stop();
+}
+
+/// Reports whether the audio sound is currently playing.
+pub fn isPlaying(self: *const DSP) bool {
+    return self.sound.isPlaying();
 }
 
 pub fn toggle(self: *DSP) !void {
@@ -192,8 +197,8 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
     self.nodes.items(.output_connected)[source.idx][source_output_port] = false;
 }
 
-/// Removes a node and repairs all graph references affected by the swap.
-pub fn remove(self: *DSP, node: Node.Index) void {
+/// Removes a node, releases its SampleTap, and repairs graph references.
+pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
@@ -221,6 +226,7 @@ pub fn remove(self: *DSP, node: Node.Index) void {
         }
     }
 
+    self.nodes.items(.sample_tap)[node.idx].queue.deinit(gpa);
     self.nodes.swapRemove(node.idx);
 
     if (removing_output) {
@@ -231,11 +237,6 @@ pub fn remove(self: *DSP, node: Node.Index) void {
 
     // The last node moved into the removed slot. Rewrite references to its old index.
     if (node.idx != last_index) {
-        // MultiArrayList moved the last node's SampleTap, so its queue slice
-        // must point at the SampleTap's new inline storage address.
-        const moved_tap = &self.nodes.items(.sample_tap)[node.idx];
-        moved_tap.queue.setBuffer(moved_tap.storage[0..]);
-
         for (self.nodes.items(.inputs)) |*node_inputs| {
             for (node_inputs) |*connection| {
                 if (!connection.isNoop() and connection.node.idx == last_index)
@@ -254,15 +255,8 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     errdefer _ = self.nodes.pop();
 
     const new_index = self.nodes.len - 1;
-    const sample_taps = self.nodes.items(.sample_tap);
-    sample_taps[new_index].queue = .initBuffer(sample_taps[new_index].storage[0..]);
-
-    // Appending can relocate every MultiArrayList field, invalidating each
-    // queue slice that points into its node's inline SampleTap storage.
-    for (sample_taps, 0..) |*sample_tap, index| {
-        if (index != new_index)
-            sample_tap.queue.setBuffer(sample_tap.storage[0..]);
-    }
+    self.nodes.items(.sample_tap)[new_index].queue =
+        try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
 
     return .{ .idx = new_index };
 }
@@ -666,6 +660,8 @@ pub const Node = struct {
         name: []const u8,
         short_name: []const u8,
         color: Display.Color,
+        /// Whether the node's outputs are meaningful to inspect as audio levels.
+        meterable: bool = true,
         inputs: [max_outlets]OutletMetadata = @splat(.{}),
         outputs: [max_outlets]OutletMetadata = @splat(.{}),
         output_count: u8 = 1,
@@ -1045,6 +1041,7 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Constant",
             .short_name = "cst",
+            .meterable = false,
             .color = .golden_rod,
             .outputs = .{
                 .{ .name = "value", .short_name = "val", .color = .golden_rod },
@@ -1382,6 +1379,7 @@ pub const Node = struct {
             .name = "Monophonic Sequencer",
             .short_name = "seq",
             .color = .feijoa,
+            .meterable = false,
             .outputs = .{
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
                 .{ .name = "gate", .short_name = "gate", .color = .feijoa },

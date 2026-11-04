@@ -20,12 +20,15 @@ zsynth: *ZSynth,
 /// DSP graph constructed when the editor enters the state stack.
 dsp: DSP,
 space: Space,
+/// Output meter bound to the currently selected DSP node.
+output_meter: OutputMeter = .{},
 
 /// State-stack callbacks used by the synth editor context.
 pub const vtable = StateStack.State.VTable{
     .enter = enter,
     .leave = leave,
     .quit = quit,
+    .update = update,
     .render = render,
     .keyUpDown = keyUpDown,
     .mouseMoved = mouseMoved,
@@ -80,6 +83,75 @@ fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.space.deinit(gpa);
 }
 
+/// Updates the selected node's output meter from the main thread.
+fn update(
+    state_stack: *StateStack,
+    _: std.mem.Allocator,
+    state: StateStack.State.Index,
+    dt: u64,
+) anyerror!void {
+    const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    const selected_node = self.space.selected_node orelse return;
+    if (self.output_meter.output_count == 0) return;
+    assert(self.output_meter.parameters.node.idx == selected_node.idx);
+    self.output_meter.update(&self.dsp, dt);
+}
+
+/// Changes the selected node and resets the meter source to match it.
+fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
+    const selected = if (node) |value| if (value.isNoop()) null else value else null;
+    const previous_parameters = self.output_meter.parameters;
+    self.space.selected_node = selected;
+    self.output_meter = .{
+        .parameters = .{
+            .direction = previous_parameters.direction,
+            .node = undefined,
+            .meter_cell_count = previous_parameters.meter_cell_count,
+        },
+    };
+
+    const selected_node = selected orelse return;
+    if (selected_node.idx >= self.dsp.nodes.len) {
+        self.space.selected_node = null;
+        self.output_meter = .{};
+        return;
+    }
+
+    const state = self.dsp.nodes.items(.state)[selected_node.idx];
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    if (!metadata.meterable) return;
+
+    self.output_meter.parameters.node = selected_node;
+    self.output_meter.output_count = metadata.output_count;
+    assert(self.output_meter.parameters.meter_cell_count > 0);
+
+    const horizontal = switch (self.output_meter.parameters.direction) {
+        .left, .right => true,
+        .up, .down => false,
+    };
+    self.output_meter.height = if (horizontal)
+        3
+    else
+        self.output_meter.parameters.meter_cell_count + 2;
+
+    for (metadata.outputs[0..metadata.output_count], 0..) |output, output_port| {
+        self.output_meter.output_short_names[output_port] = output.short_name;
+        const group_width = if (horizontal)
+            @max(
+                self.output_meter.parameters.meter_cell_count + 1,
+                @as(u32, @intCast(output.short_name.len)),
+            )
+        else
+            @max(2, @as(u32, @intCast(output.short_name.len)));
+        self.output_meter.width += @max(
+            group_width,
+            @as(u32, @intCast(output.short_name.len)),
+        );
+        if (output_port + 1 < metadata.output_count)
+            self.output_meter.width += 1;
+    }
+}
+
 /// Redraws the editor's status text in the runtime-owned display.
 fn write(self: *Self, gpa: std.mem.Allocator) !void {
     self.zsynth.display.reset();
@@ -101,14 +173,25 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     const state = self.dsp.nodes.items(.state)[selected.idx];
     switch (state) {
         inline else => |node_state| {
-            if (!@hasField(@TypeOf(node_state), "parameters")) return;
-            try writeReflectedParameters(
-                gpa,
-                display,
-                node_state.parameters,
-                graphic.height,
-                graphic.width,
-            );
+            if (@hasField(@TypeOf(node_state), "parameters")) {
+                try writeReflectedParameters(
+                    gpa,
+                    display,
+                    node_state.parameters,
+                    graphic.height,
+                    graphic.width,
+                    &self.output_meter,
+                );
+            } else {
+                try writeReflectedParameters(
+                    gpa,
+                    display,
+                    struct {}{},
+                    graphic.height,
+                    graphic.width,
+                    &self.output_meter,
+                );
+            }
         },
     }
 }
@@ -135,6 +218,7 @@ fn writeReflectedParameters(
     parameters: anytype,
     display_height: u32,
     display_width: u32,
+    output_meter: *const OutputMeter,
 ) !void {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
     var items: [field_names.len]Display.LabelValue = undefined;
@@ -157,17 +241,58 @@ fn writeReflectedParameters(
 
     const pane_height = @min(
         display_height,
-        @as(u32, @intCast(field_names.len)) + 2,
+        @max(
+            @as(u32, 5),
+            @max(
+                @as(u32, @intCast(field_names.len)) + 2,
+                output_meter.height + 2,
+            ),
+        ),
     );
-    if (pane_height <= 2) return;
+    if (pane_height < 2) return;
     const row_count = @min(
         @as(u32, @intCast(field_names.len)),
         pane_height - 2,
     );
-    const content_width = Display.labelValueColumnsWidth(&items, row_count);
-    if (content_width == 0) return;
+    // Match writeLabelValueColumns' column packing so the pane reserves the
+    // same width that the parameter renderer will consume.
+    var content_width: u32 = 0;
+    if (items.len != 0 and row_count != 0) {
+        const rows = @min(row_count, @as(u32, @intCast(items.len)));
+        var item_index: usize = 0;
+        while (item_index < items.len) {
+            const column_end = @min(
+                item_index + @as(usize, @intCast(rows)),
+                items.len,
+            );
+            var label_width: u32 = 0;
+            var column_width: u32 = 0;
 
-    const pane_width = @min(display_width, content_width + parameters_pane_padding * 2);
+            for (item_index..column_end) |index|
+                label_width = @max(
+                    label_width,
+                    @as(u32, @intCast(Display.countStripped(items[index].label))),
+                );
+
+            for (item_index..column_end) |index|
+                column_width = @max(
+                    column_width,
+                    label_width + 2 +
+                        @as(u32, @intCast(Display.countStripped(items[index].value))),
+                );
+
+            content_width += column_width;
+            item_index = column_end;
+            if (item_index < items.len)
+                content_width += 1;
+        }
+    }
+    const parameter_x = parameters_pane_padding + output_meter.width +
+        @as(u32, @intFromBool(output_meter.output_count != 0));
+    const required_meter_width = output_meter.width + parameters_pane_padding * 2;
+    const required_parameter_width = parameter_x + content_width + parameters_pane_padding;
+    const pane_width = @min(display_width, @max(required_meter_width, required_parameter_width));
+    if (pane_width < 2) return;
     const pane_top = display_height - pane_height;
     try display.fill(
         gpa,
@@ -190,16 +315,24 @@ fn writeReflectedParameters(
         .single,
     );
 
-    try display.writeLabelValueColumns(
-        gpa,
-        &items,
-        parameters_pane_padding,
-        pane_top + parameters_pane_padding,
-        pane_width,
-        row_count,
-        .ebony,
-        .apple,
-    );
+    if (output_meter.output_count != 0)
+        try output_meter.write(
+            gpa,
+            display,
+            .{ parameters_pane_padding, pane_top + parameters_pane_padding },
+        );
+
+    if (content_width != 0)
+        try display.writeLabelValueColumns(
+            gpa,
+            &items,
+            parameter_x,
+            pane_top + parameters_pane_padding,
+            pane_width,
+            row_count,
+            .ebony,
+            .apple,
+        );
 }
 
 /// Moves the viewport and redraws the complete visible space.
@@ -228,11 +361,18 @@ fn keyUpDown(
         .down => try self.moveViewport(gpa, 0, delta),
         .left => try self.moveViewport(gpa, -delta, 0),
         .right => try self.moveViewport(gpa, delta, 0),
-        .space => try self.dsp.toggle(),
+        .space => {
+            const was_playing = self.dsp.isPlaying();
+            try self.dsp.toggle();
+            if (was_playing and self.output_meter.output_count != 0) {
+                self.output_meter.reset();
+                try self.writeSelectedParametersPane(gpa);
+            }
+        },
         .d => if (self.space.selected_node) |selected|
             try self.remove(gpa, selected),
         .escape => {
-            self.space.selected_node = null;
+            self.setNodeSelection(null);
             self.zsynth.cursor.dirty = true;
             try self.write(gpa);
         },
@@ -286,10 +426,10 @@ fn mouseButton(
                 }
             }
 
-            self.space.selected_node = if (cell) |display_cell|
+            self.setNodeSelection(if (cell) |display_cell|
                 self.space.nodeAtDisplayCell(display_cell[0], display_cell[1])
             else
-                null;
+                null);
             self.zsynth.cursor.dirty = true;
 
             if (cell) |display_cell| if (self.space.selected_node) |node| {
@@ -330,7 +470,7 @@ fn beginOutletConnection(
     outlet: Space.Outlet,
     mouse_position: Space.Position,
 ) !void {
-    self.space.selected_node = outlet.node;
+    self.setNodeSelection(outlet.node);
     _ = try state_stack.push(gpa, .{
         .context = .{ .outlet_connection = .{
             .editor = self,
@@ -489,8 +629,9 @@ fn render(
 
 /// Removes a DSP node and its synchronized visual representation.
 fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
-    self.dsp.remove(node);
+    self.dsp.remove(gpa, node);
     try self.space.remove(gpa, node);
+    self.setNodeSelection(self.space.selected_node);
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
@@ -996,6 +1137,8 @@ pub const OutletConnection = struct {
 pub const OutputMeter = struct {
     /// Duration of samples accumulated before publishing a new meter value.
     const observe_duration_ms = 300;
+    /// Duration for which a clipping indicator remains visible.
+    const clipping_hold_ms: u64 = 1000;
     /// Number of stereo frames in one meter observation window.
     const observe_frame_count = (observe_duration_ms * DSP.sample_rate) / 1000;
     /// Number of interleaved samples in one meter observation window.
@@ -1004,8 +1147,38 @@ pub const OutputMeter = struct {
     /// Queue type used by the node's SampleTap.
     const Queue = DSP.SampleTap.Queue;
 
-    /// Node whose rendered outputs are analyzed by this meter.
-    node: DSP.Node.Index,
+    /// Direction in which a meter grows from its empty end to its full end.
+    pub const Direction = enum {
+        /// Horizontal meter filling from right to left.
+        left,
+        /// Horizontal meter filling from left to right.
+        right,
+        /// Vertical meter filling from bottom to top.
+        up,
+        /// Vertical meter filling from top to bottom.
+        down,
+    };
+
+    /// User-configurable source and geometry for an output meter.
+    pub const Parameters = struct {
+        /// Direction in which each meter fills.
+        direction: Direction = .right,
+        /// Node whose rendered outputs are analyzed; valid only when selected.
+        node: DSP.Node.Index = undefined,
+        /// Number of cells used by each meter itself.
+        meter_cell_count: u32 = 10,
+    };
+
+    /// Source and geometry settings for this meter.
+    parameters: Parameters = .{},
+    /// Number of declared outputs shown by the meter.
+    output_count: u8 = 0,
+    /// Short names displayed beneath the output meter groups.
+    output_short_names: [DSP.max_outlets][]const u8 = @splat(""),
+    /// Total width of all output groups and their single-cell separators.
+    width: u32 = 0,
+    /// Height required by one output group including its labels.
+    height: u32 = 0,
     /// Independent reader cursor for the node's SampleTap history.
     reader: ?Queue.Reader = null,
     /// Number of interleaved samples accumulated in the current window.
@@ -1014,21 +1187,179 @@ pub const OutputMeter = struct {
     sum_squared: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
     /// Running absolute peaks indexed by output port and stereo channel.
     peak: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
+    /// Peak-hold amplitudes indexed by output port and stereo channel.
+    peak_hold: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
     /// RMS level in dBFS indexed by output port and stereo channel.
-    rms_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
+    rms_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ -120, -120 }),
     /// Peak level in dBFS indexed by output port and stereo channel.
-    peak_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
-    /// Latched clipping state indexed by output port and stereo channel.
-    clipped: [DSP.max_outlets][2]bool = @splat(.{ false, false }),
+    peak_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ -120, -120 }),
+    /// Remaining clipping-indicator time in milliseconds per output/channel.
+    clipping_remaining_ms: [DSP.max_outlets][2]u64 = @splat(.{ 0, 0 }),
 
-    /// Drains the node's SampleTap and updates completed observation windows.
-    pub fn update(self: *OutputMeter, dsp: *DSP) void {
-        const sample_tap = dsp.sampleTap(self.node) orelse return;
+    /// Resets every measured value while preserving the meter source and layout.
+    pub fn reset(self: *OutputMeter) void {
+        // Clearing the reader makes the next update begin at the queue's
+        // current tail, so samples rendered before the pause are discarded.
+        self.reader = null;
+        self.sample_cursor = 0;
+        self.sum_squared = @splat(.{ 0, 0 });
+        self.peak = @splat(.{ 0, 0 });
+        self.peak_hold = @splat(.{ 0, 0 });
+        self.rms_dbfs = @splat(.{ -120, -120 });
+        self.peak_dbfs = @splat(.{ -120, -120 });
+        self.clipping_remaining_ms = @splat(.{ 0, 0 });
+    }
+
+    /// Draws all output meter groups and their metadata labels.
+    pub fn write(
+        self: *const OutputMeter,
+        gpa: std.mem.Allocator,
+        display: *Display,
+        position: [2]u32,
+    ) !void {
+        if (display.impl != .graphic or self.output_count == 0)
+            return;
+
+        const graphic = &display.impl.graphic;
+        assert(self.parameters.meter_cell_count > 0);
+        if (position[1] >= graphic.height or
+            self.height > graphic.height - position[1])
+            return;
+
+        const horizontal = switch (self.parameters.direction) {
+            .left, .right => true,
+            .up, .down => false,
+        };
+        const grows_forward = switch (self.parameters.direction) {
+            .right, .down => true,
+            .left, .up => false,
+        };
+        const meter_cell_count = self.parameters.meter_cell_count;
+        const meter_count: usize = @intCast(self.output_count);
+        var group_x = position[0];
+
+        for (0..meter_count) |output_port| {
+            const short_name = self.output_short_names[output_port];
+            const meter_group_width = if (horizontal) meter_cell_count + 1 else 2;
+            const group_width = if (horizontal)
+                @max(meter_group_width, @as(u32, @intCast(short_name.len)))
+            else
+                @max(2, @as(u32, @intCast(short_name.len)));
+            const meter_x = group_x + (group_width - meter_group_width) / 2;
+            const label_x = group_x +
+                (group_width - @as(u32, @intCast(short_name.len))) / 2;
+            const label_y = if (horizontal)
+                position[1] + 2
+            else
+                position[1] + meter_cell_count + 1;
+
+            try display.write(gpa, short_name, label_x, label_y, .ebony, .logan);
+
+            const meter_cell_count_f32: f32 = @floatFromInt(meter_cell_count);
+            for (0..2) |channel| {
+                const rms_fraction = std.math.clamp(
+                    (self.rms_dbfs[output_port][channel] + 60) / 60,
+                    0,
+                    1,
+                );
+                const peak_fraction = std.math.clamp(
+                    (self.peak_dbfs[output_port][channel] + 60) / 60,
+                    0,
+                    1,
+                );
+                const rms_cells: u32 = @intFromFloat(@ceil(rms_fraction * meter_cell_count_f32));
+                const peak_cells: u32 = @intFromFloat(@ceil(peak_fraction * meter_cell_count_f32));
+                const channel_label = if (channel == 0) "L" else "R";
+                const channel_x = if (horizontal)
+                    meter_x
+                else
+                    meter_x + @as(u32, @intCast(channel));
+                const channel_y = if (horizontal)
+                    position[1] + @as(u32, @intCast(channel))
+                else
+                    position[1] + meter_cell_count;
+
+                try display.write(
+                    gpa,
+                    channel_label,
+                    channel_x,
+                    channel_y,
+                    .ebony,
+                    .logan,
+                );
+
+                for (0..meter_cell_count) |cell| {
+                    const cell_index: u32 = @intCast(cell);
+                    const level_cell = if (grows_forward)
+                        cell_index
+                    else
+                        meter_cell_count - 1 - cell_index;
+                    var color = Display.Color.logan;
+
+                    if (level_cell < rms_cells) {
+                        const gradient = if (meter_cell_count == 1)
+                            0
+                        else
+                            @as(f32, @floatFromInt(level_cell)) /
+                                @as(f32, @floatFromInt(meter_cell_count - 1));
+                        color = Display.Color.apple.interpolate(.punch, gradient);
+                    }
+
+                    const has_distinct_peak =
+                        self.peak_dbfs[output_port][channel] > self.rms_dbfs[output_port][channel];
+                    const peak_cell = if (grows_forward)
+                        peak_cells -| 1
+                    else
+                        meter_cell_count - peak_cells;
+                    if (has_distinct_peak and peak_cells > 0 and cell_index == peak_cell) {
+                        color = .curious_blue;
+                    }
+
+                    if (self.clipping_remaining_ms[output_port][channel] > 0 and
+                        peak_cells > 0 and cell_index == peak_cell)
+                        color = .punch;
+
+                    const glyph = [_]u8{0x07};
+                    const cell_x = if (horizontal)
+                        meter_x + 1 + cell_index
+                    else
+                        channel_x;
+                    const cell_y = if (horizontal)
+                        position[1] + @as(u32, @intCast(channel))
+                    else
+                        position[1] + cell_index;
+                    try display.write(
+                        gpa,
+                        glyph[0..],
+                        cell_x,
+                        cell_y,
+                        .ebony,
+                        color,
+                    );
+                }
+            }
+
+            group_x += group_width;
+            if (output_port + 1 < meter_count)
+                group_x += 1;
+        }
+    }
+
+    /// Drains the selected node's SampleTap and updates meter observations.
+    pub fn update(self: *OutputMeter, dsp: *DSP, elapsed_ms: u64) void {
+        for (&self.clipping_remaining_ms) |*channels| {
+            for (channels) |*remaining|
+                remaining.* = remaining.* -| elapsed_ms;
+        }
+        const node = self.parameters.node;
+        const sample_tap = dsp.sampleTap(node) orelse return;
         if (self.reader == null)
             self.reader = sample_tap.queue.reader();
         const reader = &self.reader.?;
 
         while (sample_tap.queue.front(reader)) |block| {
+            defer sample_tap.queue.pop(reader);
+
             assert(block.sample_count <= DSP.block_size * 2);
             assert(block.output_count <= DSP.max_outlets);
             var incoming_cursor: usize = 0;
@@ -1063,10 +1394,10 @@ pub const OutputMeter = struct {
                             );
                             const absolute = @abs(values);
                             const squared = values * values;
-                            const left_squared = @select(V, left_mask, squared, zero);
-                            const right_squared = @select(V, right_mask, squared, zero);
-                            const left_absolute = @select(V, left_mask, absolute, zero);
-                            const right_absolute = @select(V, right_mask, absolute, zero);
+                            const left_squared = @select(f32, left_mask, squared, zero);
+                            const right_squared = @select(f32, right_mask, squared, zero);
+                            const left_absolute = @select(f32, left_mask, absolute, zero);
+                            const right_absolute = @select(f32, right_mask, absolute, zero);
                             const left_peak = @reduce(.Max, left_absolute);
                             const right_peak = @reduce(.Max, right_absolute);
 
@@ -1080,10 +1411,16 @@ pub const OutputMeter = struct {
                                 self.peak[output_port][1],
                                 right_peak,
                             );
+                            if (left_peak > self.peak_hold[output_port][0]) {
+                                self.peak_hold[output_port][0] = left_peak;
+                            }
+                            if (right_peak > self.peak_hold[output_port][1]) {
+                                self.peak_hold[output_port][1] = right_peak;
+                            }
                             if (left_peak >= 1)
-                                self.clipped[output_port][0] = true;
+                                self.clipping_remaining_ms[output_port][0] = clipping_hold_ms;
                             if (right_peak >= 1)
-                                self.clipped[output_port][1] = true;
+                                self.clipping_remaining_ms[output_port][1] = clipping_hold_ms;
                         }
                     }
                 }
@@ -1099,8 +1436,11 @@ pub const OutputMeter = struct {
                             self.peak[output_port][channel],
                             absolute,
                         );
+                        if (absolute > self.peak_hold[output_port][channel]) {
+                            self.peak_hold[output_port][channel] = absolute;
+                        }
                         if (absolute >= 1)
-                            self.clipped[output_port][channel] = true;
+                            self.clipping_remaining_ms[output_port][channel] = clipping_hold_ms;
                     }
                 }
 
@@ -1114,7 +1454,7 @@ pub const OutputMeter = struct {
                             const rms = @sqrt(self.sum_squared[output_port][channel] / frame_count);
                             self.rms_dbfs[output_port][channel] = dbfs(rms);
                             self.peak_dbfs[output_port][channel] = dbfs(
-                                self.peak[output_port][channel],
+                                self.peak_hold[output_port][channel],
                             );
                         }
                     }
@@ -1123,8 +1463,6 @@ pub const OutputMeter = struct {
                     self.sample_cursor = 0;
                 }
             }
-
-            sample_tap.queue.pop(reader);
         }
     }
 };

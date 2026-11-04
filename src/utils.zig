@@ -152,7 +152,7 @@ pub fn SpmcQueue(comptime T: type) type {
         /// Highest state bit reserved to exclude readers during a write.
         const writer_bit = @as(usize, 1) << (@bitSizeOf(usize) - 1);
 
-        /// Inline ring storage supplied by the owning SampleTap.
+        /// Heap-allocated ring storage owned by this queue.
         items: []Slot,
         /// Number of slots in the power-of-two ring.
         len: usize,
@@ -161,25 +161,25 @@ pub fn SpmcQueue(comptime T: type) type {
         /// Absolute position immediately after the newest published value.
         push_cursor: std.atomic.Value(usize) = .{ .raw = 0 },
 
-        /// Initializes a queue over caller-owned inline storage.
-        pub fn initBuffer(buffer: []Slot) Self {
-            std.debug.assert(std.math.isPowerOfTwo(buffer.len));
-            std.debug.assert(buffer.len > 1);
+        /// Allocates and initializes a queue with the requested ring capacity.
+        pub fn initCapacity(gpa: std.mem.Allocator, capacity: usize) !Self {
+            std.debug.assert(std.math.isPowerOfTwo(capacity));
+            std.debug.assert(capacity > 1);
+            const buffer = try gpa.alloc(Slot, capacity);
             for (buffer) |*slot| {
                 slot.sequence.store(0, .monotonic);
                 slot.readers.store(0, .monotonic);
             }
             return .{
                 .items = buffer,
-                .len = buffer.len,
-                .mask = buffer.len - 1,
+                .len = capacity,
+                .mask = capacity - 1,
             };
         }
 
-        /// Rebinds the queue to the same logical storage after its owner moves.
-        pub fn setBuffer(self: *Self, buffer: []Slot) void {
-            std.debug.assert(buffer.len == self.len);
-            self.items = buffer;
+        /// Releases the heap-allocated ring storage owned by this queue.
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            gpa.free(self.items);
         }
 
         /// Creates a reader positioned after the values currently in the queue.

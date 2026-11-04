@@ -162,36 +162,6 @@ pub fn writeLabelValueColumns(
     }
 }
 
-/// Returns the width needed by padded label/value columns.
-pub fn labelValueColumnsWidth(items: []const LabelValue, row_count: u32) u32 {
-    if (items.len == 0 or row_count == 0) return 0;
-
-    const rows = @min(row_count, @as(u32, @intCast(items.len)));
-    var width: u32 = 0;
-    var item_index: usize = 0;
-    while (item_index < items.len) {
-        const column_end = @min(item_index + @as(usize, @intCast(rows)), items.len);
-        var label_width: u32 = 0;
-        var column_width: u32 = 0;
-
-        for (item_index..column_end) |index|
-            label_width = @max(label_width, @as(u32, @intCast(countStripped(items[index].label))));
-
-        for (item_index..column_end) |index|
-            column_width = @max(
-                column_width,
-                label_width + 2 + @as(u32, @intCast(countStripped(items[index].value))),
-            );
-
-        width += column_width;
-        item_index = column_end;
-        if (item_index < items.len)
-            width += 1;
-    }
-
-    return width;
-}
-
 /// Converts an amount and capacity into a sixteen-cell bar width.
 fn barWidth(amount: u32, capacity: u32) u32 {
     if (capacity == 0) return 0;
