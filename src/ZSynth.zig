@@ -10,6 +10,7 @@ const PostProcessing = @import("PostProcessing.zig");
 const Renderer = @import("Renderer.zig");
 const StateStack = @import("StateStack.zig");
 const SynthEditor = @import("SynthEditor.zig");
+const DSP = @import("DSP.zig");
 
 const Self = @This();
 
@@ -69,7 +70,7 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
     // Configure a stereo, 48 kHz engine for the synth DSP graph.
     var audio_engine_config = audio.Engine.Config.init();
     audio_engine_config.channels = 2;
-    audio_engine_config.sample_rate = 48_000;
+    audio_engine_config.sample_rate = DSP.sample_rate;
     const audio_engine = try audio.Engine.create(audio_engine_config);
 
     // Initialize image loading before any display assets are requested.

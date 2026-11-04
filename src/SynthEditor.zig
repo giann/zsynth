@@ -1,5 +1,6 @@
 //! The synth editor state and its demonstration DSP graph.
 const std = @import("std");
+const assert = std.debug.assert;
 const sdl = @import("zsdl3");
 const DSP = @import("DSP.zig");
 const StateStack = @import("StateStack.zig");
@@ -538,7 +539,7 @@ fn addVisualNode(
     node: DSP.Node.Index,
     position: Space.Position,
 ) !void {
-    std.debug.assert(node.idx == self.space.nodes.len);
+    assert(node.idx == self.space.nodes.len);
     try self.space.nodes.append(allocator, .{
         .dsp_node = node,
         .position = position,
@@ -553,7 +554,7 @@ fn addVisualNode(
                 .x = footprint.x + @as(i32, @intCast(dx)),
                 .y = footprint.y + @as(i32, @intCast(dy)),
             };
-            std.debug.assert(self.space.occupied.get(occupied) == null);
+            assert(self.space.occupied.get(occupied) == null);
             try self.space.occupied.put(allocator, occupied, node);
         }
     }
@@ -990,3 +991,146 @@ pub const OutletConnection = struct {
         }
     }
 };
+
+/// Main-thread output meter reading one node's per-node SampleTap.
+pub const OutputMeter = struct {
+    /// Duration of samples accumulated before publishing a new meter value.
+    const observe_duration_ms = 300;
+    /// Number of stereo frames in one meter observation window.
+    const observe_frame_count = (observe_duration_ms * DSP.sample_rate) / 1000;
+    /// Number of interleaved samples in one meter observation window.
+    const observe_sample_count = observe_frame_count * 2;
+
+    /// Queue type used by the node's SampleTap.
+    const Queue = DSP.SampleTap.Queue;
+
+    /// Node whose rendered outputs are analyzed by this meter.
+    node: DSP.Node.Index,
+    /// Independent reader cursor for the node's SampleTap history.
+    reader: ?Queue.Reader = null,
+    /// Number of interleaved samples accumulated in the current window.
+    sample_cursor: usize = 0,
+    /// Running squared sums indexed by output port and stereo channel.
+    sum_squared: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
+    /// Running absolute peaks indexed by output port and stereo channel.
+    peak: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
+    /// RMS level in dBFS indexed by output port and stereo channel.
+    rms_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
+    /// Peak level in dBFS indexed by output port and stereo channel.
+    peak_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ 0, 0 }),
+    /// Latched clipping state indexed by output port and stereo channel.
+    clipped: [DSP.max_outlets][2]bool = @splat(.{ false, false }),
+
+    /// Drains the node's SampleTap and updates completed observation windows.
+    pub fn update(self: *OutputMeter, dsp: *DSP) void {
+        const sample_tap = dsp.sampleTap(self.node) orelse return;
+        if (self.reader == null)
+            self.reader = sample_tap.queue.reader();
+        const reader = &self.reader.?;
+
+        while (sample_tap.queue.front(reader)) |block| {
+            assert(block.sample_count <= DSP.block_size * 2);
+            assert(block.output_count <= DSP.max_outlets);
+            var incoming_cursor: usize = 0;
+            const output_count: usize = @intCast(block.output_count);
+
+            while (incoming_cursor < block.sample_count) {
+                const available = observe_sample_count - self.sample_cursor;
+                const copy_count = @min(available, block.sample_count - incoming_cursor);
+                const segment_end = incoming_cursor + copy_count;
+                var sample_index = incoming_cursor;
+
+                // Analyze complete SIMD vectors while preserving separate
+                // reductions for the interleaved left and right channels.
+                if (std.simd.suggestVectorLength(f32)) |lanes| {
+                    const V = @Vector(lanes, f32);
+                    const BoolV = @Vector(lanes, bool);
+                    var even_mask: BoolV = undefined;
+                    var odd_mask: BoolV = undefined;
+                    inline for (0..lanes) |lane| {
+                        even_mask[lane] = lane % 2 == 0;
+                        odd_mask[lane] = lane % 2 != 0;
+                    }
+
+                    while (sample_index + lanes <= segment_end) : (sample_index += lanes) {
+                        const left_mask = if (sample_index % 2 == 0) even_mask else odd_mask;
+                        const right_mask = if (sample_index % 2 == 0) odd_mask else even_mask;
+                        const zero: V = @splat(0);
+
+                        for (0..output_count) |output_port| {
+                            const values: V = @bitCast(
+                                block.samples[output_port][sample_index..][0..lanes].*,
+                            );
+                            const absolute = @abs(values);
+                            const squared = values * values;
+                            const left_squared = @select(V, left_mask, squared, zero);
+                            const right_squared = @select(V, right_mask, squared, zero);
+                            const left_absolute = @select(V, left_mask, absolute, zero);
+                            const right_absolute = @select(V, right_mask, absolute, zero);
+                            const left_peak = @reduce(.Max, left_absolute);
+                            const right_peak = @reduce(.Max, right_absolute);
+
+                            self.sum_squared[output_port][0] += @reduce(.Add, left_squared);
+                            self.sum_squared[output_port][1] += @reduce(.Add, right_squared);
+                            self.peak[output_port][0] = @max(
+                                self.peak[output_port][0],
+                                left_peak,
+                            );
+                            self.peak[output_port][1] = @max(
+                                self.peak[output_port][1],
+                                right_peak,
+                            );
+                            if (left_peak >= 1)
+                                self.clipped[output_port][0] = true;
+                            if (right_peak >= 1)
+                                self.clipped[output_port][1] = true;
+                        }
+                    }
+                }
+
+                // Analyze the non-vector tail, if any.
+                while (sample_index < segment_end) : (sample_index += 1) {
+                    const channel = sample_index % 2;
+                    for (0..output_count) |output_port| {
+                        const sample = block.samples[output_port][sample_index];
+                        const absolute = @abs(sample);
+                        self.sum_squared[output_port][channel] += sample * sample;
+                        self.peak[output_port][channel] = @max(
+                            self.peak[output_port][channel],
+                            absolute,
+                        );
+                        if (absolute >= 1)
+                            self.clipped[output_port][channel] = true;
+                    }
+                }
+
+                self.sample_cursor += copy_count;
+                incoming_cursor += copy_count;
+
+                if (self.sample_cursor == observe_sample_count) {
+                    const frame_count: f32 = @floatFromInt(observe_frame_count);
+                    for (0..output_count) |output_port| {
+                        for (0..2) |channel| {
+                            const rms = @sqrt(self.sum_squared[output_port][channel] / frame_count);
+                            self.rms_dbfs[output_port][channel] = dbfs(rms);
+                            self.peak_dbfs[output_port][channel] = dbfs(
+                                self.peak[output_port][channel],
+                            );
+                        }
+                    }
+                    self.sum_squared = @splat(.{ 0, 0 });
+                    self.peak = @splat(.{ 0, 0 });
+                    self.sample_cursor = 0;
+                }
+            }
+
+            sample_tap.queue.pop(reader);
+        }
+    }
+};
+
+/// Converts a linear amplitude into decibels relative to full scale.
+fn dbfs(value: f32) f32 {
+    const floor: f32 = 0.000001; // -120 dBFS
+    return 20 * std.math.log10(@max(value, floor));
+}

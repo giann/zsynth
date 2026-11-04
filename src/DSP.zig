@@ -1,22 +1,48 @@
 //! Graph-based small DSP
 const std = @import("std");
+const assert = std.debug.assert;
 const a = @import("zaudio");
 const Display = @import("Display.zig");
+const utils = @import("utils.zig");
+const SpmcQueue = utils.SpmcQueue;
 
 /// Module type containing the DSP graph, node definitions, and audio bridge.
 const DSP = @This();
+
+pub const sample_rate = 48_000;
 
 /// Maximum number of interleaved stereo samples rendered in one graph block.
 pub const block_size = 256;
 /// Maximum number of input or output ports exposed by a node.
 pub const max_outlets = 8;
+/// Number of rendered blocks retained by each node's SampleTap.
+pub const sample_tap_capacity = 64;
+
+/// Per-node, audio-thread-safe history of rendered output blocks.
+pub const SampleTap = struct {
+    /// One rendered block containing every declared output port.
+    pub const Block = struct {
+        /// Interleaved stereo samples indexed by output port.
+        samples: [max_outlets][block_size * 2]f32,
+        /// Number of valid interleaved samples in each port.
+        sample_count: usize,
+        /// Number of declared output ports represented by this block.
+        output_count: u8,
+    };
+
+    /// Queue type used to publish blocks to independent main-thread readers.
+    pub const Queue = SpmcQueue(Block);
+
+    /// Inline queue storage owned by this SampleTap.
+    storage: [sample_tap_capacity]Queue.Slot = undefined,
+    /// Queue descriptor referencing `storage`; it owns no memory.
+    queue: Queue = undefined,
+};
 
 /// Audio engine used to create and control the graph's live sound source.
 /// The engine is owned by the application and must outlive this DSP.
 engine: *a.Engine,
 
-/// Sample rate of the audio engine, normally 48 kHz.
-sample_rate: u32,
 /// Node whose first output is copied to the audio device.
 output: Node.Index = .{ .idx = 1 },
 /// Struct-of-arrays storage for all graph nodes.
@@ -36,21 +62,17 @@ sound: *a.Sound,
 /// Initializes the graph, its live data source, and the audio sound.
 pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
     // Capture the engine's format so every node renders at the device rate.
-    const sample_rate = engine.getSampleRate();
+    assert(engine.getSampleRate() == sample_rate);
 
     // Initialize graph-owned fields before creating dependent resources.
     self.* = DSP{
         .engine = engine,
-        .sample_rate = sample_rate,
         .graph_data_source = undefined,
         .sound = undefined,
     };
 
     // Create the stereo pull source consumed by the audio library.
-    try self.graph_data_source.init(
-        2,
-        sample_rate,
-    );
+    try self.graph_data_source.init(2);
 
     // Install the sentinel node first so every default connection is valid.
     _ = try self.addNode(
@@ -75,7 +97,7 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
     self.sound.destroy();
     // Tear down the callback source before freeing graph storage.
     self.graph_data_source.deinit();
-    // Release all node allocations using the allocator supplied at init time.
+    // Release all node storage using the allocator supplied at init time.
     self.nodes.deinit(gpa);
 }
 
@@ -111,8 +133,8 @@ pub fn plug(
     const source_metadata = node_metadata.get(source_tag);
     const destination_tag = std.meta.activeTag(self.nodes.items(.state)[destination.idx]);
     const destination_metadata = node_metadata.get(destination_tag);
-    std.debug.assert(source_output_port < source_metadata.output_count);
-    std.debug.assert(destination_port < destination_metadata.input_count);
+    assert(source_output_port < source_metadata.output_count);
+    assert(destination_port < destination_metadata.input_count);
 
     const inputs = self.nodes.items(.inputs);
     const output_connected = self.nodes.items(.output_connected);
@@ -121,7 +143,7 @@ pub fn plug(
     const replacing_same_connection = !previous.isNoop() and
         previous.node.idx == source.idx and
         previous.output_port == source_output_port;
-    std.debug.assert(replacing_same_connection or !output_connected[source.idx][source_output_port]);
+    assert(replacing_same_connection or !output_connected[source.idx][source_output_port]);
 
     if (!previous.isNoop()) {
         output_connected[previous.node.idx][previous.output_port] = false;
@@ -209,6 +231,11 @@ pub fn remove(self: *DSP, node: Node.Index) void {
 
     // The last node moved into the removed slot. Rewrite references to its old index.
     if (node.idx != last_index) {
+        // MultiArrayList moved the last node's SampleTap, so its queue slice
+        // must point at the SampleTap's new inline storage address.
+        const moved_tap = &self.nodes.items(.sample_tap)[node.idx];
+        moved_tap.queue.setBuffer(moved_tap.storage[0..]);
+
         for (self.nodes.items(.inputs)) |*node_inputs| {
             for (node_inputs) |*connection| {
                 if (!connection.isNoop() and connection.node.idx == last_index)
@@ -220,9 +247,34 @@ pub fn remove(self: *DSP, node: Node.Index) void {
 
 /// Appends a node and returns its index in the graph.
 pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
-    try self.nodes.append(gpa, node);
+    self.lockGraph();
+    defer self.unlockGraph();
 
-    return .{ .idx = self.nodes.len - 1 };
+    try self.nodes.append(gpa, node);
+    errdefer _ = self.nodes.pop();
+
+    const new_index = self.nodes.len - 1;
+    const sample_taps = self.nodes.items(.sample_tap);
+    sample_taps[new_index].queue = .initBuffer(sample_taps[new_index].storage[0..]);
+
+    // Appending can relocate every MultiArrayList field, invalidating each
+    // queue slice that points into its node's inline SampleTap storage.
+    for (sample_taps, 0..) |*sample_tap, index| {
+        if (index != new_index)
+            sample_tap.queue.setBuffer(sample_tap.storage[0..]);
+    }
+
+    return .{ .idx = new_index };
+}
+
+/// Returns a node's SampleTap for immediate main-thread reads.
+///
+/// The returned pointer must not be retained across graph mutation. The UI
+/// stores only the node index and resolves the tap again for each update.
+pub fn sampleTap(self: *DSP, node: Node.Index) ?*SampleTap {
+    if (node.idx >= self.nodes.len)
+        return null;
+    return &self.nodes.items(.sample_tap)[node.idx];
 }
 
 /// Renders one interleaved stereo block into the audio callback buffer.
@@ -231,8 +283,8 @@ fn stream(self: *DSP, into: []f32) !void {
     defer self.unlockGraph();
 
     // The callback may request a short block, but never more than one block.
-    std.debug.assert(into.len <= block_size * 2);
-    std.debug.assert(into.len % 2 == 0);
+    assert(into.len <= block_size * 2);
+    assert(into.len % 2 == 0);
 
     // A new generation invalidates all node caches from the previous block.
     self.render_generation += 1;
@@ -285,6 +337,24 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     // Publish the completed cache only after processing succeeds.
     cache.sample_count = sample_count;
     cache.generation = self.render_generation;
+
+    // Publish a bounded, non-blocking copy after processing completes. The
+    // SampleTap copies every declared output port for independent UI readers.
+    const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    const output_count = node_metadata.get(source_tag).output_count;
+    const sample_tap = &self.nodes.items(.sample_tap)[node.idx];
+    var block: SampleTap.Block = .{
+        .samples = undefined,
+        .sample_count = active_sample_count,
+        .output_count = output_count,
+    };
+    for (0..@intCast(output_count)) |output_port| {
+        @memcpy(
+            block.samples[output_port][0..active_sample_count],
+            outputs[output_port].samples[0..active_sample_count],
+        );
+    }
+    _ = sample_tap.queue.tryPush(block);
 }
 
 /// Resolves a connection by rendering its source and returning the requested port.
@@ -294,9 +364,9 @@ fn getOutput(
     sample_count: u32,
 ) !*Buffer {
     // Invalid connections indicate a graph-construction bug.
-    std.debug.assert(!connection.isNoop());
+    assert(!connection.isNoop());
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[connection.node.idx]);
-    std.debug.assert(connection.output_port < node_metadata.get(source_tag).output_count);
+    assert(connection.output_port < node_metadata.get(source_tag).output_count);
 
     // Rendering is cached, so repeated requests for this source are cheap.
     try self.renderNode(connection.node, sample_count);
@@ -318,8 +388,6 @@ const GraphDataSource = struct {
     data_source: *a.DataSource,
     /// Number of channels exposed to the audio library.
     channels: u32,
-    /// Sample rate exposed to the audio library.
-    sample_rate: u32,
     /// Number of frames successfully delivered so far.
     cursor: u64 = 0,
 
@@ -338,14 +406,12 @@ const GraphDataSource = struct {
     pub fn init(
         self: *GraphDataSource,
         channels: u32,
-        sample_rate: u32,
     ) !void {
         // Reset callback-visible state before handing the wrapper to the library.
         self.* = .{
             .base = undefined,
             .data_source = undefined,
             .channels = channels,
-            .sample_rate = sample_rate,
         };
 
         // Register the static callback table and allocate the opaque handle.
@@ -436,7 +502,7 @@ const GraphDataSource = struct {
         ds: *a.DataSource,
         format: ?*a.Format,
         channels: ?*u32,
-        sample_rate: ?*u32,
+        data_sample_rate: ?*u32,
         _: ?[*]a.Channel,
         _: usize,
     ) callconv(.c) a.Result {
@@ -445,7 +511,7 @@ const GraphDataSource = struct {
         // Each optional output is independently supported by the callback ABI.
         if (format) |value| value.* = .float32;
         if (channels) |value| value.* = self.channels;
-        if (sample_rate) |value| value.* = self.sample_rate;
+        if (data_sample_rate) |value| value.* = sample_rate;
 
         return .success;
     }
@@ -540,7 +606,7 @@ pub const Note = struct {
                 @backingInt(accidental);
 
             // Reject values outside the representable MIDI range.
-            std.debug.assert(value >= 0 and value <= 127);
+            assert(value >= 0 and value <= 127);
 
             // The assertion makes this narrowing conversion safe.
             return @intCast(value);
@@ -582,6 +648,8 @@ pub const Node = struct {
     output_connected: [max_outlets]bool = @splat(false),
     /// Per-generation output cache.
     cache: Cache = .{},
+    /// Main-thread-readable history of this node's rendered outputs.
+    sample_tap: SampleTap = .{},
     /// Function used to render this node's outputs.
     process: Process,
 
@@ -1119,10 +1187,10 @@ pub const Node = struct {
                 try dsp.getOutput(amplitude_connection, into[0].sample_count);
 
             // Convert the engine rate to float for phase integration.
-            const sample_rate: f32 = @floatFromInt(dsp.sample_rate);
+            const f_sample_rate: f32 = @floatFromInt(sample_rate);
             const parameters = state.parameters;
 
-            std.debug.assert(into[0].sample_count % 2 == 0);
+            assert(into[0].sample_count % 2 == 0);
             const frame_count: usize = @intCast(into[0].sample_count / 2);
             // Generate one value per stereo frame and duplicate it to both channels.
             for (0..frame_count) |frame| {
@@ -1160,7 +1228,7 @@ pub const Node = struct {
 
                 // Integrate frequency into phase so
                 // frequency modulation works correctly across frames.
-                state.phase += tau * frequency / sample_rate;
+                state.phase += tau * frequency / f_sample_rate;
 
                 // Keep phase bounded. This assumes normal oscillator
                 // frequencies whose per-frame increment is below tau.
@@ -1258,7 +1326,7 @@ pub const Node = struct {
                 input_count += 1;
             }
 
-            std.debug.assert(output.sample_count % 2 == 0);
+            assert(output.sample_count % 2 == 0);
 
             // Mix complete SIMD vectors, preserving the interleaved channel gains.
             var offset: usize = 0;
@@ -1362,7 +1430,7 @@ pub const Node = struct {
         }
 
         /// Converts a musical duration from ticks to rounded interleaved samples.
-        fn ticksToSamples(self: *MonophonicSequencer, ticks: u64, sample_rate: u32) u64 {
+        fn ticksToSamples(self: *MonophonicSequencer, ticks: u64) u64 {
             const samples_f64 =
                 @as(f64, @floatFromInt(ticks)) *
                 60.0 *
@@ -1386,13 +1454,13 @@ pub const Node = struct {
             const ticks_per_frame: f64 =
                 @as(f64, @floatFromInt(parameters.bpm)) *
                 @as(f64, @floatFromInt(quarter_note_ticks)) /
-                (60.0 * @as(f64, @floatFromInt(dsp.sample_rate)));
+                (60.0 * @as(f64, @floatFromInt(sample_rate)));
 
             // The graph uses interleaved stereo samples, so frames are pairs.
-            std.debug.assert(into[0].sample_count % 2 == 0);
+            assert(into[0].sample_count % 2 == 0);
             const frame_count: usize = @intCast(into[0].sample_count / 2);
 
-            std.debug.assert(parameters.notes.len > 0);
+            assert(parameters.notes.len > 0);
             // Compute the end of the final note for loop and stop handling.
             const sequence_end = @as(
                 f64,
@@ -1586,7 +1654,7 @@ pub const Node = struct {
                 try dsp.getOutput(velocity_connection, into[0].sample_count);
 
             // Clamp the sustain level once because it is constant for the block.
-            std.debug.assert(into[0].sample_count % 2 == 0);
+            assert(into[0].sample_count % 2 == 0);
             const frame_count: usize = @intCast(into[0].sample_count / 2);
             const sustain = @max(0.0, @min(1.0, parameters.sustain));
             // Advance the state machine once for each stereo frame.
@@ -1626,8 +1694,8 @@ pub const Node = struct {
                 }
 
                 // Then advance the active stage by one sample period.
-                const sample_rate: f32 = @floatFromInt(dsp.sample_rate);
-                const delta_time = 1.0 / sample_rate;
+                const f_sample_rate: f32 = @floatFromInt(sample_rate);
+                const delta_time = 1.0 / f_sample_rate;
 
                 // Evaluate the level and transition when a stage completes.
                 switch (state.stage) {
@@ -1837,7 +1905,7 @@ pub const Node = struct {
                 null;
 
             // Use the engine rate to convert cutoff to the filter coefficient.
-            const sample_rate: f32 = @floatFromInt(dsp.sample_rate);
+            const f_sample_rate: f32 = @floatFromInt(sample_rate);
 
             // Update the two-channel filter state one interleaved sample at a time.
             for (0..into[0].sample_count) |sample| {
@@ -1858,8 +1926,8 @@ pub const Node = struct {
                 // This is a Chamberlin-style state-variable filter. `f`
                 // controls how quickly the filter moves, while `damping`
                 // controls the resonance around the cutoff.
-                const clamped_cutoff = @max(0.0, @min(sample_rate * 0.49, cutoff));
-                const f = 2 * @sin(std.math.pi * clamped_cutoff / sample_rate);
+                const clamped_cutoff = @max(0.0, @min(f_sample_rate * 0.49, cutoff));
+                const f = 2 * @sin(std.math.pi * clamped_cutoff / f_sample_rate);
                 const clamped_resonance = @max(0.0, @min(1.0, resonance));
                 const resonance_root = @sqrt(@sqrt(clamped_resonance));
                 var damping = 2 * (1 - resonance_root);
@@ -1951,7 +2019,7 @@ pub const Node = struct {
             const state = &dsp.nodes.items(.state)[node.idx].bit_crusher;
             const parameters = state.parameters;
             const levels: f32 = @floatFromInt((@as(u32, 1) << parameters.bit_depth) - 1);
-            const frames_to_hold = dsp.sample_rate / parameters.target_sample_rate;
+            const frames_to_hold = sample_rate / parameters.target_sample_rate;
 
             // A severed source leaves the already-cleared output silent.
             const input = dsp.nodes.items(.inputs)[node.idx][0];
@@ -1960,7 +2028,7 @@ pub const Node = struct {
             // Resolve the source buffer before processing frames.
             const input_buffer = try dsp.getOutput(input, output.sample_count);
 
-            std.debug.assert(output.sample_count % 2 == 0);
+            assert(output.sample_count % 2 == 0);
             const frame_count: usize = @intCast(output.sample_count / 2);
             // Process complete stereo frames so both channels share a hold period.
             for (0..frame_count) |frame| {
@@ -2079,7 +2147,7 @@ pub const Node = struct {
                 try dsp.getOutput(amplitude_connection, into[0].sample_count);
 
             // Generate interleaved stereo samples so color state stays channel-local.
-            std.debug.assert(into[0].sample_count % 2 == 0);
+            assert(into[0].sample_count % 2 == 0);
             for (0..into[0].sample_count) |sample| {
                 // Prefer modulation input; otherwise use the configured amplitude.
                 const amplitude = if (amplitude_buffer) |buffer|
