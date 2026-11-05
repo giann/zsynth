@@ -18,16 +18,19 @@ and effects to be composed into a real-time sound pipeline.
 - BitCrusher
 - Noise: white, pink and brown
 - Utility nodes: Add, Multiply, Constant
+- Keyboard
 
 ## TODO
 
+- ability to group nodes under a meta-node with: that node combines the input of the leaf of that subtree and the outputs of the root
+- copy-paste nodes
 - color picker for nodes
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for
   audio)
 - pitch shifter
 - resampler
-- MIDI input + keyboard virutal midi device
+- MIDI input
 
 ## Controls and UI elements
 

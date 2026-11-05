@@ -212,6 +212,11 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
     const previous_idx = if (self.space.selected_node) |previous| previous.idx else null;
     const selected_idx = if (selected) |current| current.idx else null;
     if (previous_idx != selected_idx) {
+        if (previous_idx) |previous| {
+            if (previous < self.dsp.nodes.len and
+                std.meta.activeTag(self.dsp.nodes.items(.state)[previous]) == .keyboard)
+                self.dsp.keyboardReleaseAll(.{ .idx = previous });
+        }
         self.parameter_editor.active = null;
         self.parameter_editor.cell_count = 0;
     }
@@ -699,7 +704,7 @@ fn moveViewport(self: *Self, gpa: std.mem.Allocator, dx: i32, dy: i32) !void {
     try self.write(gpa);
 }
 
-/// Handles arrow keys used to move the editor viewport.
+/// Handles editor commands and arrow keys used to move the viewport.
 fn keyUpDown(
     state_stack: *StateStack,
     gpa: std.mem.Allocator,
@@ -707,6 +712,30 @@ fn keyUpDown(
     event: sdl.KeyboardEvent,
 ) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+
+    if (self.parameter_editor.active == null) {
+        if (self.space.selected_node) |selected| {
+            if (selected.idx < self.dsp.nodes.len and
+                std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
+            {
+                const modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
+                const command_modifiers = sdl.Keymod.ctrl |
+                    sdl.Keymod.lgui |
+                    sdl.Keymod.rgui |
+                    sdl.Keymod.alt;
+                if ((modifiers & command_modifiers) == 0) {
+                    const handled = if (event.down)
+                        self.dsp.keyboardKeyDown(.{ .idx = selected.idx }, event.key)
+                    else
+                        self.dsp.keyboardKeyUp(.{ .idx = selected.idx }, event.key);
+                    if (handled) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     if (!event.down) return self.parameter_editor.active != null;
 
     if (self.parameter_editor.active != null) {
@@ -2072,6 +2101,7 @@ pub const CommandPalette = struct {
             .add => DSP.Node.Add.create(name),
             .multiply => DSP.Node.Multiply.create(name),
             .constant => DSP.Node.Constant.create(name, .{}),
+            .keyboard => DSP.Node.Keyboard.create(name, .{}),
             .oscillator => DSP.Node.Oscillator.create(name, .{
                 .waveform = .sine,
                 .default_frequency = 440,

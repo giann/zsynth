@@ -26,6 +26,7 @@ message Node {
     FilterParameters filter = 15;
     BitCrusherParameters bit_crusher = 16;
     NoiseParameters noise = 17;
+    KeyboardParameters keyboard = 18;
   }
 }
 
@@ -91,4 +92,8 @@ message NoiseParameters {
   optional uint64 seed = 1;
   optional string type = 2;
   optional float amplitude = 3;
+}
+
+message KeyboardParameters {
+  optional sint32 octave = 1;
 }

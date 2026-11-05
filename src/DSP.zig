@@ -2,6 +2,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const a = @import("zaudio");
+const sdl = @import("zsdl3");
 const Display = @import("Display.zig");
 const utils = @import("utils.zig");
 const SpmcQueue = utils.SpmcQueue;
@@ -273,6 +274,33 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
         try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
 
     return .{ .idx = new_index };
+}
+
+/// Presses a key on a keyboard node using its atomic voice state.
+pub fn keyboardKeyDown(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
+    assert(node.idx < self.nodes.len);
+    switch (self.nodes.items(.state)[node.idx]) {
+        .keyboard => |*keyboard| return keyboard.press(key),
+        else => return false,
+    }
+}
+
+/// Releases a key on a keyboard node using its atomic voice state.
+pub fn keyboardKeyUp(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
+    assert(node.idx < self.nodes.len);
+    switch (self.nodes.items(.state)[node.idx]) {
+        .keyboard => |*keyboard| return keyboard.release(key),
+        else => return false,
+    }
+}
+
+/// Releases all keys held by a keyboard node using atomic stores.
+pub fn keyboardReleaseAll(self: *DSP, node: Node.Index) void {
+    assert(node.idx < self.nodes.len);
+    switch (self.nodes.items(.state)[node.idx]) {
+        .keyboard => |*keyboard| keyboard.releaseAll(),
+        else => {},
+    }
 }
 
 /// Returns a node's SampleTap for immediate main-thread reads.
@@ -740,6 +768,7 @@ pub const Node = struct {
         adsr,
         bit_crusher,
         constant,
+        keyboard,
         mixer,
         monophonic_sequencer,
         multimode_filter,
@@ -760,6 +789,8 @@ pub const Node = struct {
         bit_crusher: BitCrusher,
         /// Constant-value source state.
         constant: Constant,
+        /// Computer-keyboard note source state.
+        keyboard: Keyboard,
         /// Multi-input mixer state.
         mixer: Mixer,
         /// Monophonic note sequencer state.
@@ -1106,6 +1137,170 @@ pub const Node = struct {
                 into[0].samples[0..],
                 dsp.nodes.items(.state)[node.idx].constant.parameters.constant,
             );
+        }
+    };
+
+    /// Emits up to eight simultaneously held keyboard notes as frequencies.
+    pub const Keyboard = struct {
+        /// Number of independent frequency and gate voice pairs.
+        pub const voice_count = 4;
+        /// Sentinel MIDI value used before a voice has played a note.
+        const empty_pitch: u8 = std.math.maxInt(u8);
+
+        /// Port metadata for the keyboard node.
+        pub const metadata = Node.Metadata{
+            .name = "Keyboard",
+            .short_name = "kbd",
+            .meterable = false,
+            .color = .feijoa,
+            .outputs = .{
+                .{ .name = "frequency 1", .short_name = "freq1", .unit = "Hz", .color = .feijoa },
+                .{ .name = "gate 1", .short_name = "gate1", .color = .feijoa },
+                .{ .name = "frequency 2", .short_name = "freq2", .unit = "Hz", .color = .feijoa },
+                .{ .name = "gate 2", .short_name = "gate2", .color = .feijoa },
+                .{ .name = "frequency 3", .short_name = "freq3", .unit = "Hz", .color = .feijoa },
+                .{ .name = "gate 3", .short_name = "gate3", .color = .feijoa },
+                .{ .name = "frequency 4", .short_name = "freq4", .unit = "Hz", .color = .feijoa },
+                .{ .name = "gate 4", .short_name = "gate4", .color = .feijoa },
+            },
+            .input_count = 0,
+            .output_count = voice_count * 2,
+        };
+
+        /// User-controlled octave of the lower keyboard row.
+        pub const Parameters = struct {
+            /// MIDI octave containing the lower row's C key.
+            octave: i8 = 4,
+        };
+
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// SDL keycode assigned to each voice, or unknown for an unused voice.
+        voice_keys: [voice_count]std.atomic.Value(u32) = @splat(.{ .raw = 0 }),
+        /// Last MIDI pitch assigned to each voice, or empty_pitch if unused.
+        voice_pitches: [voice_count]std.atomic.Value(u8) = @splat(.{ .raw = empty_pitch }),
+
+        /// Creates a keyboard node with all voices released.
+        pub fn create(name: []const u8, parameters: Parameters) Node {
+            return .{
+                .state = .{
+                    .keyboard = .{ .parameters = parameters },
+                },
+                .name = name,
+                .process = process,
+            };
+        }
+
+        /// Presses a mapped key into the first available voice slot.
+        pub fn press(self: *Keyboard, key: sdl.Keycode) bool {
+            const pitch = self.pitchForKey(key) orelse return false;
+            if (self.voiceForKey(key) != null) return true;
+
+            for (0..voice_count) |voice| {
+                if (self.voice_keys[voice].load(.acquire) == @backingInt(sdl.Keycode.unknown)) {
+                    self.voice_pitches[voice].store(@intCast(pitch), .release);
+                    self.voice_keys[voice].store(@backingInt(key), .release);
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        /// Releases the voice currently assigned to a mapped key.
+        pub fn release(self: *Keyboard, key: sdl.Keycode) bool {
+            const voice = self.voiceForKey(key) orelse return self.pitchForKey(key) != null;
+            self.voice_keys[voice].store(@backingInt(sdl.Keycode.unknown), .release);
+            return true;
+        }
+
+        /// Releases every active keyboard voice.
+        pub fn releaseAll(self: *Keyboard) void {
+            for (&self.voice_keys) |*voice|
+                voice.store(@backingInt(sdl.Keycode.unknown), .release);
+        }
+
+        /// Returns the voice assigned to a key, if it is currently held.
+        fn voiceForKey(self: *const Keyboard, key: sdl.Keycode) ?usize {
+            for (&self.voice_keys, 0..) |*voice_key, voice| {
+                if (voice_key.load(.acquire) == @backingInt(key)) return voice;
+            }
+            return null;
+        }
+
+        /// Converts a mapped key to its MIDI pitch under the configured octave.
+        fn pitchForKey(self: *const Keyboard, key: sdl.Keycode) ?u7 {
+            const offset: ?i16 = switch (key) {
+                .z => 0,
+                .s => 1,
+                .x => 2,
+                .d => 3,
+                .c => 4,
+                .v => 5,
+                .g => 6,
+                .b => 7,
+                .h => 8,
+                .n => 9,
+                .j => 10,
+                .m => 11,
+                .q => 12,
+                .@"2" => 13,
+                .w => 14,
+                .@"3" => 15,
+                .e => 16,
+                .r => 17,
+                .@"5" => 18,
+                .t => 19,
+                .@"6" => 20,
+                .y => 21,
+                .@"7" => 22,
+                .u => 23,
+                .i => 24,
+                else => null,
+            };
+            const pitch_offset = offset orelse return null;
+            const pitch = (@as(i16, self.parameters.octave) + 1) * 12 + pitch_offset;
+            if (pitch < 0 or pitch > std.math.maxInt(u7)) return null;
+            return @intCast(pitch);
+        }
+
+        /// Converts a MIDI pitch to its equal-tempered frequency in hertz.
+        fn frequency(pitch: u7) f32 {
+            return 440 * std.math.pow(
+                f32,
+                2,
+                @as(f32, @floatFromInt(@as(i16, @intCast(pitch)) - 69)) / 12,
+            );
+        }
+
+        /// Fills one frequency and one gate output for every voice.
+        fn process(
+            dsp: *DSP,
+            node: Index,
+            into: []const *Buffer,
+        ) ProcessError!void {
+            const state = &dsp.nodes.items(.state)[node.idx].keyboard;
+            for (0..voice_count) |voice| {
+                const raw_key = state.voice_keys[voice].load(.acquire);
+                const raw_pitch = state.voice_pitches[voice].load(.acquire);
+                const pitch = if (raw_key != @backingInt(sdl.Keycode.unknown))
+                    state.pitchForKey(@fromBackingInt(@intCast(raw_key))) orelse
+                        if (raw_pitch != empty_pitch) @as(u7, @intCast(raw_pitch)) else null
+                else if (raw_pitch != empty_pitch)
+                    @as(u7, @intCast(raw_pitch))
+                else
+                    null;
+                const sample = if (pitch) |value| frequency(value) else 0;
+                const frequency_output = voice * 2;
+                const gate_output = frequency_output + 1;
+                @memset(
+                    into[frequency_output].samples[0..into[frequency_output].sample_count],
+                    sample,
+                );
+                @memset(
+                    into[gate_output].samples[0..into[gate_output].sample_count],
+                    if (raw_key == @backingInt(sdl.Keycode.unknown)) 0 else 1,
+                );
+            }
         }
     };
 
@@ -2223,6 +2418,7 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .adsr = Node.ADSR.metadata,
         .bit_crusher = Node.BitCrusher.metadata,
         .constant = Node.Constant.metadata,
+        .keyboard = Node.Keyboard.metadata,
         .mixer = Node.Mixer.metadata,
         .monophonic_sequencer = Node.MonophonicSequencer.metadata,
         .multimode_filter = Node.MultimodeFilter.metadata,

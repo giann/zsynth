@@ -178,6 +178,9 @@ fn parametersToProto(
 ) !?P.Node.parameters_union {
     return switch (state) {
         .noop, .add, .multiply, .output => null,
+        .keyboard => |value| .{ .keyboard = .{
+            .octave = value.parameters.octave,
+        } },
         .constant => |value| .{ .constant = .{ .constant = value.parameters.constant } },
         .oscillator => |value| .{ .oscillator = .{
             .waveform = @tagName(value.parameters.waveform),
@@ -339,6 +342,15 @@ fn nodeFromProto(
             .amplitude = value.amplitude orelse 1,
         });
     }
+    if (std.mem.eql(u8, serialized.kind, "keyboard")) {
+        const value = try requiredParameters(serialized, .keyboard);
+        const octave = value.octave orelse 4;
+        if (octave < std.math.minInt(i8) or octave > std.math.maxInt(i8))
+            return error.InvalidNodeParameters;
+        return DSP.Node.Keyboard.create(name, .{
+            .octave = @intCast(octave),
+        });
+    }
     return error.UnknownNodeKind;
 }
 
@@ -381,7 +393,7 @@ fn validateDocument(document: P.SynthDocument) !void {
         if (index != 0) {
             switch (tag) {
                 .noop => unreachable,
-                .add, .multiply, .output, .constant, .oscillator, .mixer, .monophonic_sequencer, .adsr, .multimode_filter, .bit_crusher, .noise => try validateNodeParameters(node, tag),
+                .add, .multiply, .output, .constant, .keyboard, .oscillator, .mixer, .monophonic_sequencer, .adsr, .multimode_filter, .bit_crusher, .noise => try validateNodeParameters(node, tag),
             }
         }
         for (node.inputs.items, 0..) |connection, connection_index| {
@@ -455,6 +467,12 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
         .noise => {
             const value = try requiredParameters(node, .noise);
             _ = try enumFromString(DSP.Node.Noise.Type, value.type orelse "white");
+        },
+        .keyboard => {
+            const value = try requiredParameters(node, .keyboard);
+            const octave = value.octave orelse 4;
+            if (octave < std.math.minInt(i8) or octave > std.math.maxInt(i8))
+                return error.InvalidNodeParameters;
         },
         .add, .multiply, .noop, .output => {},
     }
