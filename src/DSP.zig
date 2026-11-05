@@ -101,6 +101,20 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
     self.nodes.deinit(gpa);
 }
 
+/// Removes every user node while retaining the no-op sentinel at index zero.
+pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    while (self.nodes.len > 1) {
+        const index = self.nodes.len - 1;
+        self.nodes.items(.sample_tap)[index].queue.deinit(gpa);
+        _ = self.nodes.pop();
+    }
+    self.output = .noop;
+    self.render_generation = 0;
+}
+
 /// Starts streaming rendered graph audio to the sound device.
 pub fn start(self: *DSP) !void {
     try self.sound.start();

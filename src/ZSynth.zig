@@ -189,6 +189,7 @@ pub fn start(self: *Self, allocator: std.mem.Allocator) !void {
                             .height = self.display.impl.graphic.height,
                         },
                     },
+                    .serializer = undefined,
                 },
             },
             .vtable = &SynthEditor.vtable,

@@ -220,6 +220,65 @@ pub fn nodePosition(self: *Self, node: VisualNode.Index) Position {
     return self.nodes.items(.position)[node.idx];
 }
 
+/// Adds one visual node and reserves the cells covered by its footprint.
+pub fn addNode(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    node: DSP.Node.Index,
+    position: Position,
+) !void {
+    if (node.idx != self.nodes.len)
+        return error.InvalidVisualNodeIndex;
+
+    try self.nodes.append(gpa, .{
+        .dsp_node = node,
+        .position = position,
+    });
+
+    const footprint = if (node.isNoop()) null else self.nodeFootprint(node);
+    if (footprint) |bounds| {
+        for (0..bounds.width) |dx| {
+            for (0..bounds.height) |dy| {
+                const occupied = Position{
+                    .x = bounds.x + @as(i32, @intCast(dx)),
+                    .y = bounds.y + @as(i32, @intCast(dy)),
+                };
+                if (self.occupied.get(occupied) != null) {
+                    _ = self.nodes.pop();
+                    return error.InvalidVisualNodeLayout;
+                }
+            }
+        }
+        self.occupied.ensureUnusedCapacity(gpa, bounds.width * bounds.height) catch |err| {
+            _ = self.nodes.pop();
+            return err;
+        };
+    }
+
+    if (footprint) |bounds| {
+        for (0..bounds.width) |dx| {
+            for (0..bounds.height) |dy| {
+                const occupied = Position{
+                    .x = bounds.x + @as(i32, @intCast(dx)),
+                    .y = bounds.y + @as(i32, @intCast(dy)),
+                };
+                self.occupied.putAssumeCapacityNoClobber(occupied, node);
+            }
+        }
+    }
+}
+
+/// Clears visual nodes and derived routing state while retaining the viewport.
+pub fn reset(self: *Self, gpa: std.mem.Allocator) void {
+    self.clearPaths(gpa);
+    self.nodes.clearRetainingCapacity();
+    self.occupied.clearRetainingCapacity();
+    self.path_occupied.clearRetainingCapacity();
+    self.selected_node = null;
+    self.graph_north_west = .{ .x = 0, .y = 0 };
+    self.graph_south_east = .{ .x = 0, .y = 0 };
+}
+
 /// Move one visual node and rebuild the cells used by routing.
 /// Returns false when the candidate position collides with the graph layout.
 pub fn moveNode(

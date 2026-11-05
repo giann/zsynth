@@ -1,4 +1,5 @@
 const std = @import("std");
+const protobuf = @import("protobuf");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -23,11 +24,33 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", build_options);
 
+    const protobuf_dep = b.dependency(
+        "protobuf",
+        .{
+            .target = target,
+            .optimize = optimize,
+        },
+    );
+
+    // Generate protobuf bindings before compiling the executable that imports
+    // the serialized synth document types.
+    const gen_proto = b.step("gen-proto", "Generate Zig files from protobuf definitions");
+    const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
+        .destination_directory = b.path("src/"),
+        .protoc = null,
+        .source_files = &.{b.path("proto/zsynth.proto")},
+        .include_directories = &.{b.path("proto")},
+        .preserve_unknown_fields = false,
+    });
+    gen_proto.dependOn(protoc_step.step);
+
     addSdl3(b, target, exe);
     addZstbi(b, exe);
     addZpool(b, exe);
     addZaudio(b, exe);
     addImGUI(b, exe);
+    addProtobuf(exe, protobuf_dep);
+    exe.step.dependOn(gen_proto);
     exe.root_module.linkLibrary(mimalloc);
 
     const check = b.step("check", "Compile zsynth without installing it");
@@ -228,4 +251,11 @@ fn addZaudio(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
     const zaudio = b.dependency("zaudio", .{});
     compile_step.root_module.addImport("zaudio", zaudio.module("root"));
     compile_step.root_module.linkLibrary(zaudio.artifact("miniaudio"));
+}
+
+fn addProtobuf(
+    compile_step: *std.Build.Step.Compile,
+    protobuf_dep: *std.Build.Dependency,
+) void {
+    compile_step.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
 }

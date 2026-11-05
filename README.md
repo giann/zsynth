@@ -31,11 +31,11 @@ and effects to be composed into a real-time sound pipeline.
 
 ## Controls and UI elements
 
-- meter (••••○○○○)
 - knob
 - number input
 - label input
 - dial
+- radio/check button
 
 The idea: you design the DSP graph and then you have can draw your UI with
 prefab elements to make your own synth that looks how you want

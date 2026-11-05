@@ -7,6 +7,7 @@ const StateStack = @import("StateStack.zig");
 const ZSynth = @import("ZSynth.zig");
 const Renderer = @import("Renderer.zig");
 const Space = @import("Space.zig");
+const Serializer = @import("Serializer.zig");
 const Display = @import("Display.zig");
 const VisualNode = Space.VisualNode;
 
@@ -20,6 +21,8 @@ zsynth: *ZSynth,
 /// DSP graph constructed when the editor enters the state stack.
 dsp: DSP,
 space: Space,
+/// Protobuf serializer bound to the live graph and its visual layout.
+serializer: Serializer,
 /// Output meter bound to the currently selected DSP node.
 output_meter: OutputMeter = .{},
 
@@ -45,6 +48,12 @@ fn enter(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     // Initialize the DSP against the runtime-owned audio engine.
     try self.dsp.init(self.zsynth.audio_engine, gpa);
+    self.serializer = .{
+        .dsp = &self.dsp,
+        .space = &self.space,
+        .allocator = gpa,
+        .io = self.zsynth.io,
+    };
     self.space.dsp = &self.dsp;
     try addVisualNode(self, gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
     // Build and start the simple demonstration graph.
@@ -79,6 +88,7 @@ fn quit(
 
 /// Stops and deinitializes the DSP graph exactly once.
 fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+    self.serializer.deinit();
     self.dsp.deinit(gpa);
     self.space.deinit(gpa);
 }
@@ -356,7 +366,17 @@ fn keyUpDown(
     const modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
     const delta: i32 = if ((modifiers & sdl.Keymod.shift) != 0) 5 else 1;
 
+    const command = (modifiers & (sdl.Keymod.lgui | sdl.Keymod.rgui)) != 0;
+
     switch (event.key) {
+        .s => if (command) try self.serializer.save("./simpleDSP.zsynth") else return false,
+        .l => if (command) {
+            try self.serializer.load("./simpleDSP.zsynth");
+            self.setNodeSelection(null);
+            self.output_meter = .{};
+            self.zsynth.cursor.dirty = true;
+            try self.write(gpa);
+        } else return false,
         .up => try self.moveViewport(gpa, 0, -delta),
         .down => try self.moveViewport(gpa, 0, delta),
         .left => try self.moveViewport(gpa, -delta, 0),
@@ -680,25 +700,7 @@ fn addVisualNode(
     node: DSP.Node.Index,
     position: Space.Position,
 ) !void {
-    assert(node.idx == self.space.nodes.len);
-    try self.space.nodes.append(allocator, .{
-        .dsp_node = node,
-        .position = position,
-    });
-
-    if (node.isNoop()) return;
-
-    const footprint = self.space.nodeFootprint(node);
-    for (0..footprint.width) |dx| {
-        for (0..footprint.height) |dy| {
-            const occupied = Space.Position{
-                .x = footprint.x + @as(i32, @intCast(dx)),
-                .y = footprint.y + @as(i32, @intCast(dy)),
-            };
-            assert(self.space.occupied.get(occupied) == null);
-            try self.space.occupied.put(allocator, occupied, node);
-        }
-    }
+    try self.space.addNode(allocator, node, position);
 }
 
 fn addNode(
