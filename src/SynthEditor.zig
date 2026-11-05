@@ -74,6 +74,8 @@ dsp: DSP,
 space: Space,
 /// Protobuf serializer bound to the live graph and its visual layout.
 serializer: Serializer,
+/// Allocated path of the graph most recently saved or loaded.
+document_path: ?[]u8 = null,
 /// Allocated names entered for nodes created through the command palette.
 owned_node_names: std.ArrayList([]u8) = .empty,
 /// Output meter bound to the currently selected DSP node.
@@ -128,6 +130,10 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
     self.dsp.reset(gpa);
     self.space.reset(gpa);
     self.serializer.clearOwned();
+    if (self.document_path) |path| {
+        gpa.free(path);
+        self.document_path = null;
+    }
     for (self.owned_node_names.items) |name|
         gpa.free(name);
     self.owned_node_names.clearRetainingCapacity();
@@ -179,6 +185,8 @@ fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.serializer.deinit();
     self.dsp.deinit(gpa);
     self.space.deinit(gpa);
+    if (self.document_path) |path|
+        gpa.free(path);
     for (self.owned_node_names.items) |name|
         gpa.free(name);
     self.owned_node_names.deinit(gpa);
@@ -263,6 +271,71 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
 fn write(self: *Self, gpa: std.mem.Allocator) !void {
     self.zsynth.display.reset();
     try self.space.write(gpa, &self.zsynth.display);
+}
+
+/// Remembers a successfully saved or loaded graph path for the UI title.
+fn rememberDocumentPath(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+    const owned = try gpa.dupe(u8, path);
+    if (self.document_path) |previous|
+        gpa.free(previous);
+    self.document_path = owned;
+    self.zsynth.cursor.dirty = true;
+}
+
+/// Saves the graph and updates the remembered document path after success.
+fn saveDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+    try self.serializer.save(path);
+    try self.rememberDocumentPath(gpa, path);
+}
+
+/// Loads the graph and updates the remembered document path after success.
+fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+    try self.serializer.load(path);
+    try self.rememberDocumentPath(gpa, path);
+}
+
+/// Returns the final filename without its path or final extension.
+fn documentName(path: []const u8) []const u8 {
+    var name_start: usize = 0;
+    for (path, 0..) |character, index| {
+        if (character == std.fs.path.sep)
+            name_start = index + 1;
+    }
+
+    const name = path[name_start..];
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |extension_start|
+        if (extension_start > 0)
+            return name[0..extension_start];
+    return name;
+}
+
+/// Draws the remembered document filename at the top-left of the UI overlay.
+fn writeDocumentName(self: *Self, gpa: std.mem.Allocator) !void {
+    const path = self.document_path orelse return;
+
+    var name_start: usize = 0;
+    for (path, 0..) |character, index| {
+        if (character == '/' or character == '\\')
+            name_start = index + 1;
+    }
+
+    const name = path[name_start..];
+    const displayed_name = if (std.mem.lastIndexOfScalar(u8, name, '.')) |extension_start|
+        if (extension_start > 0)
+            name[0..extension_start]
+        else
+            name
+    else
+        name;
+
+    try self.zsynth.ui_display.write(
+        gpa,
+        displayed_name,
+        0,
+        0,
+        .black,
+        .astral,
+    );
 }
 
 /// Draws the selected node's reflected parameters in the bottom UI pane.
@@ -685,10 +758,10 @@ fn keyUpDown(
             );
         },
         .s => if (command) {
-            self.serializer.save("./simpleDSP.zsynth") catch return error.IoError;
+            self.saveDocument(gpa, "./simpleDSP.zsynth") catch return error.IoError;
         } else return false,
         .l => if (command) {
-            self.serializer.load("./simpleDSP.zsynth") catch return error.IoError;
+            self.loadDocument(gpa, "./simpleDSP.zsynth") catch return error.IoError;
             self.setNodeSelection(null);
             self.output_meter = .{};
             self.zsynth.cursor.dirty = true;
@@ -1310,6 +1383,8 @@ fn render(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     // Redraw text before the runtime overlays the software cursor.
     try self.write(gpa);
+    // Draw the remembered filename before transient editor overlays.
+    try self.writeDocumentName(gpa);
     // Draw selected-node parameters in the editor-owned transparent overlay.
     try self.writeSelectedParametersPane(gpa);
     // Draw outlet labels before the runtime adds the generic cursor glyph.
@@ -1833,12 +1908,12 @@ pub const CommandPalette = struct {
         switch (self.selected_command.?) {
             .save => {
                 if (self.text_field.inputSlice().len == 0) return;
-                self.editor.serializer.save(self.inputSlice()) catch return error.IoError;
+                self.editor.saveDocument(gpa, self.inputSlice()) catch return error.IoError;
                 try self.finish(state_stack, gpa);
             },
             .load => {
                 if (self.text_field.inputSlice().len == 0) return;
-                self.editor.serializer.load(self.inputSlice()) catch return error.IoError;
+                self.editor.loadDocument(gpa, self.inputSlice()) catch return error.IoError;
                 self.editor.setNodeSelection(null);
                 self.editor.output_meter = .{};
                 self.editor.zsynth.cursor.dirty = true;
