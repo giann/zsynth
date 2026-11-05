@@ -31,6 +31,8 @@ const ParameterEditor = struct {
     const ParameterCell = struct {
         /// Reflected parameter field name used for editing.
         field_name: []const u8,
+        /// Fixed-array element index, or null for a scalar field.
+        array_index: ?usize,
         /// Horizontal position of the rendered value.
         value_x: u32,
         /// Vertical position of the rendered row.
@@ -47,6 +49,8 @@ const ParameterEditor = struct {
         node: DSP.Node.Index,
         /// Reflected field name within the node parameter struct.
         field_name: []const u8,
+        /// Fixed-array element index, or null for a scalar field.
+        array_index: ?usize,
     };
 
     /// Context passed while committing a parameter under the graph lock.
@@ -60,6 +64,8 @@ const ParameterEditor = struct {
 
 /// Number of parameter rows available after applying the pane padding.
 const parameters_pane_padding: u32 = 1;
+/// Maximum number of parameter rows packed into one selected-pane column.
+const parameters_pane_max_rows: u32 = 5;
 
 /// Runtime owning the display, renderer, and audio engine used by this state.
 zsynth: *ZSynth,
@@ -323,6 +329,31 @@ fn isEditableParameterType(comptime T: type) bool {
     };
 }
 
+/// Counts the selected-pane cells produced by a reflected parameter struct.
+fn reflectedParameterItemCount(comptime Parameters: type) usize {
+    const field_names = @typeInfo(Parameters).@"struct".field_names;
+    var count: usize = 1;
+    inline for (field_names) |field_name| {
+        const field_type = @TypeOf(@field(@as(Parameters, undefined), field_name));
+        count += switch (@typeInfo(field_type)) {
+            .array => |array| array.len,
+            else => 1,
+        };
+    }
+    return count;
+}
+
+/// Returns whether two selected-pane parameter references identify the same value.
+fn sameParameter(
+    left_field_name: []const u8,
+    left_array_index: ?usize,
+    right_field_name: []const u8,
+    right_array_index: ?usize,
+) bool {
+    return std.mem.eql(u8, left_field_name, right_field_name) and
+        std.meta.eql(left_array_index, right_array_index);
+}
+
 /// Reserves enough cells for an enum's longest tag or the formatted scalar.
 fn parameterValueWidth(comptime T: type, formatted_len: usize) u32 {
     switch (@typeInfo(T)) {
@@ -348,11 +379,14 @@ fn writeReflectedParameters(
     output_meter: *const OutputMeter,
 ) !void {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
-    var items: [field_names.len + 1]Display.LabelValue = undefined;
-    var value_buffers: [field_names.len + 1][64]u8 = undefined;
-    var value_widths: [field_names.len + 1]u32 = undefined;
-    var editable: [field_names.len + 1]bool = undefined;
-    var cell_names: [field_names.len + 1][]const u8 = undefined;
+    const item_count = comptime reflectedParameterItemCount(@TypeOf(parameters));
+    var items: [item_count]Display.LabelValue = undefined;
+    var value_buffers: [item_count][64]u8 = undefined;
+    var value_widths: [item_count]u32 = undefined;
+    var editable: [item_count]bool = undefined;
+    var cell_names: [item_count][]const u8 = undefined;
+    var cell_array_indices: [item_count]?usize = undefined;
+    var label_buffers: [item_count][64]u8 = undefined;
 
     cell_names[0] = node_name_field_name;
     items[0] = .{
@@ -362,44 +396,84 @@ fn writeReflectedParameters(
     };
     value_widths[0] = @intCast(@max(node_name.len, 1));
     editable[0] = true;
+    cell_array_indices[0] = null;
 
-    inline for (field_names, 0..) |field_name, index| {
-        cell_names[index + 1] = field_name;
+    var reflected_item_index: usize = 1;
+    inline for (field_names) |field_name| {
         const value = @field(parameters, field_name);
-        const value_color: Display.Color = switch (@typeInfo(@TypeOf(value))) {
-            .int, .float => .golden_rod,
-            .@"enum" => .science_blue,
-            else => .white,
-        };
-        const formatted_value = formatParameterValue(&value_buffers[index], value);
-        items[index + 1] = .{
-            .label = field_name,
-            .value = formatted_value,
-            .value_color = value_color,
-        };
-        value_widths[index + 1] = parameterValueWidth(
-            @TypeOf(value),
-            formatted_value.len,
-        );
-        editable[index + 1] = isEditableParameterType(@TypeOf(value));
+        switch (@typeInfo(@TypeOf(value))) {
+            .array => |array| {
+                inline for (0..array.len) |array_index| {
+                    const element = value[array_index];
+                    const formatted_value = formatParameterValue(
+                        &value_buffers[reflected_item_index],
+                        element,
+                    );
+                    const label = std.fmt.bufPrint(
+                        &label_buffers[reflected_item_index],
+                        "{s} #{d}",
+                        .{ field_name, array_index + 1 },
+                    ) catch field_name;
+                    const value_color: Display.Color = switch (@typeInfo(@TypeOf(element))) {
+                        .int, .float => .golden_rod,
+                        .@"enum" => .science_blue,
+                        else => .white,
+                    };
+                    items[reflected_item_index] = .{
+                        .label = label,
+                        .value = formatted_value,
+                        .value_color = value_color,
+                    };
+                    value_widths[reflected_item_index] = parameterValueWidth(
+                        @TypeOf(element),
+                        formatted_value.len,
+                    );
+                    editable[reflected_item_index] = isEditableParameterType(@TypeOf(element));
+                    cell_names[reflected_item_index] = field_name;
+                    cell_array_indices[reflected_item_index] = array_index;
+                    reflected_item_index += 1;
+                }
+            },
+            else => {
+                const formatted_value = formatParameterValue(
+                    &value_buffers[reflected_item_index],
+                    value,
+                );
+                const value_color: Display.Color = switch (@typeInfo(@TypeOf(value))) {
+                    .int, .float => .golden_rod,
+                    .@"enum" => .science_blue,
+                    else => .white,
+                };
+                items[reflected_item_index] = .{
+                    .label = field_name,
+                    .value = formatted_value,
+                    .value_color = value_color,
+                };
+                value_widths[reflected_item_index] = parameterValueWidth(
+                    @TypeOf(value),
+                    formatted_value.len,
+                );
+                editable[reflected_item_index] = isEditableParameterType(@TypeOf(value));
+                cell_names[reflected_item_index] = field_name;
+                cell_array_indices[reflected_item_index] = null;
+                reflected_item_index += 1;
+            },
+        }
     }
 
     const pane_height = @min(
         display_height,
         @max(
-            @as(u32, 5),
-            @max(
-                @as(u32, @intCast(items.len)) + 2,
-                output_meter.height + 2,
-            ),
+            parameters_pane_max_rows + 2,
+            output_meter.height + 2,
         ),
     );
     if (pane_height < 2) return;
     const row_count = @min(
         @as(u32, @intCast(items.len)),
-        pane_height - 2,
+        parameters_pane_max_rows,
     );
-    const rows = @min(row_count, @as(u32, @intCast(items.len)));
+    const rows = @min(row_count, pane_height - 2);
     // Match the selected-pane column packing while retaining each value's
     // coordinates for mouse hit-testing and the active text field.
     var content_width: u32 = 0;
@@ -423,6 +497,7 @@ fn writeReflectedParameters(
                 column_width = @max(
                     column_width,
                     label_width +
+                        1 +
                         value_widths[index],
                 );
 
@@ -479,14 +554,15 @@ fn writeReflectedParameters(
                 @as(u32, @intCast(Display.countStripped(items[index].label))),
             );
         for (item_index..column_end) |index|
-            column_width = @max(column_width, label_width + value_widths[index]);
+            column_width = @max(column_width, label_width + 1 + value_widths[index]);
 
         for (item_index..column_end) |index| {
             const row = @as(u32, @intCast(index - item_index));
-            const value_x = column_x + label_width;
+            const value_x = column_x + label_width + 1;
             const value_y = pane_top + parameters_pane_padding + row;
             const cell = ParameterEditor.ParameterCell{
                 .field_name = cell_names[index],
+                .array_index = cell_array_indices[index],
                 .value_x = value_x,
                 .value_y = value_y,
                 .value_width = value_widths[index],
@@ -523,7 +599,12 @@ fn writeReflectedParameters(
         if (self.space.selected_node) |selected| {
             if (active.node.idx == selected.idx) {
                 for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |cell| {
-                    if (!cell.editable or !std.mem.eql(u8, cell.field_name, active.field_name))
+                    if (!cell.editable or !sameParameter(
+                        cell.field_name,
+                        cell.array_index,
+                        active.field_name,
+                        active.array_index,
+                    ))
                         continue;
                     self.parameter_editor.text_field.parameters.width = if (pane_width > cell.value_x + 1)
                         pane_width - cell.value_x - 1
@@ -684,7 +765,12 @@ fn beginFirstParameterEdit(self: *Self) bool {
 /// Starts editing a selected-pane property and loads its current value.
 fn beginParameterEdit(self: *Self, parameter: ParameterEditor.ParameterCell) void {
     if (self.parameter_editor.active) |active|
-        if (std.mem.eql(u8, active.field_name, parameter.field_name))
+        if (sameParameter(
+            active.field_name,
+            active.array_index,
+            parameter.field_name,
+            parameter.array_index,
+        ))
             return;
 
     if (self.parameter_editor.active != null)
@@ -694,6 +780,7 @@ fn beginParameterEdit(self: *Self, parameter: ParameterEditor.ParameterCell) voi
     self.parameter_editor.active = .{
         .node = .{ .idx = node.idx },
         .field_name = parameter.field_name,
+        .array_index = parameter.array_index,
     };
     self.parameter_editor.text_field = .init(self, .{
         .width = parameter.value_width,
@@ -702,7 +789,14 @@ fn beginParameterEdit(self: *Self, parameter: ParameterEditor.ParameterCell) voi
     });
 
     var buffer: [64]u8 = undefined;
-    self.parameter_editor.text_field.setInput(self.formatNodeParameter(node.idx, parameter.field_name, &buffer));
+    self.parameter_editor.text_field.setInput(
+        self.formatNodeParameter(
+            node.idx,
+            parameter.field_name,
+            parameter.array_index,
+            &buffer,
+        ),
+    );
 }
 
 /// Commits the active field and moves to the adjacent editable property.
@@ -711,7 +805,12 @@ fn moveParameterEdit(self: *Self, direction: i2) void {
     var current_index: usize = 0;
     while (current_index < self.parameter_editor.cell_count) : (current_index += 1) {
         const parameter = self.parameter_editor.cells[current_index];
-        if (parameter.editable and std.mem.eql(u8, parameter.field_name, active.field_name))
+        if (parameter.editable and sameParameter(
+            parameter.field_name,
+            parameter.array_index,
+            active.field_name,
+            active.array_index,
+        ))
             break;
     }
     if (current_index == self.parameter_editor.cell_count) return;
@@ -749,7 +848,14 @@ fn commitParameterEdit(self: *Self) void {
     var buffer: [64]u8 = undefined;
     const active = self.parameter_editor.active orelse return;
     const node = self.space.selected_node orelse return;
-    self.parameter_editor.text_field.setInput(self.formatNodeParameter(node.idx, active.field_name, &buffer));
+    self.parameter_editor.text_field.setInput(
+        self.formatNodeParameter(
+            node.idx,
+            active.field_name,
+            active.array_index,
+            &buffer,
+        ),
+    );
 }
 
 /// Parses and assigns an active property while the DSP graph is locked.
@@ -779,6 +885,7 @@ fn commitParameterLocked(context: *ParameterEditor.CommitContext) void {
                 context.accepted = assignReflectedParameter(
                     &node_state.parameters,
                     active.field_name,
+                    active.array_index,
                     self.parameter_editor.text_field.inputSlice(),
                 );
         },
@@ -790,6 +897,7 @@ fn formatNodeParameter(
     self: *const Self,
     node: usize,
     field_name: []const u8,
+    array_index: ?usize,
     buffer: []u8,
 ) []const u8 {
     if (node >= self.dsp.nodes.len) return "";
@@ -798,18 +906,35 @@ fn formatNodeParameter(
     const state = self.dsp.nodes.items(.state)[node];
     return switch (state) {
         inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
-            formatReflectedParameter(node_state.parameters, field_name, buffer)
+            formatReflectedParameter(node_state.parameters, field_name, array_index, buffer)
         else
             "",
     };
 }
 
-/// Formats a named scalar or enum value from a reflected parameter struct.
-fn formatReflectedParameter(parameters: anytype, field_name: []const u8, buffer: []u8) []const u8 {
+/// Formats a named scalar or fixed-array element from a reflected parameter struct.
+fn formatReflectedParameter(
+    parameters: anytype,
+    field_name: []const u8,
+    array_index: ?usize,
+    buffer: []u8,
+) []const u8 {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
     inline for (field_names) |name| {
-        if (std.mem.eql(u8, name, field_name))
-            return formatParameterValue(buffer, @field(parameters, name));
+        if (std.mem.eql(u8, name, field_name)) {
+            const value = @field(parameters, name);
+            switch (@typeInfo(@TypeOf(value))) {
+                .array => |array| {
+                    const index = array_index orelse return "";
+                    if (index >= array.len) return "";
+                    return formatParameterValue(buffer, value[index]);
+                },
+                else => {
+                    if (array_index != null) return "";
+                    return formatParameterValue(buffer, value);
+                },
+            }
+        }
     }
     return "";
 }
@@ -823,16 +948,22 @@ fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
     const state = self.dsp.nodes.items(.state)[active.node.idx];
     return switch (state) {
         inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
-            reflectedEnumCompletion(node_state.parameters, active.field_name, field.inputSlice())
+            reflectedEnumCompletion(
+                node_state.parameters,
+                active.field_name,
+                active.array_index,
+                field.inputSlice(),
+            )
         else
             "",
     };
 }
 
-/// Finds a matching enum tag for a reflected property input prefix.
+/// Finds a matching enum tag for a reflected scalar or fixed-array element prefix.
 fn reflectedEnumCompletion(
     parameters: anytype,
     field_name: []const u8,
+    array_index: ?usize,
     input: []const u8,
 ) []const u8 {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
@@ -841,9 +972,21 @@ fn reflectedEnumCompletion(
             const value = @field(parameters, name);
             switch (@typeInfo(@TypeOf(value))) {
                 .@"enum" => {
+                    if (array_index != null) return "";
                     inline for (std.meta.tags(@TypeOf(value))) |tag|
                         if (parameterStartsWithIgnoreCase(@tagName(tag), input))
                             return @tagName(tag);
+                },
+                .array => |array| {
+                    const index = array_index orelse return "";
+                    if (index >= array.len) return "";
+                    const element = value[index];
+                    switch (@typeInfo(@TypeOf(element))) {
+                        .@"enum" => inline for (std.meta.tags(@TypeOf(element))) |tag|
+                            if (parameterStartsWithIgnoreCase(@tagName(tag), input))
+                                return @tagName(tag),
+                        else => {},
+                    }
                 },
                 else => {},
             }
@@ -852,42 +995,62 @@ fn reflectedEnumCompletion(
     return "";
 }
 
-/// Parses and assigns one supported reflected scalar or enum property.
-fn assignReflectedParameter(parameters: anytype, field_name: []const u8, input: []const u8) bool {
+/// Parses and assigns one supported reflected scalar or fixed-array element.
+fn assignReflectedParameter(
+    parameters: anytype,
+    field_name: []const u8,
+    array_index: ?usize,
+    input: []const u8,
+) bool {
     const field_names = @typeInfo(@TypeOf(parameters.*)).@"struct".field_names;
     inline for (field_names) |name| {
         if (std.mem.eql(u8, name, field_name)) {
             const value = &@field(parameters.*, name);
             switch (@typeInfo(@TypeOf(value.*))) {
-                .bool => {
-                    if (std.ascii.eqlIgnoreCase(input, "true")) {
-                        value.* = true;
-                        return true;
-                    }
-                    if (std.ascii.eqlIgnoreCase(input, "false")) {
-                        value.* = false;
-                        return true;
-                    }
-                },
-                .int => {
-                    value.* = std.fmt.parseInt(@TypeOf(value.*), input, 10) catch return false;
-                    return true;
-                },
-                .float => {
-                    value.* = std.fmt.parseFloat(@TypeOf(value.*), input) catch return false;
-                    return true;
-                },
-                .@"enum" => {
-                    inline for (std.meta.tags(@TypeOf(value.*))) |tag| {
-                        if (std.ascii.eqlIgnoreCase(input, @tagName(tag))) {
-                            value.* = tag;
-                            return true;
-                        }
-                    }
+                .array => |array| {
+                    const index = array_index orelse return false;
+                    if (index >= array.len) return false;
+                    return assignReflectedScalar(&value.*[index], input);
                 },
                 else => {},
             }
+            if (array_index != null) return false;
+            return assignReflectedScalar(value, input);
         }
+    }
+    return false;
+}
+
+/// Parses and assigns one supported reflected scalar or enum value.
+fn assignReflectedScalar(value: anytype, input: []const u8) bool {
+    switch (@typeInfo(@TypeOf(value.*))) {
+        .bool => {
+            if (std.ascii.eqlIgnoreCase(input, "true")) {
+                value.* = true;
+                return true;
+            }
+            if (std.ascii.eqlIgnoreCase(input, "false")) {
+                value.* = false;
+                return true;
+            }
+        },
+        .int => {
+            value.* = std.fmt.parseInt(@TypeOf(value.*), input, 10) catch return false;
+            return true;
+        },
+        .float => {
+            value.* = std.fmt.parseFloat(@TypeOf(value.*), input) catch return false;
+            return true;
+        },
+        .@"enum" => {
+            inline for (std.meta.tags(@TypeOf(value.*))) |tag| {
+                if (std.ascii.eqlIgnoreCase(input, @tagName(tag))) {
+                    value.* = tag;
+                    return true;
+                }
+            }
+        },
+        else => {},
     }
     return false;
 }

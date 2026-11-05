@@ -21,6 +21,7 @@ and effects to be composed into a real-time sound pipeline.
 
 ## TODO
 
+- color picker for nodes
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for
   audio)
@@ -31,8 +32,6 @@ and effects to be composed into a real-time sound pipeline.
 ## Controls and UI elements
 
 - knob
-- number input
-- label input
 - dial
 - radio/check button
 

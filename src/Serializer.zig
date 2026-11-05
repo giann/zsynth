@@ -36,7 +36,7 @@ pub fn clearOwned(self: *Serializer) void {
     self.releaseOwned();
 }
 
-/// Writes the current graph and visual node positions to a protobuf file.
+/// Writes the current graph, visual node positions, and viewport position to a protobuf file.
 pub fn save(self: *Serializer, path: []const u8) !void {
     if (path.len == 0)
         return error.EmptySynthPath;
@@ -48,6 +48,8 @@ pub fn save(self: *Serializer, path: []const u8) !void {
     var document = P.SynthDocument{
         .schema_version = schema_version,
         .output_node = @intCast(self.dsp.output.idx),
+        .viewport_x = self.space.viewport.x,
+        .viewport_y = self.space.viewport.y,
     };
 
     if (self.space.nodes.len != self.dsp.nodes.len)
@@ -82,7 +84,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
     try writer.interface.flush();
 }
 
-/// Loads a document, replacing the current graph and preserving play state.
+/// Loads a document, replacing the current graph and viewport while preserving play state.
 pub fn load(self: *Serializer, path: []const u8) !void {
     if (path.len == 0)
         return error.EmptySynthPath;
@@ -103,6 +105,8 @@ pub fn load(self: *Serializer, path: []const u8) !void {
     try self.dsp.stop();
     self.dsp.reset(self.allocator);
     self.space.reset(self.allocator);
+    self.space.viewport.x = document.viewport_x;
+    self.space.viewport.y = document.viewport_y;
     self.releaseOwned();
 
     // DSP.reset() retains the runtime sentinel at index zero.

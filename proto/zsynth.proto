@@ -6,6 +6,8 @@ message SynthDocument {
   uint32 schema_version = 1;
   uint32 output_node = 2;
   repeated Node nodes = 3;
+  int32 viewport_x = 4;
+  int32 viewport_y = 5;
 }
 
 message Node {
