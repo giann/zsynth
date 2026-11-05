@@ -31,6 +31,11 @@ pub fn deinit(self: *Serializer) void {
     self.owned_notes.deinit(self.allocator);
 }
 
+/// Releases names and note arrays retained by the current document.
+pub fn clearOwned(self: *Serializer) void {
+    self.releaseOwned();
+}
+
 /// Writes the current graph and visual node positions to a protobuf file.
 pub fn save(self: *Serializer, path: []const u8) !void {
     if (path.len == 0)

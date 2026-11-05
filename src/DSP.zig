@@ -313,6 +313,13 @@ fn unlockGraph(self: *DSP) void {
     self.graph_mutex.unlock();
 }
 
+/// Runs a bounded main-thread update while excluding the audio graph traversal.
+pub fn withGraphLock(self: *DSP, context: anytype, callback: anytype) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+    callback(context);
+}
+
 /// Evaluates one node and all of its dependencies for the requested sample count.
 fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     const cache = &self.nodes.items(.cache)[node.idx];

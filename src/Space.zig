@@ -158,6 +158,110 @@ pub fn moveViewport(self: *Self, dx: i32, dy: i32) void {
     self.viewport.y += dy;
 }
 
+/// Finds a deterministic free top-left position for a visual node.
+///
+/// Positions fully inside the current viewport are considered first. If all
+/// visible positions are occupied, the search expands rectangular shells
+/// around the viewport so a finite graph can always be extended in the
+/// unbounded editor space.
+pub fn findFreePosition(
+    self: *Self,
+    node: VisualNode.Index,
+    preferred: Position,
+) ?Position {
+    const footprint = self.nodeFootprintAt(node, preferred);
+    const viewport_left = @as(i64, self.viewport.x);
+    const viewport_top = @as(i64, self.viewport.y);
+    const viewport_right = viewport_left + @as(i64, self.viewport.width) -
+        @as(i64, footprint.width);
+    const viewport_bottom = viewport_top + @as(i64, self.viewport.height) -
+        @as(i64, footprint.height);
+
+    if (viewport_right >= viewport_left and viewport_bottom >= viewport_top) {
+        const center_x = std.math.clamp(
+            @as(i64, preferred.x) - @as(i64, footprint.width / 2),
+            viewport_left,
+            viewport_right,
+        );
+        const center_y = std.math.clamp(
+            @as(i64, preferred.y) - @as(i64, footprint.height / 2),
+            viewport_top,
+            viewport_bottom,
+        );
+        if (self.canPlaceAt(node, .{ .x = @intCast(center_x), .y = @intCast(center_y) }))
+            return .{ .x = @intCast(center_x), .y = @intCast(center_y) };
+
+        var y = viewport_top;
+        while (y <= viewport_bottom) : (y += 1) {
+            var x = viewport_left;
+            while (x <= viewport_right) : (x += 1) {
+                if (x == center_x and y == center_y) continue;
+                if (self.canPlaceAt(node, .{ .x = @intCast(x), .y = @intCast(y) }))
+                    return .{ .x = @intCast(x), .y = @intCast(y) };
+            }
+        }
+    }
+
+    var radius: i64 = 1;
+    while (radius <= std.math.maxInt(i32)) : (radius += 1) {
+        const left = viewport_left - radius;
+        const top = viewport_top - radius;
+        const right = viewport_right + radius;
+        const bottom = viewport_bottom + radius;
+
+        var x = left;
+        while (x <= right) : (x += 1) {
+            if (self.canPlaceAtI64(node, x, top))
+                return .{ .x = @intCast(x), .y = @intCast(top) };
+            if (bottom != top and self.canPlaceAtI64(node, x, bottom))
+                return .{ .x = @intCast(x), .y = @intCast(bottom) };
+        }
+
+        var y = top + 1;
+        while (y < bottom) : (y += 1) {
+            if (self.canPlaceAtI64(node, left, y))
+                return .{ .x = @intCast(left), .y = @intCast(y) };
+            if (right != left and self.canPlaceAtI64(node, right, y))
+                return .{ .x = @intCast(right), .y = @intCast(y) };
+        }
+    }
+
+    return null;
+}
+
+/// Returns the world-space center cell of the current viewport.
+pub fn viewportCenter(self: *Self) Position {
+    return self.worldPositionAtDisplayCell(self.viewport.width / 2, self.viewport.height / 2);
+}
+
+/// Tests a candidate position after widening it to the integer search type.
+fn canPlaceAtI64(self: *Self, node: VisualNode.Index, x: i64, y: i64) bool {
+    if (x < std.math.minInt(i32) + 2 or y < std.math.minInt(i32) + 1)
+        return false;
+    if (x > std.math.maxInt(i32) - 32 or y > std.math.maxInt(i32) - 32)
+        return false;
+    return self.canPlaceAt(node, .{ .x = @intCast(x), .y = @intCast(y) });
+}
+
+/// Tests whether a node footprint and its immediate routing cells are free.
+fn canPlaceAt(self: *Self, node: VisualNode.Index, position: Position) bool {
+    const footprint = self.nodeFootprintAt(node, position);
+    const left = @as(i64, position.x) - 2;
+    const top = @as(i64, position.y) - 1;
+    const right = @as(i64, position.x) + @as(i64, footprint.width);
+    const bottom = @as(i64, position.y) + @as(i64, footprint.height);
+
+    var y = top;
+    while (y <= bottom) : (y += 1) {
+        var x = left;
+        while (x <= right) : (x += 1) {
+            if (self.occupied.get(.{ .x = @intCast(x), .y = @intCast(y) }) != null)
+                return false;
+        }
+    }
+    return true;
+}
+
 /// Shift the viewport minimally so a node and its selected labels are visible.
 pub fn revealNode(self: *Self, node: VisualNode.Index) bool {
     if (node.isNoop()) return false;
@@ -703,6 +807,11 @@ fn intersectsViewport(self: *Self, footprint: Bound) bool {
 
 pub fn nodeFootprint(self: *Self, node: VisualNode.Index) Bound {
     const position = self.nodes.items(.position)[node.idx];
+    return self.nodeFootprintAt(node, position);
+}
+
+/// Returns the footprint a node would occupy at a candidate position.
+fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Bound {
     const state = self.dsp.nodes.items(.state)[node.idx];
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
 

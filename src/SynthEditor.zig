@@ -13,6 +13,51 @@ const VisualNode = Space.VisualNode;
 
 const Self = @This();
 
+/// Synthetic selected-pane field name used for editing a node's display name.
+const node_name_field_name = "name";
+
+/// Owns all state and reflection descriptors for selected-pane property edits.
+const ParameterEditor = struct {
+    /// Reusable field used to edit the active property value.
+    text_field: TextField(*Self) = undefined,
+    /// Selected-pane property receiving keyboard and text input, if any.
+    active: ?ActiveParameter = null,
+    /// Parameter cells generated during the last selected-pane render.
+    cells: [32]ParameterCell = undefined,
+    /// Number of valid entries in `cells`.
+    cell_count: usize = 0,
+
+    /// Coordinates and editability information for one selected-pane parameter.
+    const ParameterCell = struct {
+        /// Reflected parameter field name used for editing.
+        field_name: []const u8,
+        /// Horizontal position of the rendered value.
+        value_x: u32,
+        /// Vertical position of the rendered row.
+        value_y: u32,
+        /// Number of display cells reserved for the value.
+        value_width: u32,
+        /// Whether this field has scalar or enum editing support.
+        editable: bool,
+    };
+
+    /// Identifies the parameter currently being edited.
+    const ActiveParameter = struct {
+        /// Node containing the parameter.
+        node: DSP.Node.Index,
+        /// Reflected field name within the node parameter struct.
+        field_name: []const u8,
+    };
+
+    /// Context passed while committing a parameter under the graph lock.
+    const CommitContext = struct {
+        /// Editor owning the selected node and text field.
+        editor: *Self,
+        /// Whether the entered value was parsed and assigned successfully.
+        accepted: bool = false,
+    };
+};
+
 /// Number of parameter rows available after applying the pane padding.
 const parameters_pane_padding: u32 = 1;
 
@@ -23,8 +68,12 @@ dsp: DSP,
 space: Space,
 /// Protobuf serializer bound to the live graph and its visual layout.
 serializer: Serializer,
+/// Allocated names entered for nodes created through the command palette.
+owned_node_names: std.ArrayList([]u8) = .empty,
 /// Output meter bound to the currently selected DSP node.
 output_meter: OutputMeter = .{},
+/// State used to edit scalar and enum properties in the selected pane.
+parameter_editor: ParameterEditor = .{},
 
 /// State-stack callbacks used by the synth editor context.
 pub const vtable = StateStack.State.VTable{
@@ -34,6 +83,7 @@ pub const vtable = StateStack.State.VTable{
     .update = update,
     .render = render,
     .keyUpDown = keyUpDown,
+    .textInput = textInput,
     .mouseMoved = mouseMoved,
     .mouseButton = mouseButton,
 };
@@ -43,11 +93,12 @@ fn enter(
     state_stack: *StateStack,
     gpa: std.mem.Allocator,
     state: StateStack.State.Index,
-) anyerror!void {
+) StateStack.State.Error!void {
     // Resolve this state index to the concrete editor context.
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    try sdl.startTextInput(self.zsynth.renderer.window);
     // Initialize the DSP against the runtime-owned audio engine.
-    try self.dsp.init(self.zsynth.audio_engine, gpa);
+    self.dsp.init(self.zsynth.audio_engine, gpa) catch return error.AudioError;
     self.serializer = .{
         .dsp = &self.dsp,
         .space = &self.space,
@@ -56,9 +107,38 @@ fn enter(
     };
     self.space.dsp = &self.dsp;
     try addVisualNode(self, gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
-    // Build and start the simple demonstration graph.
-    try simpleDSP(self, gpa);
+    // Start with only the audio output at the center of the empty space.
+    try self.newGraph(gpa);
     // Show the editor status after audio is running.
+    try self.write(gpa);
+}
+
+/// Replaces the current graph with a fresh no-op and output node.
+fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
+    self.parameter_editor.active = null;
+    self.parameter_editor.cell_count = 0;
+    self.output_meter = .{};
+
+    self.dsp.reset(gpa);
+    self.space.reset(gpa);
+    self.serializer.clearOwned();
+    for (self.owned_node_names.items) |name|
+        gpa.free(name);
+    self.owned_node_names.clearRetainingCapacity();
+
+    // DSP.reset() retains the runtime sentinel at index zero.
+    try self.space.addNode(gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
+    const output = try addNode(
+        self,
+        gpa,
+        DSP.Node.Output.create("output"),
+        self.space.viewportCenter(),
+    );
+    self.dsp.output = output;
+    if (!try self.space.rebuildOccupancy(gpa))
+        return error.InvalidVisualNodeLayout;
+    try self.space.computePaths(gpa);
+    self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
 
@@ -68,9 +148,10 @@ fn leave(
     gpa: std.mem.Allocator,
     _: *Renderer,
     state: StateStack.State.Index,
-) anyerror!void {
+) StateStack.State.Error!void {
     // Resolve the concrete editor context before releasing its DSP graph.
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    sdl.stopTextInput(self.zsynth.renderer.window) catch {};
     self.deinit(gpa);
 }
 
@@ -80,9 +161,10 @@ fn quit(
     gpa: std.mem.Allocator,
     _: *Renderer,
     state: StateStack.State.Index,
-) anyerror!void {
+) StateStack.State.Error!void {
     // Resolve the concrete editor context before releasing its DSP graph.
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    sdl.stopTextInput(self.zsynth.renderer.window) catch {};
     self.deinit(gpa);
 }
 
@@ -91,6 +173,9 @@ fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.serializer.deinit();
     self.dsp.deinit(gpa);
     self.space.deinit(gpa);
+    for (self.owned_node_names.items) |name|
+        gpa.free(name);
+    self.owned_node_names.deinit(gpa);
 }
 
 /// Updates the selected node's output meter from the main thread.
@@ -99,7 +184,7 @@ fn update(
     _: std.mem.Allocator,
     state: StateStack.State.Index,
     dt: u64,
-) anyerror!void {
+) StateStack.State.Error!void {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     const selected_node = self.space.selected_node orelse return;
     if (self.output_meter.output_count == 0) return;
@@ -110,6 +195,12 @@ fn update(
 /// Changes the selected node and resets the meter source to match it.
 fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
     const selected = if (node) |value| if (value.isNoop()) null else value else null;
+    const previous_idx = if (self.space.selected_node) |previous| previous.idx else null;
+    const selected_idx = if (selected) |current| current.idx else null;
+    if (previous_idx != selected_idx) {
+        self.parameter_editor.active = null;
+        self.parameter_editor.cell_count = 0;
+    }
     const previous_parameters = self.output_meter.parameters;
     self.space.selected_node = selected;
     self.output_meter = .{
@@ -170,6 +261,7 @@ fn write(self: *Self, gpa: std.mem.Allocator) !void {
 
 /// Draws the selected node's reflected parameters in the bottom UI pane.
 fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
+    self.parameter_editor.cell_count = 0;
     const display = &self.zsynth.ui_display;
     if (display.impl != .graphic) return;
 
@@ -184,19 +276,21 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     switch (state) {
         inline else => |node_state| {
             if (@hasField(@TypeOf(node_state), "parameters")) {
-                try writeReflectedParameters(
+                try self.writeReflectedParameters(
                     gpa,
                     display,
                     node_state.parameters,
+                    self.dsp.nodes.items(.name)[selected.idx],
                     graphic.height,
                     graphic.width,
                     &self.output_meter,
                 );
             } else {
-                try writeReflectedParameters(
+                try self.writeReflectedParameters(
                     gpa,
                     display,
                     struct {}{},
+                    self.dsp.nodes.items(.name)[selected.idx],
                     graphic.height,
                     graphic.width,
                     &self.output_meter,
@@ -221,20 +315,56 @@ fn formatParameterValue(buffer: []u8, value: anytype) []const u8 {
     return result;
 }
 
+/// Returns whether a reflected field can be edited by the selected-pane UI.
+fn isEditableParameterType(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => true,
+        else => false,
+    };
+}
+
+/// Reserves enough cells for an enum's longest tag or the formatted scalar.
+fn parameterValueWidth(comptime T: type, formatted_len: usize) u32 {
+    switch (@typeInfo(T)) {
+        .@"enum" => {
+            var width: usize = 0;
+            inline for (std.meta.tags(T)) |tag|
+                width = @max(width, @tagName(tag).len);
+            return @intCast(width);
+        },
+        else => return @intCast(formatted_len),
+    }
+}
+
 /// Writes reflected parameter fields in padded, row-limited columns.
 fn writeReflectedParameters(
+    self: *Self,
     gpa: std.mem.Allocator,
     display: *Display,
     parameters: anytype,
+    node_name: []const u8,
     display_height: u32,
     display_width: u32,
     output_meter: *const OutputMeter,
 ) !void {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
-    var items: [field_names.len]Display.LabelValue = undefined;
-    var value_buffers: [field_names.len][64]u8 = undefined;
+    var items: [field_names.len + 1]Display.LabelValue = undefined;
+    var value_buffers: [field_names.len + 1][64]u8 = undefined;
+    var value_widths: [field_names.len + 1]u32 = undefined;
+    var editable: [field_names.len + 1]bool = undefined;
+    var cell_names: [field_names.len + 1][]const u8 = undefined;
+
+    cell_names[0] = node_name_field_name;
+    items[0] = .{
+        .label = node_name_field_name,
+        .value = node_name,
+        .value_color = .white,
+    };
+    value_widths[0] = @intCast(@max(node_name.len, 1));
+    editable[0] = true;
 
     inline for (field_names, 0..) |field_name, index| {
+        cell_names[index + 1] = field_name;
         const value = @field(parameters, field_name);
         const value_color: Display.Color = switch (@typeInfo(@TypeOf(value))) {
             .int, .float => .golden_rod,
@@ -242,11 +372,16 @@ fn writeReflectedParameters(
             else => .white,
         };
         const formatted_value = formatParameterValue(&value_buffers[index], value);
-        items[index] = .{
+        items[index + 1] = .{
             .label = field_name,
             .value = formatted_value,
             .value_color = value_color,
         };
+        value_widths[index + 1] = parameterValueWidth(
+            @TypeOf(value),
+            formatted_value.len,
+        );
+        editable[index + 1] = isEditableParameterType(@TypeOf(value));
     }
 
     const pane_height = @min(
@@ -254,21 +389,21 @@ fn writeReflectedParameters(
         @max(
             @as(u32, 5),
             @max(
-                @as(u32, @intCast(field_names.len)) + 2,
+                @as(u32, @intCast(items.len)) + 2,
                 output_meter.height + 2,
             ),
         ),
     );
     if (pane_height < 2) return;
     const row_count = @min(
-        @as(u32, @intCast(field_names.len)),
+        @as(u32, @intCast(items.len)),
         pane_height - 2,
     );
-    // Match writeLabelValueColumns' column packing so the pane reserves the
-    // same width that the parameter renderer will consume.
+    const rows = @min(row_count, @as(u32, @intCast(items.len)));
+    // Match the selected-pane column packing while retaining each value's
+    // coordinates for mouse hit-testing and the active text field.
     var content_width: u32 = 0;
     if (items.len != 0 and row_count != 0) {
-        const rows = @min(row_count, @as(u32, @intCast(items.len)));
         var item_index: usize = 0;
         while (item_index < items.len) {
             const column_end = @min(
@@ -287,8 +422,8 @@ fn writeReflectedParameters(
             for (item_index..column_end) |index|
                 column_width = @max(
                     column_width,
-                    label_width + 2 +
-                        @as(u32, @intCast(Display.countStripped(items[index].value))),
+                    label_width +
+                        value_widths[index],
                 );
 
             content_width += column_width;
@@ -332,17 +467,74 @@ fn writeReflectedParameters(
             .{ parameters_pane_padding, pane_top + parameters_pane_padding },
         );
 
-    if (content_width != 0)
-        try display.writeLabelValueColumns(
-            gpa,
-            &items,
-            parameter_x,
-            pane_top + parameters_pane_padding,
-            pane_width,
-            row_count,
-            .ebony,
-            .apple,
-        );
+    var column_x = parameter_x;
+    var item_index: usize = 0;
+    while (item_index < items.len and column_x < pane_width) {
+        const column_end = @min(item_index + @as(usize, @intCast(rows)), items.len);
+        var label_width: u32 = 0;
+        var column_width: u32 = 0;
+        for (item_index..column_end) |index|
+            label_width = @max(
+                label_width,
+                @as(u32, @intCast(Display.countStripped(items[index].label))),
+            );
+        for (item_index..column_end) |index|
+            column_width = @max(column_width, label_width + value_widths[index]);
+
+        for (item_index..column_end) |index| {
+            const row = @as(u32, @intCast(index - item_index));
+            const value_x = column_x + label_width;
+            const value_y = pane_top + parameters_pane_padding + row;
+            const cell = ParameterEditor.ParameterCell{
+                .field_name = cell_names[index],
+                .value_x = value_x,
+                .value_y = value_y,
+                .value_width = value_widths[index],
+                .editable = editable[index],
+            };
+            if (self.parameter_editor.cell_count < self.parameter_editor.cells.len) {
+                self.parameter_editor.cells[self.parameter_editor.cell_count] = cell;
+                self.parameter_editor.cell_count += 1;
+            }
+
+            try display.write(
+                gpa,
+                items[index].label,
+                column_x,
+                value_y,
+                .ebony,
+                .apple,
+            );
+            try display.write(
+                gpa,
+                items[index].value,
+                value_x,
+                value_y,
+                .ebony,
+                items[index].value_color,
+            );
+        }
+
+        item_index = column_end;
+        column_x += column_width + 1;
+    }
+
+    if (self.parameter_editor.active) |active| {
+        if (self.space.selected_node) |selected| {
+            if (active.node.idx == selected.idx) {
+                for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |cell| {
+                    if (!cell.editable or !std.mem.eql(u8, cell.field_name, active.field_name))
+                        continue;
+                    self.parameter_editor.text_field.parameters.width = if (pane_width > cell.value_x + 1)
+                        pane_width - cell.value_x - 1
+                    else
+                        1;
+                    try self.parameter_editor.text_field.write(gpa, display, cell.value_x, cell.value_y);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Moves the viewport and redraws the complete visible space.
@@ -359,35 +551,86 @@ fn keyUpDown(
     gpa: std.mem.Allocator,
     state: StateStack.State.Index,
     event: sdl.KeyboardEvent,
-) anyerror!bool {
-    if (!event.down) return false;
-
+) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    if (!event.down) return self.parameter_editor.active != null;
+
+    if (self.parameter_editor.active != null) {
+        switch (event.key) {
+            .escape => {
+                self.cancelParameterEdit();
+                self.zsynth.cursor.dirty = true;
+            },
+            .@"return", .kp_enter => {
+                self.commitParameterEdit();
+                self.cancelParameterEdit();
+                self.zsynth.cursor.dirty = true;
+            },
+            .up => {
+                self.commitParameterEdit();
+                self.moveParameterEdit(-1);
+                self.zsynth.cursor.dirty = true;
+            },
+            .down => {
+                self.commitParameterEdit();
+                self.moveParameterEdit(1);
+                self.zsynth.cursor.dirty = true;
+            },
+            else => {
+                self.parameter_editor.text_field.textUpDown(event);
+                self.zsynth.cursor.dirty = true;
+            },
+        }
+        return true;
+    }
+
     const modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
     const delta: i32 = if ((modifiers & sdl.Keymod.shift) != 0) 5 else 1;
 
     const command = (modifiers & (sdl.Keymod.lgui | sdl.Keymod.rgui)) != 0;
 
     switch (event.key) {
-        .s => if (command) try self.serializer.save("./simpleDSP.zsynth") else return false,
+        .p => if (command) {
+            _ = try state_stack.push(
+                gpa,
+                .{
+                    .context = .{
+                        .command_palette = .{
+                            .editor = self,
+                        },
+                    },
+                    .vtable = &CommandPalette.vtable,
+                },
+            );
+        },
+        .s => if (command) {
+            self.serializer.save("./simpleDSP.zsynth") catch return error.IoError;
+        } else return false,
         .l => if (command) {
-            try self.serializer.load("./simpleDSP.zsynth");
+            self.serializer.load("./simpleDSP.zsynth") catch return error.IoError;
             self.setNodeSelection(null);
             self.output_meter = .{};
             self.zsynth.cursor.dirty = true;
             try self.write(gpa);
         } else return false,
+        .n => if (command) try self.newGraph(gpa) else return false,
         .up => try self.moveViewport(gpa, 0, -delta),
         .down => try self.moveViewport(gpa, 0, delta),
         .left => try self.moveViewport(gpa, -delta, 0),
         .right => try self.moveViewport(gpa, delta, 0),
         .space => {
             const was_playing = self.dsp.isPlaying();
-            try self.dsp.toggle();
+            self.dsp.toggle() catch return error.AudioError;
             if (was_playing and self.output_meter.output_count != 0) {
                 self.output_meter.reset();
                 try self.writeSelectedParametersPane(gpa);
             }
+        },
+        .@"return", .kp_enter => {
+            if (self.beginFirstParameterEdit())
+                self.zsynth.cursor.dirty = true
+            else
+                return false;
         },
         .d => if (self.space.selected_node) |selected|
             try self.remove(gpa, selected),
@@ -402,13 +645,266 @@ fn keyUpDown(
     return true;
 }
 
+/// Handles SDL text input for the active selected-pane property field.
+fn textInput(
+    state_stack: *StateStack,
+    _: std.mem.Allocator,
+    state: StateStack.State.Index,
+    event: sdl.TextInputEvent,
+) StateStack.State.Error!bool {
+    const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    if (self.parameter_editor.active == null) return false;
+    self.parameter_editor.text_field.textInput(event);
+    self.zsynth.cursor.dirty = true;
+    return true;
+}
+
+/// Returns the editable selected-pane value under a display cell.
+fn parameterCellAt(self: *const Self, cell: [2]u32) ?ParameterEditor.ParameterCell {
+    for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |parameter| {
+        if (cell[1] == parameter.value_y and
+            cell[0] >= parameter.value_x and
+            cell[0] < parameter.value_x + parameter.value_width)
+            return parameter;
+    }
+    return null;
+}
+
+/// Starts editing the first editable property of the selected node.
+fn beginFirstParameterEdit(self: *Self) bool {
+    for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |parameter| {
+        if (parameter.editable) {
+            self.beginParameterEdit(parameter);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Starts editing a selected-pane property and loads its current value.
+fn beginParameterEdit(self: *Self, parameter: ParameterEditor.ParameterCell) void {
+    if (self.parameter_editor.active) |active|
+        if (std.mem.eql(u8, active.field_name, parameter.field_name))
+            return;
+
+    if (self.parameter_editor.active != null)
+        self.commitParameterEdit();
+
+    const node = self.space.selected_node orelse return;
+    self.parameter_editor.active = .{
+        .node = .{ .idx = node.idx },
+        .field_name = parameter.field_name,
+    };
+    self.parameter_editor.text_field = .init(self, .{
+        .width = parameter.value_width,
+        .completion = parameterCompletion,
+        .label = "",
+    });
+
+    var buffer: [64]u8 = undefined;
+    self.parameter_editor.text_field.setInput(self.formatNodeParameter(node.idx, parameter.field_name, &buffer));
+}
+
+/// Commits the active field and moves to the adjacent editable property.
+fn moveParameterEdit(self: *Self, direction: i2) void {
+    const active = self.parameter_editor.active orelse return;
+    var current_index: usize = 0;
+    while (current_index < self.parameter_editor.cell_count) : (current_index += 1) {
+        const parameter = self.parameter_editor.cells[current_index];
+        if (parameter.editable and std.mem.eql(u8, parameter.field_name, active.field_name))
+            break;
+    }
+    if (current_index == self.parameter_editor.cell_count) return;
+
+    if (direction < 0) {
+        while (current_index > 0) {
+            current_index -= 1;
+            if (self.parameter_editor.cells[current_index].editable) {
+                self.beginParameterEdit(self.parameter_editor.cells[current_index]);
+                return;
+            }
+        }
+    } else {
+        current_index += 1;
+        while (current_index < self.parameter_editor.cell_count) : (current_index += 1) {
+            if (self.parameter_editor.cells[current_index].editable) {
+                self.beginParameterEdit(self.parameter_editor.cells[current_index]);
+                return;
+            }
+        }
+    }
+}
+
+/// Cancels property editing without changing the node parameter.
+fn cancelParameterEdit(self: *Self) void {
+    self.parameter_editor.active = null;
+}
+
+/// Commits the active property or restores its original value on parse failure.
+fn commitParameterEdit(self: *Self) void {
+    if (self.parameter_editor.active == null) return;
+
+    var context = ParameterEditor.CommitContext{ .editor = self };
+    self.dsp.withGraphLock(&context, commitParameterLocked);
+    var buffer: [64]u8 = undefined;
+    const active = self.parameter_editor.active orelse return;
+    const node = self.space.selected_node orelse return;
+    self.parameter_editor.text_field.setInput(self.formatNodeParameter(node.idx, active.field_name, &buffer));
+}
+
+/// Parses and assigns an active property while the DSP graph is locked.
+fn commitParameterLocked(context: *ParameterEditor.CommitContext) void {
+    const self = context.editor;
+    const active = self.parameter_editor.active orelse return;
+    if (active.node.idx >= self.dsp.nodes.len) return;
+
+    if (std.mem.eql(u8, active.field_name, node_name_field_name)) {
+        const owned_name = self.serializer.allocator.dupe(
+            u8,
+            self.parameter_editor.text_field.inputSlice(),
+        ) catch return;
+        self.owned_node_names.append(self.serializer.allocator, owned_name) catch {
+            self.serializer.allocator.free(owned_name);
+            return;
+        };
+        self.dsp.nodes.items(.name)[active.node.idx] = owned_name;
+        context.accepted = true;
+        return;
+    }
+
+    const state = &self.dsp.nodes.items(.state)[active.node.idx];
+    switch (state.*) {
+        inline else => |*node_state| {
+            if (@hasField(@TypeOf(node_state.*), "parameters"))
+                context.accepted = assignReflectedParameter(
+                    &node_state.parameters,
+                    active.field_name,
+                    self.parameter_editor.text_field.inputSlice(),
+                );
+        },
+    }
+}
+
+/// Formats one reflected property from a node's parameter struct.
+fn formatNodeParameter(
+    self: *const Self,
+    node: usize,
+    field_name: []const u8,
+    buffer: []u8,
+) []const u8 {
+    if (node >= self.dsp.nodes.len) return "";
+    if (std.mem.eql(u8, field_name, node_name_field_name))
+        return self.dsp.nodes.items(.name)[node];
+    const state = self.dsp.nodes.items(.state)[node];
+    return switch (state) {
+        inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
+            formatReflectedParameter(node_state.parameters, field_name, buffer)
+        else
+            "",
+    };
+}
+
+/// Formats a named scalar or enum value from a reflected parameter struct.
+fn formatReflectedParameter(parameters: anytype, field_name: []const u8, buffer: []u8) []const u8 {
+    const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
+    inline for (field_names) |name| {
+        if (std.mem.eql(u8, name, field_name))
+            return formatParameterValue(buffer, @field(parameters, name));
+    }
+    return "";
+}
+
+/// Returns an enum tag completing the active selected-pane input.
+fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
+    const self = field.context;
+    const active = self.parameter_editor.active orelse return "";
+    if (active.node.idx >= self.dsp.nodes.len) return "";
+
+    const state = self.dsp.nodes.items(.state)[active.node.idx];
+    return switch (state) {
+        inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
+            reflectedEnumCompletion(node_state.parameters, active.field_name, field.inputSlice())
+        else
+            "",
+    };
+}
+
+/// Finds a matching enum tag for a reflected property input prefix.
+fn reflectedEnumCompletion(
+    parameters: anytype,
+    field_name: []const u8,
+    input: []const u8,
+) []const u8 {
+    const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
+    inline for (field_names) |name| {
+        if (std.mem.eql(u8, name, field_name)) {
+            const value = @field(parameters, name);
+            switch (@typeInfo(@TypeOf(value))) {
+                .@"enum" => {
+                    inline for (std.meta.tags(@TypeOf(value))) |tag|
+                        if (parameterStartsWithIgnoreCase(@tagName(tag), input))
+                            return @tagName(tag);
+                },
+                else => {},
+            }
+        }
+    }
+    return "";
+}
+
+/// Parses and assigns one supported reflected scalar or enum property.
+fn assignReflectedParameter(parameters: anytype, field_name: []const u8, input: []const u8) bool {
+    const field_names = @typeInfo(@TypeOf(parameters.*)).@"struct".field_names;
+    inline for (field_names) |name| {
+        if (std.mem.eql(u8, name, field_name)) {
+            const value = &@field(parameters.*, name);
+            switch (@typeInfo(@TypeOf(value.*))) {
+                .bool => {
+                    if (std.ascii.eqlIgnoreCase(input, "true")) {
+                        value.* = true;
+                        return true;
+                    }
+                    if (std.ascii.eqlIgnoreCase(input, "false")) {
+                        value.* = false;
+                        return true;
+                    }
+                },
+                .int => {
+                    value.* = std.fmt.parseInt(@TypeOf(value.*), input, 10) catch return false;
+                    return true;
+                },
+                .float => {
+                    value.* = std.fmt.parseFloat(@TypeOf(value.*), input) catch return false;
+                    return true;
+                },
+                .@"enum" => {
+                    inline for (std.meta.tags(@TypeOf(value.*))) |tag| {
+                        if (std.ascii.eqlIgnoreCase(input, @tagName(tag))) {
+                            value.* = tag;
+                            return true;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+/// Returns whether `candidate` begins with the case-insensitive prefix.
+fn parameterStartsWithIgnoreCase(candidate: []const u8, prefix: []const u8) bool {
+    return prefix.len <= candidate.len and
+        std.ascii.eqlIgnoreCase(candidate[0..prefix.len], prefix);
+}
+
 /// Starts and stops viewport panning with the middle mouse button.
 fn mouseButton(
     state_stack: *StateStack,
     gpa: std.mem.Allocator,
     state: StateStack.State.Index,
     event: sdl.MouseButtonEvent,
-) anyerror!bool {
+) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
     if (event.button == 3 and event.down) {
@@ -426,6 +922,23 @@ fn mouseButton(
 
         if (event.down) {
             const cell = self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
+            if (cell) |display_cell| {
+                if (self.parameterCellAt(display_cell)) |parameter| {
+                    if (parameter.editable) {
+                        self.zsynth.cursor.left_mouse_down = false;
+                        self.beginParameterEdit(parameter);
+                        self.zsynth.cursor.dirty = true;
+                        return true;
+                    }
+                    if (self.parameter_editor.active != null) {
+                        self.zsynth.cursor.left_mouse_down = false;
+                        self.commitParameterEdit();
+                        self.cancelParameterEdit();
+                        self.zsynth.cursor.dirty = true;
+                        return true;
+                    }
+                }
+            }
             if (cell) |display_cell| {
                 const world = self.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
                 if (self.space.outletAt(world)) |outlet| {
@@ -537,7 +1050,7 @@ fn mouseMoved(
     gpa: std.mem.Allocator,
     state: StateStack.State.Index,
     event: sdl.MouseMotionEvent,
-) anyerror!bool {
+) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
     if (self.zsynth.cursor.left_mouse_down) {
@@ -629,7 +1142,7 @@ fn render(
     state: StateStack.State.Index,
     renderer: *Renderer,
     dt: u64,
-) anyerror!void {
+) StateStack.State.Error!void {
     // Resolve the concrete editor context for this frame.
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     // Redraw text before the runtime overlays the software cursor.
@@ -975,6 +1488,376 @@ fn simpleDSP(self: *Self, allocator: std.mem.Allocator) !void {
     try self.space.computePaths(allocator);
 }
 
+pub const CommandPalette = struct {
+    editor: *Self,
+    text_field: TextField(*CommandPalette) = undefined,
+    selected_command: ?Command = null,
+    selected_node_tag: ?DSP.Node.Tag = null,
+
+    const Command = enum {
+        addNode,
+        save,
+        load,
+        quit,
+    };
+
+    pub const vtable = StateStack.State.VTable{
+        .enter = CommandPalette.enter,
+        .leave = CommandPalette.leave,
+        .quit = CommandPalette.quit,
+        .keyUpDown = CommandPalette.keyUpDown,
+        .textInput = CommandPalette.textInput,
+        .render = CommandPalette.render,
+    };
+
+    fn enter(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+    ) StateStack.State.Error!void {
+        const self: *CommandPalette = &state_stack.stack.items(.context)[state.idx].command_palette;
+        self.text_field = .init(self, .{
+            .width = 0,
+            .completion = CommandPalette.completion,
+            .label = "Command:",
+        });
+        self.editor.zsynth.cursor.dirty = true;
+        try self.write(gpa);
+    }
+
+    /// Releases the palette state when it is temporarily removed.
+    fn leave(
+        state_stack: *StateStack,
+        _: std.mem.Allocator,
+        _: *Renderer,
+        _: StateStack.State.Index,
+    ) StateStack.State.Error!void {
+        _ = state_stack;
+    }
+
+    /// Releases the palette state while the application state stack is shutting down.
+    fn quit(
+        state_stack: *StateStack,
+        _: std.mem.Allocator,
+        _: *Renderer,
+        _: StateStack.State.Index,
+    ) StateStack.State.Error!void {
+        _ = state_stack;
+    }
+
+    fn keyUpDown(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        event: sdl.KeyboardEvent,
+    ) StateStack.State.Error!bool {
+        if (!event.down) return true;
+        const self: *CommandPalette = &state_stack.stack.items(.context)[state.idx].command_palette;
+        if (event.key == .escape) {
+            self.editor.zsynth.cursor.dirty = true;
+            try state_stack.pop(gpa, &self.editor.zsynth.renderer);
+        } else if (event.key == .@"return" or event.key == .kp_enter) {
+            try self.activate(state_stack, gpa);
+        } else {
+            self.text_field.textUpDown(event);
+            try self.write(gpa);
+        }
+        return true;
+    }
+
+    fn textInput(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        event: sdl.TextInputEvent,
+    ) StateStack.State.Error!bool {
+        const self: *CommandPalette = &state_stack.stack.items(.context)[state.idx].command_palette;
+        self.text_field.textInput(event);
+        try self.write(gpa);
+        return true;
+    }
+
+    /// Draws the palette panel into the transparent UI overlay.
+    fn write(self: *CommandPalette, gpa: std.mem.Allocator) !void {
+        if (self.editor.zsynth.ui_display.impl != .graphic) return;
+        const display = &self.editor.zsynth.ui_display.impl.graphic;
+        if (display.width < 32 or display.height < 3) return;
+
+        const panel_width: u32 = 32;
+        const panel_height: u32 = 3;
+        const panel_x = (display.width - panel_width) / 2;
+        const panel_y = (display.height - panel_height) / 2;
+        const inner_width: usize = 30;
+        const label = if (self.selected_command) |command| switch (command) {
+            .addNode => if (self.selected_node_tag == null) "Add node:" else "Name:",
+            .save => "Save:",
+            .load => "Load:",
+            .quit => "Command:",
+        } else "Command:";
+        const field_width = inner_width - label.len;
+
+        self.text_field.parameters.label = label;
+        self.text_field.parameters.width = @intCast(field_width);
+        try self.text_field.write(
+            gpa,
+            &self.editor.zsynth.ui_display,
+            panel_x + 1,
+            panel_y + 1,
+        );
+
+        // Draw the border last so text and the caret can never cover it.
+        try self.editor.zsynth.ui_display.writeBox(
+            gpa,
+            panel_x,
+            panel_y,
+            panel_width,
+            panel_height,
+            .ebony,
+            .curious_blue,
+            .single,
+        );
+
+        // A three-row box has a one-cell vertical edge; write those cells
+        // explicitly because the generic line helper omits point lines.
+        try self.editor.zsynth.ui_display.write(
+            gpa,
+            "\xB3",
+            panel_x,
+            panel_y + 1,
+            .ebony,
+            .curious_blue,
+        );
+        try self.editor.zsynth.ui_display.write(
+            gpa,
+            "\xB3",
+            panel_x + panel_width - 1,
+            panel_y + 1,
+            .ebony,
+            .curious_blue,
+        );
+    }
+
+    /// Renders the palette after the editor and after transient overlays reset.
+    fn render(
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+        state: StateStack.State.Index,
+        _: *Renderer,
+        _: u64,
+    ) StateStack.State.Error!void {
+        const self: *CommandPalette = &state_stack.stack.items(.context)[state.idx].command_palette;
+        try self.write(gpa);
+    }
+
+    /// Executes the current command or advances to its argument field.
+    fn activate(
+        self: *CommandPalette,
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+    ) StateStack.State.Error!void {
+        if (self.selected_command == null) {
+            const command = self.commandForInput() orelse return;
+            self.selected_command = command;
+            if (command == .quit) {
+                try state_stack.quit(gpa, &self.editor.zsynth.renderer);
+                return;
+            }
+            self.clearInput();
+            try self.write(gpa);
+            return;
+        }
+
+        switch (self.selected_command.?) {
+            .save => {
+                if (self.text_field.inputSlice().len == 0) return;
+                self.editor.serializer.save(self.inputSlice()) catch return error.IoError;
+                try self.finish(state_stack, gpa);
+            },
+            .load => {
+                if (self.text_field.inputSlice().len == 0) return;
+                self.editor.serializer.load(self.inputSlice()) catch return error.IoError;
+                self.editor.setNodeSelection(null);
+                self.editor.output_meter = .{};
+                self.editor.zsynth.cursor.dirty = true;
+                try self.editor.write(gpa);
+                try self.finish(state_stack, gpa);
+            },
+            .addNode => {
+                if (self.selected_node_tag == null) {
+                    self.selected_node_tag = self.nodeTagForInput() orelse return;
+                    self.clearInput();
+                    try self.write(gpa);
+                } else {
+                    try self.addNode(state_stack, gpa);
+                }
+            },
+            .quit => unreachable,
+        }
+    }
+
+    /// Adds the requested node and reveals it in the unbounded editor space.
+    fn addNode(
+        self: *CommandPalette,
+        state_stack: *StateStack,
+        gpa: std.mem.Allocator,
+    ) StateStack.State.Error!void {
+        if (self.text_field.inputSlice().len == 0) return;
+
+        const tag = self.selected_node_tag orelse return;
+        const owned_name = try gpa.dupe(u8, self.inputSlice());
+        self.editor.owned_node_names.append(gpa, owned_name) catch |err| {
+            gpa.free(owned_name);
+            return err;
+        };
+        const node = createNode(tag, owned_name);
+        const index = self.editor.dsp.addNode(gpa, node) catch |err| {
+            _ = self.editor.owned_node_names.pop();
+            gpa.free(owned_name);
+            return err;
+        };
+        errdefer self.editor.dsp.remove(gpa, index);
+
+        const position = self.editor.space.findFreePosition(
+            index,
+            self.editor.space.viewportCenter(),
+        ) orelse return error.InvalidVisualNodeLayout;
+
+        try self.editor.space.addNode(gpa, index, position);
+        errdefer self.editor.space.remove(gpa, index) catch {};
+        if (!try self.editor.space.rebuildOccupancy(gpa))
+            return error.InvalidVisualNodeLayout;
+        try self.editor.space.computePaths(gpa);
+        self.editor.setNodeSelection(index);
+        _ = self.editor.space.revealNode(index);
+        self.editor.zsynth.cursor.dirty = true;
+        try self.editor.write(gpa);
+        try self.finish(state_stack, gpa);
+    }
+
+    /// Removes the palette and requests the transient overlay to be cleared.
+    fn finish(self: *CommandPalette, state_stack: *StateStack, gpa: std.mem.Allocator) !void {
+        self.editor.zsynth.cursor.dirty = true;
+        try state_stack.pop(gpa, &self.editor.zsynth.renderer);
+    }
+
+    /// Returns the input currently being edited.
+    fn inputSlice(self: *const CommandPalette) []const u8 {
+        return self.text_field.inputSlice();
+    }
+
+    /// Clears the argument input and places the cursor at its beginning.
+    fn clearInput(self: *CommandPalette) void {
+        self.text_field.clear();
+    }
+
+    /// Returns the command matching the input or its two-character completion.
+    fn commandForInput(self: *const CommandPalette) ?Command {
+        inline for (std.meta.tags(Command)) |command|
+            if (std.ascii.eqlIgnoreCase(self.inputSlice(), commandName(command)))
+                return command;
+
+        if (self.inputSlice().len < 2) return null;
+        const completion_value = self.text_field.completionSlice();
+        inline for (std.meta.tags(Command)) |command|
+            if (std.ascii.eqlIgnoreCase(completion_value, commandName(command)))
+                return command;
+        return null;
+    }
+
+    /// Returns the node type matching the input or its two-character completion.
+    fn nodeTagForInput(self: *const CommandPalette) ?DSP.Node.Tag {
+        inline for (std.meta.tags(DSP.Node.Tag)) |tag| {
+            const name = nodeName(tag);
+            if (name.len != 0 and std.ascii.eqlIgnoreCase(self.inputSlice(), name))
+                return tag;
+        }
+
+        if (self.inputSlice().len < 2) return null;
+        const completion_value = self.text_field.completionSlice();
+        inline for (std.meta.tags(DSP.Node.Tag)) |tag| {
+            const name = nodeName(tag);
+            if (name.len != 0 and std.ascii.eqlIgnoreCase(completion_value, name))
+                return tag;
+        }
+        return null;
+    }
+
+    /// Returns the full completion candidate for the field's current palette phase.
+    fn completion(field: *const TextField(*CommandPalette)) []const u8 {
+        const self = field.context;
+        const input = field.inputSlice();
+        if (input.len == 0) return "";
+
+        if (self.selected_command == null) {
+            inline for (std.meta.tags(Command)) |command| {
+                const name = commandName(command);
+                if (startsWithIgnoreCase(name, input))
+                    return name;
+            }
+        } else if (self.selected_command.? == .addNode and self.selected_node_tag == null) {
+            inline for (std.meta.tags(DSP.Node.Tag)) |tag| {
+                const name = nodeName(tag);
+                if (name.len != 0 and startsWithIgnoreCase(name, input))
+                    return name;
+            }
+        }
+        return "";
+    }
+
+    /// Returns whether `candidate` begins with the case-insensitive prefix.
+    fn startsWithIgnoreCase(candidate: []const u8, prefix: []const u8) bool {
+        return prefix.len <= candidate.len and
+            std.ascii.eqlIgnoreCase(candidate[0..prefix.len], prefix);
+    }
+
+    /// Returns the stable spelling used for a palette command.
+    fn commandName(command: Command) []const u8 {
+        return switch (command) {
+            .addNode => "addNode",
+            .save => "save",
+            .load => "load",
+            .quit => "quit",
+        };
+    }
+
+    /// Returns the stable palette spelling for a constructible processing node.
+    fn nodeName(tag: DSP.Node.Tag) []const u8 {
+        return switch (tag) {
+            .noop, .output => "",
+            else => DSP.node_metadata.get(tag).name,
+        };
+    }
+
+    /// Constructs a processing node with safe default parameters.
+    fn createNode(tag: DSP.Node.Tag, name: []const u8) DSP.Node {
+        return switch (tag) {
+            .add => DSP.Node.Add.create(name),
+            .multiply => DSP.Node.Multiply.create(name),
+            .constant => DSP.Node.Constant.create(name, .{}),
+            .oscillator => DSP.Node.Oscillator.create(name, .{
+                .waveform = .sine,
+                .default_frequency = 440,
+                .default_amplitude = 1,
+            }),
+            .mixer => DSP.Node.Mixer.create(name, .{}),
+            .monophonic_sequencer => DSP.Node.MonophonicSequencer.create(name, .{
+                .notes = &.{},
+            }),
+            .adsr => DSP.Node.ADSR.create(name, .{}),
+            .multimode_filter => DSP.Node.MultimodeFilter.create(name, .{
+                .type = .low_pass,
+                .default_cutoff = 1_000,
+                .default_resonance = 0,
+            }),
+            .bit_crusher => DSP.Node.BitCrusher.create(name, .{}),
+            .noise => DSP.Node.Noise.create(name, .{
+                .seed = 0,
+            }),
+            .noop, .output => unreachable,
+        };
+    }
+};
+
 /// Overlay state used to connect one DSP outlet to another.
 pub const OutletConnection = struct {
     editor: *Self,
@@ -996,7 +1879,7 @@ pub const OutletConnection = struct {
         state_stack: *StateStack,
         gpa: std.mem.Allocator,
         state: StateStack.State.Index,
-    ) anyerror!void {
+    ) StateStack.State.Error!void {
         const context = stateContext(state_stack, state);
         try context.updatePreview(gpa);
     }
@@ -1006,7 +1889,7 @@ pub const OutletConnection = struct {
         gpa: std.mem.Allocator,
         _: *Renderer,
         state: StateStack.State.Index,
-    ) anyerror!void {
+    ) StateStack.State.Error!void {
         stateContext(state_stack, state).clearPreview(gpa);
     }
 
@@ -1015,7 +1898,7 @@ pub const OutletConnection = struct {
         gpa: std.mem.Allocator,
         _: *Renderer,
         state: StateStack.State.Index,
-    ) anyerror!void {
+    ) StateStack.State.Error!void {
         stateContext(state_stack, state).clearPreview(gpa);
     }
 
@@ -1025,7 +1908,7 @@ pub const OutletConnection = struct {
         state: StateStack.State.Index,
         _: *Renderer,
         _: u64,
-    ) anyerror!void {
+    ) StateStack.State.Error!void {
         // The editor rendered the base display first; this state only overlays the preview.
         const context = stateContext(state_stack, state);
         if (context.preview_path) |path|
@@ -1041,7 +1924,7 @@ pub const OutletConnection = struct {
         gpa: std.mem.Allocator,
         state: StateStack.State.Index,
         event: sdl.KeyboardEvent,
-    ) anyerror!bool {
+    ) StateStack.State.Error!bool {
         if (!event.down) return true;
         if (event.key == .escape) {
             const context = stateContext(state_stack, state);
@@ -1059,7 +1942,7 @@ pub const OutletConnection = struct {
         gpa: std.mem.Allocator,
         state: StateStack.State.Index,
         event: sdl.MouseMotionEvent,
-    ) anyerror!bool {
+    ) StateStack.State.Error!bool {
         const context = stateContext(state_stack, state);
         if (context.editor.zsynth.displayCellAtWindowPosition(.{ event.x, event.y })) |cell| {
             context.mouse_position = context.editor.space.worldPositionAtDisplayCell(cell[0], cell[1]);
@@ -1073,7 +1956,7 @@ pub const OutletConnection = struct {
         gpa: std.mem.Allocator,
         state: StateStack.State.Index,
         event: sdl.MouseButtonEvent,
-    ) anyerror!bool {
+    ) StateStack.State.Error!bool {
         const context = stateContext(state_stack, state);
         const cell = context.editor.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
         const clicked = if (cell) |display_cell|
@@ -1473,4 +2356,226 @@ pub const OutputMeter = struct {
 fn dbfs(value: f32) f32 {
     const floor: f32 = 0.000001; // -120 dBFS
     return 20 * std.math.log10(@max(value, floor));
+}
+
+/// Creates a reusable single-line text field bound to an application context.
+pub fn TextField(comptime Context: type) type {
+    return struct {
+        /// Concrete text-field type produced for the supplied context type.
+        const Field = @This();
+
+        /// Supplies the full completion value for the current field contents.
+        pub const Completion = *const fn (field: *const Field) []const u8;
+
+        /// Configures the visible field width, completion provider, and label.
+        pub const Parameters = struct {
+            /// Number of display cells available for the editable value.
+            width: u32,
+            /// Returns one complete value that may complete the current input.
+            completion: Completion,
+            /// Text rendered immediately before the editable value.
+            label: []const u8,
+        };
+
+        /// Context supplied to the completion callback.
+        context: Context,
+        /// Current visual and completion configuration.
+        parameters: Parameters,
+        /// Storage for the current UTF-8 byte input.
+        input: [256]u8 = @splat(0),
+        /// Number of bytes currently in `input`.
+        input_len: usize = 0,
+        /// Byte offset of the insertion cursor.
+        cursor: usize = 0,
+
+        /// Constructs a text field with its owning context and parameters.
+        pub fn init(context: Context, parameters: Parameters) Field {
+            return .{
+                .context = context,
+                .parameters = parameters,
+            };
+        }
+
+        /// Returns the bytes currently entered by the user.
+        pub fn inputSlice(self: *const Field) []const u8 {
+            return self.input[0..self.input_len];
+        }
+
+        /// Clears the field and moves its cursor to the beginning.
+        pub fn clear(self: *Field) void {
+            self.input = @splat(0);
+            self.input_len = 0;
+            self.cursor = 0;
+        }
+
+        /// Replaces the field contents and places the cursor at the end.
+        pub fn setInput(self: *Field, value: []const u8) void {
+            const copy_len = @min(value.len, self.input.len);
+            self.input = @splat(0);
+            @memcpy(self.input[0..copy_len], value[0..copy_len]);
+            self.input_len = copy_len;
+            self.cursor = copy_len;
+        }
+
+        /// Handles SDL Unicode text input by inserting it at the cursor.
+        pub fn textInput(self: *Field, event: sdl.TextInputEvent) void {
+            if (event.text) |text| {
+                const spanned = std.mem.span(text);
+                const insert_len = @min(spanned.len, self.input.len - self.input_len);
+                var index = self.input_len;
+                while (index > self.cursor) : (index -= 1)
+                    self.input[index + insert_len - 1] = self.input[index - 1];
+                @memcpy(
+                    self.input[self.cursor .. self.cursor + insert_len],
+                    spanned[0..insert_len],
+                );
+                self.input_len += insert_len;
+                self.cursor += insert_len;
+            }
+        }
+
+        /// Handles cursor movement, completion, and editing shortcuts.
+        pub fn textUpDown(self: *Field, event: sdl.KeyboardEvent) void {
+            if (!event.down) return;
+
+            const control = (@backingInt(event.mod) & sdl.Keymod.ctrl) != 0;
+            switch (event.key) {
+                .left => {
+                    if (control) {
+                        while (self.cursor > 0 and std.ascii.isWhitespace(self.input[self.cursor - 1]))
+                            self.cursor -= 1;
+                        while (self.cursor > 0 and !std.ascii.isWhitespace(self.input[self.cursor - 1]))
+                            self.cursor -= 1;
+                    } else {
+                        self.cursor -|= 1;
+                    }
+                },
+                .right => {
+                    if (control) {
+                        while (self.cursor < self.input_len and std.ascii.isWhitespace(self.input[self.cursor]))
+                            self.cursor += 1;
+                        while (self.cursor < self.input_len and !std.ascii.isWhitespace(self.input[self.cursor]))
+                            self.cursor += 1;
+                    } else if (self.cursor < self.input_len) {
+                        self.cursor += 1;
+                    }
+                },
+                .a => {
+                    if (control) self.cursor = 0;
+                },
+                .e => {
+                    if (control) self.cursor = self.input_len;
+                },
+                .tab => self.complete(),
+                .k => {
+                    if (control) {
+                        self.input_len = self.cursor;
+                        if (self.input_len < self.input.len)
+                            self.input[self.input_len] = 0;
+                    }
+                },
+                .backspace => self.eraseLeft(),
+                .escape, .@"return", .kp_enter => {},
+                else => {},
+            }
+        }
+
+        /// Draws the label, editable area, input, completion, and caret.
+        pub fn write(
+            self: *const Field,
+            gpa: std.mem.Allocator,
+            display: *Display,
+            x: u32,
+            y: u32,
+        ) !void {
+            const field_x = x + @as(u32, @intCast(self.parameters.label.len));
+            try display.fill(
+                gpa,
+                .mine_shaft,
+                .mine_shaft,
+                ' ',
+                field_x,
+                y,
+                self.parameters.width,
+                1,
+            );
+            try display.write(gpa, self.parameters.label, x, y, .ebony, .curious_blue);
+
+            const field_width: usize = self.parameters.width;
+            if (field_width == 0) return;
+
+            const input_start = if (self.input_len > field_width)
+                @min(self.cursor, self.input_len - field_width)
+            else
+                0;
+            const input_end = @min(self.input_len, input_start + field_width);
+            const typed = self.input[input_start..input_end];
+            try display.write(gpa, typed, field_x, y, .mine_shaft, .white);
+
+            const cursor_offset = self.cursor - input_start;
+            if (cursor_offset < field_width) {
+                try display.write(
+                    gpa,
+                    "\xB3",
+                    field_x + @as(u32, @intCast(cursor_offset)),
+                    y,
+                    .mine_shaft,
+                    .amber,
+                );
+            }
+
+            const candidate = self.completionSlice();
+            if (input_start == 0 and input_end == self.input_len and typed.len + 1 < field_width and
+                candidate.len > self.input_len)
+            {
+                const completion_len = @min(
+                    candidate.len - self.input_len,
+                    field_width - typed.len - 1,
+                );
+                if (completion_len != 0) {
+                    try display.write(
+                        gpa,
+                        candidate[self.input_len .. self.input_len + completion_len],
+                        field_x + @as(u32, @intCast(typed.len + 1)),
+                        y,
+                        .mine_shaft,
+                        .logan,
+                    );
+                }
+            }
+        }
+
+        /// Replaces the entire field with its current completion candidate.
+        fn complete(self: *Field) void {
+            const candidate = self.completionSlice();
+            if (candidate.len == 0) return;
+
+            const copy_len = @min(candidate.len, self.input.len);
+            self.input = @splat(0);
+            @memcpy(self.input[0..copy_len], candidate[0..copy_len]);
+            self.input_len = copy_len;
+            self.cursor = self.input_len;
+        }
+
+        /// Deletes the byte immediately before the cursor.
+        fn eraseLeft(self: *Field) void {
+            if (self.cursor == 0) return;
+
+            var index = self.cursor - 1;
+            while (index < self.input_len - 1) : (index += 1)
+                self.input[index] = self.input[index + 1];
+            self.input_len -= 1;
+            self.cursor -= 1;
+            self.input[self.input_len] = 0;
+        }
+
+        /// Returns a valid full completion, or an empty string when none exists.
+        /// Returns the full completion matching the current input prefix.
+        pub fn completionSlice(self: *const Field) []const u8 {
+            const candidate = (self.parameters.completion)(self);
+            if (self.input_len == 0 or candidate.len < self.input_len) return "";
+            if (!std.ascii.eqlIgnoreCase(candidate[0..self.input_len], self.inputSlice())) return "";
+            return candidate;
+        }
+    };
 }

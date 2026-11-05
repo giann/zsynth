@@ -21,13 +21,12 @@ and effects to be composed into a real-time sound pipeline.
 
 ## TODO
 
-- save/load
-- interact with node properties
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for
   audio)
 - pitch shifter
 - resampler
+- MIDI input + keyboard virutal midi device
 
 ## Controls and UI elements
 

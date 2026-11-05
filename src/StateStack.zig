@@ -12,7 +12,7 @@ stack: std.MultiArrayList(State) = .empty,
 
 /// Creates an empty stack with room for the initial application states.
 pub fn init(gpa: std.mem.Allocator) !Self {
-    return .{ .stack = try .initCapacity(gpa, 8) };
+    return .{ .stack = try .initCapacity(gpa, 20) };
 }
 
 /// Releases the backing storage while leaving state-owned resources to `quit`.
@@ -44,7 +44,7 @@ pub fn synthEditor(self: *Self) ?*SynthEditor {
 }
 
 /// Appends a state, enters it, and returns its stack index.
-pub fn push(self: *Self, gpa: std.mem.Allocator, new_state: State) !State.Index {
+pub fn push(self: *Self, gpa: std.mem.Allocator, new_state: State) State.Error!State.Index {
     // Refuse to grow beyond the fixed capacity reserved by this stack.
     if (self.stack.len >= self.stack.capacity)
         return error.StateStackOverflow;
@@ -58,7 +58,7 @@ pub fn push(self: *Self, gpa: std.mem.Allocator, new_state: State) !State.Index 
 }
 
 /// Leaves and removes the top state, if one exists.
-pub fn pop(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer) !void {
+pub fn pop(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer) State.Error!void {
     // Find the state that will be removed.
     const previous = self.current() orelse return;
     // Let the state release transient resources before removing its context.
@@ -68,7 +68,7 @@ pub fn pop(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer) !void {
 }
 
 /// Quits every state from top to bottom and retains the allocated capacity.
-pub fn quit(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer) !void {
+pub fn quit(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer) State.Error!void {
     // Walk downward so each state is quit before the stack is cleared.
     var index = self.stack.len;
     while (index > 0) : (index -= 1) {
@@ -84,7 +84,7 @@ pub fn quit(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer) !void {
 }
 
 /// Updates every enabled state from bottom to top.
-pub fn update(self: *Self, gpa: std.mem.Allocator, dt: u64) !void {
+pub fn update(self: *Self, gpa: std.mem.Allocator, dt: u64) State.Error!void {
     // Cache the column slices used during the ordered traversal.
     const vtables = self.stack.items(.vtable);
     const enabled = self.stack.items(.enabled);
@@ -96,7 +96,7 @@ pub fn update(self: *Self, gpa: std.mem.Allocator, dt: u64) !void {
 }
 
 /// Renders every enabled state from bottom to top.
-pub fn render(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer, dt: u64) !void {
+pub fn render(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer, dt: u64) State.Error!void {
     // Cache the columns so rendering does not repeatedly look them up.
     const vtables = self.stack.items(.vtable);
     const enabled = self.stack.items(.enabled);
@@ -108,7 +108,7 @@ pub fn render(self: *Self, gpa: std.mem.Allocator, renderer: *Renderer, dt: u64)
 }
 
 /// Sends an input event from the topmost enabled state downward.
-pub fn inputEvent(self: *Self, gpa: std.mem.Allocator, event: sdl.Event) !bool {
+pub fn inputEvent(self: *Self, gpa: std.mem.Allocator, event: sdl.Event) State.Error!bool {
     // Traverse in reverse so overlays and the active state get first refusal.
     var index = self.stack.len;
     while (index > 0) : (index -= 1) {
@@ -126,7 +126,7 @@ pub fn inputEvent(self: *Self, gpa: std.mem.Allocator, event: sdl.Event) !bool {
 }
 
 /// Dispatches a keyboard event from the topmost enabled state downward.
-pub fn keyUpDown(self: *Self, gpa: std.mem.Allocator, event: sdl.KeyboardEvent) !void {
+pub fn keyUpDown(self: *Self, gpa: std.mem.Allocator, event: sdl.KeyboardEvent) State.Error!void {
     var index = self.stack.len;
     while (index > 0) : (index -= 1) {
         if (!self.stack.items(.enabled)[index - 1]) continue;
@@ -139,8 +139,22 @@ pub fn keyUpDown(self: *Self, gpa: std.mem.Allocator, event: sdl.KeyboardEvent) 
     }
 }
 
+/// Dispatches SDL text input from the topmost enabled state downward.
+pub fn textInput(self: *Self, gpa: std.mem.Allocator, event: sdl.TextInputEvent) State.Error!void {
+    var index = self.stack.len;
+    while (index > 0) : (index -= 1) {
+        if (!self.stack.items(.enabled)[index - 1]) continue;
+        if (try self.stack.items(.vtable)[index - 1].textInput(
+            self,
+            gpa,
+            .{ .idx = index - 1 },
+            event,
+        )) return;
+    }
+}
+
 /// Dispatches mouse motion from the topmost enabled state downward.
-pub fn mouseMoved(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseMotionEvent) !void {
+pub fn mouseMoved(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseMotionEvent) State.Error!void {
     var index = self.stack.len;
     while (index > 0) : (index -= 1) {
         if (!self.stack.items(.enabled)[index - 1]) continue;
@@ -154,7 +168,7 @@ pub fn mouseMoved(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseMotionEve
 }
 
 /// Dispatches a mouse-button event from the topmost enabled state downward.
-pub fn mouseButton(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseButtonEvent) !void {
+pub fn mouseButton(self: *Self, gpa: std.mem.Allocator, event: sdl.MouseButtonEvent) State.Error!void {
     var index = self.stack.len;
     while (index > 0) : (index -= 1) {
         if (!self.stack.items(.enabled)[index - 1]) continue;
@@ -175,6 +189,25 @@ pub const State = struct {
         idx: usize,
     };
 
+    /// Errors allowed to cross the state lifecycle and input callback boundary.
+    pub const Error = error{
+        OutOfMemory,
+        AudioError,
+        SdlError,
+        StateStackOverflow,
+        InvalidVisualNodeIndex,
+        InvalidVisualNodeLayout,
+        EmptySynthPath,
+        InvalidVisualGraph,
+        InvalidNodeParameters,
+        UnknownNodeKind,
+        MissingNodeParameters,
+        UnsupportedSynthSchema,
+        InvalidSynthDocument,
+        InvalidGraphReference,
+        IoError,
+    };
+
     /// State-owned data, selected by `ContextTag`.
     context: Context,
     /// Callback table for the context stored in `context`.
@@ -188,6 +221,7 @@ pub const State = struct {
         synth_editor,
         /// Temporary state used while connecting two DSP outlets.
         outlet_connection,
+        command_palette,
     };
 
     /// Union containing the concrete data for a supported state.
@@ -196,51 +230,58 @@ pub const State = struct {
         synth_editor: SynthEditor,
         /// The active outlet connection context.
         outlet_connection: SynthEditor.OutletConnection,
+        command_palette: SynthEditor.CommandPalette,
     };
 
     /// Lifecycle and dispatch callbacks for a state context.
     pub const VTable = struct {
         /// Default callback for entering a state.
-        fn defaultEnter(_: *Self, _: std.mem.Allocator, _: Index) anyerror!void {}
+        fn defaultEnter(_: *Self, _: std.mem.Allocator, _: Index) Error!void {}
         /// Default callback for leaving a state.
-        fn defaultLeave(_: *Self, _: std.mem.Allocator, _: *Renderer, _: Index) anyerror!void {}
+        fn defaultLeave(_: *Self, _: std.mem.Allocator, _: *Renderer, _: Index) Error!void {}
         /// Default callback for permanently quitting a state.
-        fn defaultQuit(_: *Self, _: std.mem.Allocator, _: *Renderer, _: Index) anyerror!void {}
+        fn defaultQuit(_: *Self, _: std.mem.Allocator, _: *Renderer, _: Index) Error!void {}
         /// Default callback for updating a state.
-        fn defaultUpdate(_: *Self, _: std.mem.Allocator, _: Index, _: u64) anyerror!void {}
+        fn defaultUpdate(_: *Self, _: std.mem.Allocator, _: Index, _: u64) Error!void {}
         /// Default callback for rendering a state.
-        fn defaultRender(_: *Self, _: std.mem.Allocator, _: Index, _: *Renderer, _: u64) anyerror!void {}
+        fn defaultRender(_: *Self, _: std.mem.Allocator, _: Index, _: *Renderer, _: u64) Error!void {}
         /// Default callback for dispatching an input event.
-        fn defaultInputEvent(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.Event) anyerror!bool {
+        fn defaultInputEvent(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.Event) Error!bool {
             return false;
         }
-        fn defaultKeyUpDown(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.KeyboardEvent) anyerror!bool {
+        fn defaultKeyUpDown(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.KeyboardEvent) Error!bool {
             return false;
         }
-        fn defaultMouseMoved(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.MouseMotionEvent) anyerror!bool {
+        /// Default callback for SDL text input.
+        fn defaultTextInput(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.TextInputEvent) Error!bool {
             return false;
         }
-        fn defaultMouseButton(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.MouseButtonEvent) anyerror!bool {
+        fn defaultMouseMoved(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.MouseMotionEvent) Error!bool {
+            return false;
+        }
+        fn defaultMouseButton(_: *Self, _: std.mem.Allocator, _: Index, _: sdl.MouseButtonEvent) Error!bool {
             return false;
         }
 
         /// Called when the state enters the stack.
-        enter: *const fn (*Self, std.mem.Allocator, Index) anyerror!void = defaultEnter,
+        enter: *const fn (*Self, std.mem.Allocator, Index) Error!void = defaultEnter,
         /// Called when the state is temporarily popped.
-        leave: *const fn (*Self, std.mem.Allocator, *Renderer, Index) anyerror!void = defaultLeave,
+        leave: *const fn (*Self, std.mem.Allocator, *Renderer, Index) Error!void = defaultLeave,
         /// Called when the state stack is shutting down.
-        quit: *const fn (*Self, std.mem.Allocator, *Renderer, Index) anyerror!void = defaultQuit,
+        quit: *const fn (*Self, std.mem.Allocator, *Renderer, Index) Error!void = defaultQuit,
         /// Called once per frame before rendering.
-        update: *const fn (*Self, std.mem.Allocator, Index, u64) anyerror!void = defaultUpdate,
+        update: *const fn (*Self, std.mem.Allocator, Index, u64) Error!void = defaultUpdate,
         /// Called once per frame to enqueue rendering work.
-        render: *const fn (*Self, std.mem.Allocator, Index, *Renderer, u64) anyerror!void = defaultRender,
+        render: *const fn (*Self, std.mem.Allocator, Index, *Renderer, u64) Error!void = defaultRender,
         /// Called for input events from the topmost state downward.
-        inputEvent: *const fn (*Self, std.mem.Allocator, Index, sdl.Event) anyerror!bool = defaultInputEvent,
+        inputEvent: *const fn (*Self, std.mem.Allocator, Index, sdl.Event) Error!bool = defaultInputEvent,
         /// Called for key-down and key-up events that were not consumed raw.
-        keyUpDown: *const fn (*Self, std.mem.Allocator, Index, sdl.KeyboardEvent) anyerror!bool = defaultKeyUpDown,
+        keyUpDown: *const fn (*Self, std.mem.Allocator, Index, sdl.KeyboardEvent) Error!bool = defaultKeyUpDown,
+        /// Called for SDL text-input events that were not consumed raw.
+        textInput: *const fn (*Self, std.mem.Allocator, Index, sdl.TextInputEvent) Error!bool = defaultTextInput,
         /// Called for mouse-motion events that were not consumed raw.
-        mouseMoved: *const fn (*Self, std.mem.Allocator, Index, sdl.MouseMotionEvent) anyerror!bool = defaultMouseMoved,
+        mouseMoved: *const fn (*Self, std.mem.Allocator, Index, sdl.MouseMotionEvent) Error!bool = defaultMouseMoved,
         /// Called for mouse-button events that were not consumed raw.
-        mouseButton: *const fn (*Self, std.mem.Allocator, Index, sdl.MouseButtonEvent) anyerror!bool = defaultMouseButton,
+        mouseButton: *const fn (*Self, std.mem.Allocator, Index, sdl.MouseButtonEvent) Error!bool = defaultMouseButton,
     };
 };

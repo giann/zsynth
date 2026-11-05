@@ -1892,7 +1892,7 @@ pub const TextInputEvent = extern struct {
     reserved: u32,
     timestamp: u64,
     window_id: WindowId,
-    text: [*c]const u8,
+    text: ?[*:0]const u8,
 };
 
 pub const MouseDeviceEvent = extern struct {
@@ -2927,7 +2927,19 @@ extern fn SDL_GetKeyboardState(numkeys: ?*c_int) [*c]const bool;
 // - SDL_GetScancodeFromName
 // - SDL_GetKeyName
 // - SDL_GetKeyFromName
-// - SDL_StartTextInput
+
+/// Enables Unicode text input events for a window.
+pub fn startTextInput(window: *Window) Error!void {
+    if (!SDL_StartTextInput(window)) return makeError();
+}
+
+/// Disables Unicode text input events for a window.
+pub fn stopTextInput(window: *Window) Error!void {
+    if (!SDL_StopTextInput(window)) return makeError();
+}
+
+extern fn SDL_StartTextInput(window: *Window) bool;
+extern fn SDL_StopTextInput(window: *Window) bool;
 
 pub const TextInputType = enum(c_int) {
     text,

@@ -243,6 +243,7 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
                         try self.state_stack.keyUpDown(allocator, event.key);
                     }
                 },
+                .text_input => try self.state_stack.textInput(allocator, event.text),
                 .mouse_motion => try self.state_stack.mouseMoved(allocator, event.motion),
                 .mouse_button_down, .mouse_button_up => try self.state_stack.mouseButton(allocator, event.button),
                 else => {},
