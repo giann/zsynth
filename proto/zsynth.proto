@@ -17,6 +17,11 @@ message Node {
   int32 y = 4;
   repeated Connection inputs = 5;
   uint32 parameter_source = 6;
+  repeated uint32 group_members = 7;
+  repeated GroupBinding group_inputs = 8;
+  repeated GroupBinding group_outputs = 9;
+  optional uint32 group_owner = 20;
+  optional uint32 group_port = 21;
 
   oneof parameters {
     ConstantParameters constant = 10;
@@ -29,6 +34,12 @@ message Node {
     NoiseParameters noise = 17;
     KeyboardParameters keyboard = 18;
   }
+}
+
+message GroupBinding {
+  uint32 group_port = 1;
+  uint32 member_node = 2;
+  uint32 member_port = 3;
 }
 
 message Connection {

@@ -82,6 +82,10 @@ owned_node_names: std.ArrayList([]u8) = .empty,
 output_meter: OutputMeter = .{},
 /// State used to edit scalar and enum properties in the selected pane.
 parameter_editor: ParameterEditor = .{},
+/// Temporary scoped layout used while a group view is active.
+group_space: ?Space = null,
+/// Group currently owning the temporary scoped layout, if any.
+active_group: ?DSP.Node.Index = null,
 
 /// State-stack callbacks used by the synth editor context.
 pub const vtable = StateStack.State.VTable{
@@ -95,6 +99,80 @@ pub const vtable = StateStack.State.VTable{
     .mouseMoved = mouseMoved,
     .mouseButton = mouseButton,
 };
+
+/// Returns the layout operated on by the active editor state.
+fn editorSpace(self: *Self) *Space {
+    if (self.active_group != null)
+        if (self.group_space) |*group_space|
+            return group_space;
+    return &self.space;
+}
+
+/// Copies active group positions into the general visual space.
+fn persistGroupPositions(self: *Self) void {
+    if (self.active_group) |group| if (self.group_space) |*space| {
+        const group_state = self.dsp.nodes.items(.state)[group.idx].group;
+        for (group_state.members[0..group_state.member_count]) |member| {
+            self.space.nodes.items(.position)[member.idx] = space.nodePosition(member);
+        }
+    };
+}
+
+/// Builds the temporary layout containing one group's members and endpoints.
+fn enterGroupView(self: *Self, gpa: std.mem.Allocator, group: DSP.Node.Index) !void {
+    var scoped = Space{
+        .viewport = self.space.viewport,
+        .dsp = &self.dsp,
+        .scope = .{ .group = group },
+    };
+    errdefer scoped.deinit(gpa);
+
+    const group_state = self.dsp.nodes.items(.state)[group.idx].group;
+
+    var member_north_west = Space.Position{ .x = std.math.maxInt(i32), .y = std.math.maxInt(i32) };
+    var member_south_east = Space.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
+    for (group_state.members[0..group_state.member_count]) |member| {
+        const position = self.space.nodePosition(member);
+        const footprint = self.space.nodeFootprint(member);
+        member_north_west.x = @min(member_north_west.x, position.x);
+        member_north_west.y = @min(member_north_west.y, position.y);
+        member_south_east.x = @max(member_south_east.x, position.x + @as(i32, @intCast(footprint.width)));
+        member_south_east.y = @max(member_south_east.y, position.y + @as(i32, @intCast(footprint.height)));
+    }
+    const member_center_y = member_north_west.y +
+        @divTrunc(member_south_east.y - member_north_west.y, 2);
+    for (0..self.dsp.nodes.len) |index| {
+        const node = DSP.Node.Index{ .idx = index };
+        var position = self.space.nodePosition(node);
+        if (self.space.isGroupEndpoint(node)) {
+            const endpoint_port = switch (self.dsp.nodes.items(.state)[index]) {
+                .group_input => |endpoint| endpoint.port,
+                .group_output => |endpoint| endpoint.port,
+                else => 0,
+            };
+            const left = std.meta.activeTag(self.dsp.nodes.items(.state)[index]) == .group_input;
+            position = .{
+                .x = if (left) member_north_west.x - 20 else member_south_east.x + 4,
+                .y = member_center_y + @as(i32, @intCast(endpoint_port * 4)) - 14,
+            };
+        }
+        try scoped.addNode(gpa, node, position);
+    }
+    if (!try scoped.rebuildOccupancy(gpa))
+        return error.InvalidVisualNodeLayout;
+    try scoped.computePaths(gpa);
+    self.group_space = scoped;
+    self.active_group = group;
+}
+
+/// Releases the temporary group layout and returns interaction to the root view.
+fn leaveGroupView(self: *Self, gpa: std.mem.Allocator) void {
+    self.persistGroupPositions();
+    if (self.group_space) |*space|
+        space.deinit(gpa);
+    self.group_space = null;
+    self.active_group = null;
+}
 
 /// Initializes the editor DSP graph and writes its initial display text.
 fn enter(
@@ -113,7 +191,7 @@ fn enter(
         .allocator = gpa,
         .io = self.zsynth.io,
     };
-    self.space.dsp = &self.dsp;
+    self.editorSpace().dsp = &self.dsp;
     try addVisualNode(self, gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
     // Start with only the audio output at the center of the empty space.
     try self.newGraph(gpa);
@@ -123,12 +201,14 @@ fn enter(
 
 /// Replaces the current graph with a fresh no-op and output node.
 fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
+    if (self.group_space != null)
+        self.leaveGroupView(gpa);
     self.parameter_editor.active = null;
     self.parameter_editor.cell_count = 0;
     self.output_meter = .{};
 
     self.dsp.reset(gpa);
-    self.space.reset(gpa);
+    self.editorSpace().reset(gpa);
     self.serializer.clearOwned();
     if (self.document_path) |path| {
         gpa.free(path);
@@ -139,17 +219,17 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
     self.owned_node_names.clearRetainingCapacity();
 
     // DSP.reset() retains the runtime sentinel at index zero.
-    try self.space.addNode(gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
+    try self.editorSpace().addNode(gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
     const output = try addNode(
         self,
         gpa,
         DSP.Node.Output.create("output"),
-        self.space.viewportCenter(),
+        self.editorSpace().viewportCenter(),
     );
     self.dsp.output = output;
-    if (!try self.space.rebuildOccupancy(gpa))
+    if (!try self.editorSpace().rebuildOccupancy(gpa))
         return error.InvalidVisualNodeLayout;
-    try self.space.computePaths(gpa);
+    try self.editorSpace().computePaths(gpa);
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
@@ -182,6 +262,8 @@ fn quit(
 
 /// Stops and deinitializes the DSP graph exactly once.
 fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+    if (self.group_space != null)
+        self.leaveGroupView(gpa);
     self.serializer.deinit();
     self.dsp.deinit(gpa);
     self.space.deinit(gpa);
@@ -200,7 +282,7 @@ fn update(
     dt: u64,
 ) StateStack.State.Error!void {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
-    const selected_node = self.space.singleSelectedNode() orelse return;
+    const selected_node = self.editorSpace().singleSelectedNode() orelse return;
     if (self.output_meter.output_count == 0) return;
     assert(self.output_meter.parameters.node.idx == selected_node.idx);
     self.output_meter.update(&self.dsp, dt);
@@ -220,8 +302,8 @@ fn refreshSelectionUi(self: *Self) void {
         },
     };
 
-    const selected_node = self.space.singleSelectedNode() orelse return;
-    if (selected_node.idx >= self.dsp.nodes.len) return;
+    const selected_node = self.editorSpace().singleSelectedNode() orelse return;
+    assert(selected_node.idx < self.dsp.nodes.len);
 
     const state = self.dsp.nodes.items(.state)[selected_node.idx];
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
@@ -255,30 +337,30 @@ fn refreshSelectionUi(self: *Self) void {
 /// Changes the single selection and resets the meter source to match it.
 fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
     const selected = if (node) |value| if (value.isNoop()) null else value else null;
-    const previous_count = self.space.selected_count;
-    const previous_single = self.space.singleSelectedNode();
+    const previous_count = self.editorSpace().selected_count;
+    const previous_single = self.editorSpace().singleSelectedNode();
     const selected_idx = if (selected) |current| current.idx else null;
     const changed = previous_count != 1 or
         (if (previous_single) |previous| previous.idx else null) != selected_idx;
 
     if (changed) {
-        for (self.space.selected_nodes[0..self.space.selected_count]) |previous| {
-            if (previous.idx < self.dsp.nodes.len and
-                std.meta.activeTag(self.dsp.nodes.items(.state)[previous.idx]) == .keyboard)
+        for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |previous| {
+            assert(previous.idx < self.dsp.nodes.len);
+            if (std.meta.activeTag(self.dsp.nodes.items(.state)[previous.idx]) == .keyboard)
                 self.dsp.keyboardReleaseAll(.{ .idx = previous.idx });
         }
     }
 
-    self.space.selectSingle(selected);
+    self.editorSpace().selectSingle(selected);
     if (changed) self.refreshSelectionUi();
 }
 
 /// Redraws the editor's status text in the runtime-owned display.
 fn write(self: *Self, gpa: std.mem.Allocator) !void {
     self.zsynth.display.reset();
-    try self.space.write(gpa, &self.zsynth.display);
+    try self.editorSpace().write(gpa, &self.zsynth.display);
     if (self.zsynth.cursor.selection_dragging)
-        try self.space.writeSelectionMarquee(
+        try self.editorSpace().writeSelectionMarquee(
             gpa,
             &self.zsynth.display,
             .{
@@ -303,12 +385,15 @@ fn rememberDocumentPath(self: *Self, gpa: std.mem.Allocator, path: []const u8) !
 
 /// Saves the graph and updates the remembered document path after success.
 fn saveDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+    self.persistGroupPositions();
     try self.serializer.save(path);
     try self.rememberDocumentPath(gpa, path);
 }
 
 /// Loads the graph and updates the remembered document path after success.
 fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+    if (self.group_space != null)
+        self.leaveGroupView(gpa);
     try self.serializer.load(path);
     try self.rememberDocumentPath(gpa, path);
 }
@@ -357,6 +442,27 @@ fn writeDocumentName(self: *Self, gpa: std.mem.Allocator) !void {
     );
 }
 
+/// Draws the active group's name centered along the top edge of the graph.
+fn writeGroupTitle(self: *Self, gpa: std.mem.Allocator) !void {
+    const group = self.active_group orelse return;
+    if (self.zsynth.display.impl != .graphic) return;
+
+    var title: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&title, "Group: {s}", .{
+        self.dsp.nodes.items(.name)[group.idx],
+    }) catch return;
+    const display = &self.zsynth.display.impl.graphic;
+    if (text.len > display.width) return;
+    try self.zsynth.display.write(
+        gpa,
+        text,
+        (display.width - @as(u32, @intCast(text.len))) / 2,
+        0,
+        .black,
+        .white,
+    );
+}
+
 /// Draws the selected node's reflected parameters in the bottom UI pane.
 fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     self.parameter_editor.cell_count = 0;
@@ -364,8 +470,9 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     if (display.impl != .graphic) return;
 
     const graphic = &display.impl.graphic;
-    const selected = self.space.singleSelectedNode() orelse return;
-    if (selected.isNoop() or selected.idx >= self.dsp.nodes.len) return;
+    const selected = self.editorSpace().singleSelectedNode() orelse return;
+    if (selected.isNoop()) return;
+    assert(selected.idx < self.dsp.nodes.len);
 
     if (graphic.height < 2 or graphic.width <= parameters_pane_padding * 2)
         return;
@@ -695,7 +802,7 @@ fn writeReflectedParameters(
     }
 
     if (self.parameter_editor.active) |active| {
-        if (self.space.singleSelectedNode()) |selected| {
+        if (self.editorSpace().singleSelectedNode()) |selected| {
             if (active.node.idx == selected.idx) {
                 for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |cell| {
                     if (!cell.editable or !sameParameter(
@@ -720,7 +827,7 @@ fn writeReflectedParameters(
 /// Moves the viewport and redraws the complete visible space.
 fn moveViewport(self: *Self, gpa: std.mem.Allocator, dx: i32, dy: i32) !void {
     if (dx == 0 and dy == 0) return;
-    self.space.moveViewport(dx, dy);
+    self.editorSpace().moveViewport(dx, dy);
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
@@ -735,10 +842,9 @@ fn keyUpDown(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
     if (self.parameter_editor.active == null) {
-        if (self.space.singleSelectedNode()) |selected| {
-            if (selected.idx < self.dsp.nodes.len and
-                std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
-            {
+        if (self.editorSpace().singleSelectedNode()) |selected| {
+            assert(selected.idx < self.dsp.nodes.len);
+            if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard) {
                 const modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
                 const command_modifiers = sdl.Keymod.ctrl |
                     sdl.Keymod.lgui |
@@ -794,6 +900,14 @@ fn keyUpDown(
 
     const command = (modifiers & (sdl.Keymod.lgui | sdl.Keymod.rgui)) != 0;
 
+    if (event.key == .escape and self.active_group != null) {
+        self.leaveGroupView(gpa);
+        self.setNodeSelection(null);
+        self.zsynth.cursor.dirty = true;
+        try self.write(gpa);
+        return true;
+    }
+
     switch (event.key) {
         .p => if (command) {
             _ = try state_stack.push(
@@ -819,6 +933,7 @@ fn keyUpDown(
             try self.write(gpa);
         } else return false,
         .n => if (command) try self.newGraph(gpa) else return false,
+        .g => if (command) try self.createSelectedGroup(gpa) else return false,
         .up => try self.moveViewport(gpa, 0, -delta),
         .down => try self.moveViewport(gpa, 0, delta),
         .left => try self.moveViewport(gpa, -delta, 0),
@@ -840,7 +955,7 @@ fn keyUpDown(
         .d => {
             if (command) {
                 try self.duplicateSelectedNodes(gpa, shift);
-            } else if (self.space.selected_count != 0) {
+            } else if (self.editorSpace().selected_count != 0) {
                 try self.removeSelectedNodes(gpa);
             } else return false;
         },
@@ -855,24 +970,126 @@ fn keyUpDown(
     return true;
 }
 
+/// Creates a non-nested group from the current ordinary selection.
+fn createSelectedGroup(self: *Self, gpa: std.mem.Allocator) !void {
+    if (self.active_group != null) return;
+    if (self.editorSpace().selected_count < 2) return;
+
+    var members: [DSP.max_group_members]DSP.Node.Index = undefined;
+    var member_count: usize = 0;
+    for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |selected| {
+        assert(selected.idx < self.dsp.nodes.len);
+        if (self.editorSpace().isGroup(selected)) continue;
+        if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output) continue;
+        if (member_count >= members.len) break;
+        members[member_count] = selected;
+        member_count += 1;
+    }
+    if (member_count < 2) return;
+
+    // Grouping keeps only edges fully inside the selection. Boundary edges
+    // are deliberately removed because the new group ports start unbound.
+    for (self.dsp.nodes.items(.inputs), 0..) |node_inputs, destination_index| {
+        const destination_selected = containsNode(members[0..member_count], destination_index);
+        for (node_inputs, 0..) |connection, input_port| {
+            if (connection.isNoop()) continue;
+            const source_selected = containsNode(members[0..member_count], connection.node.idx);
+            if (source_selected != destination_selected)
+                self.dsp.disconnectInput(.{ .idx = destination_index }, @intCast(input_port));
+        }
+    }
+    for (self.dsp.nodes.items(.parameter_link), 0..) |link, source_index| {
+        if (link.target) |target| {
+            if (containsNode(members[0..member_count], source_index) !=
+                containsNode(members[0..member_count], target.idx))
+                self.dsp.disconnectParameterTarget(.{ .idx = source_index });
+        }
+    }
+
+    const owned_name = try gpa.dupe(u8, "group");
+    try self.owned_node_names.append(gpa, owned_name);
+
+    const group = try self.dsp.addNode(gpa, DSP.Node.Group.create(
+        owned_name,
+        members[0..member_count],
+    ));
+
+    self.editorSpace().addNode(gpa, group, self.editorSpace().nodePosition(members[0])) catch |err| {
+        if (err == error.InvalidVisualNodeLayout) self.rollbackCreatedGroup(gpa, group);
+        return err;
+    };
+    self.dsp.addGroupEndpoints(gpa, group) catch |err| return err;
+    const group_position = self.editorSpace().nodePosition(group);
+    const group_state = self.dsp.nodes.items(.state)[group.idx].group;
+    for (0..DSP.max_outlets) |port| {
+        self.editorSpace().addNode(gpa, group_state.input_nodes[port], group_position) catch |err| {
+            if (err == error.InvalidVisualNodeLayout) self.rollbackCreatedGroup(gpa, group);
+            return err;
+        };
+        self.editorSpace().addNode(gpa, group_state.output_nodes[port], group_position) catch |err| {
+            if (err == error.InvalidVisualNodeLayout) self.rollbackCreatedGroup(gpa, group);
+            return err;
+        };
+    }
+
+    self.releaseSelectedKeyboards();
+    self.editorSpace().selectSingle(group);
+    const layout_valid = self.editorSpace().rebuildOccupancy(gpa) catch |err| return err;
+    if (!layout_valid) {
+        self.rollbackCreatedGroup(gpa, group);
+        return error.InvalidVisualNodeLayout;
+    }
+    try self.editorSpace().computePaths(gpa);
+    self.refreshSelectionUi();
+    self.zsynth.cursor.dirty = true;
+    try self.write(gpa);
+}
+
+/// Removes a partially created group after a recoverable visual-layout error.
+fn rollbackCreatedGroup(self: *Self, gpa: std.mem.Allocator, group: DSP.Node.Index) void {
+    while (self.editorSpace().nodes.len > group.idx + 1)
+        self.editorSpace().remove(
+            gpa,
+            .{ .idx = self.editorSpace().nodes.len - 1 },
+        ) catch {};
+    if (self.editorSpace().nodes.len > group.idx)
+        self.editorSpace().remove(gpa, group) catch {};
+
+    while (self.dsp.nodes.len > group.idx + 1)
+        self.dsp.remove(gpa, .{ .idx = self.dsp.nodes.len - 1 });
+    if (self.dsp.nodes.len > group.idx)
+        self.dsp.remove(gpa, group);
+
+    const owned_name = self.owned_node_names.pop() orelse unreachable;
+    gpa.free(owned_name);
+}
+
+/// Returns whether a node index occurs in a fixed group member slice.
+fn containsNode(nodes: []const DSP.Node.Index, index: usize) bool {
+    for (nodes) |node|
+        if (node.idx == index) return true;
+    return false;
+}
+
 /// Duplicates the complete current selection using one shared group offset.
 fn duplicateSelectedNodes(self: *Self, gpa: std.mem.Allocator, link_parameters: bool) !void {
-    if (self.space.selected_count == 0) return;
-    if (self.space.selected_count == 1) {
-        try self.duplicateSelectedNode(gpa, self.space.selected_nodes[0], link_parameters);
+    if (self.editorSpace().selected_count == 0) return;
+    if (self.editorSpace().selected_count == 1) {
+        try self.duplicateSelectedNode(gpa, self.editorSpace().selected_nodes[0], link_parameters);
         return;
     }
 
-    var sources: [16]VisualNode.Index = undefined;
+    var sources: [Space.max_selected_nodes]VisualNode.Index = undefined;
     var source_count: usize = 0;
     var north_west = Space.Position{ .x = std.math.maxInt(i32), .y = std.math.maxInt(i32) };
     var south_east = Space.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
-    for (self.space.selected_nodes[0..self.space.selected_count]) |source| {
-        if (std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]) == .output) continue;
+    for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |source| {
+        if (std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]) == .output or
+            self.editorSpace().isGroup(source)) continue;
         sources[source_count] = source;
         source_count += 1;
-        const footprint = self.space.nodeFootprint(source);
-        const position = self.space.nodePosition(source);
+        const footprint = self.editorSpace().nodeFootprint(source);
+        const position = self.editorSpace().nodePosition(source);
         north_west.x = @min(north_west.x, position.x);
         north_west.y = @min(north_west.y, position.y);
         south_east.x = @max(south_east.x, position.x + @as(i32, @intCast(footprint.width)));
@@ -880,24 +1097,24 @@ fn duplicateSelectedNodes(self: *Self, gpa: std.mem.Allocator, link_parameters: 
     }
     if (source_count == 0) return;
 
-    const offset = self.space.findFreeGroupOffset(sources[0..source_count], .{
+    const offset = self.editorSpace().findFreeGroupOffset(sources[0..source_count], .{
         .x = south_east.x - north_west.x + 3,
         .y = 0,
     }) orelse return error.InvalidVisualNodeLayout;
 
-    var duplicates: [16]VisualNode.Index = undefined;
+    var duplicates: [Space.max_selected_nodes]VisualNode.Index = undefined;
     var duplicate_count: usize = 0;
     errdefer {
         while (duplicate_count > 0) {
             duplicate_count -= 1;
             const duplicate = duplicates[duplicate_count];
             self.dsp.remove(gpa, duplicate);
-            self.space.remove(gpa, duplicate) catch {};
+            self.editorSpace().remove(gpa, duplicate) catch {};
         }
     }
 
     for (sources[0..source_count]) |source| {
-        const position = self.space.nodePosition(source);
+        const position = self.editorSpace().nodePosition(source);
         duplicates[duplicate_count] = try self.duplicateNodeAt(
             gpa,
             source,
@@ -908,21 +1125,68 @@ fn duplicateSelectedNodes(self: *Self, gpa: std.mem.Allocator, link_parameters: 
     }
 
     self.releaseSelectedKeyboards();
-    self.space.selectSingle(duplicates[0]);
+    self.editorSpace().selectSingle(duplicates[0]);
     for (duplicates[1..duplicate_count]) |duplicate|
-        self.space.toggleSelection(duplicate);
+        self.editorSpace().toggleSelection(duplicate);
     self.refreshSelectionUi();
-    try self.space.computePaths(gpa);
-    _ = self.space.revealNode(duplicates[0]);
+    try self.editorSpace().computePaths(gpa);
+    _ = self.editorSpace().revealNode(duplicates[0]);
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
 
 /// Removes every currently selected node while preserving index validity.
 fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
-    var nodes: [16]VisualNode.Index = undefined;
-    const count = self.space.selected_count;
-    @memcpy(nodes[0..count], self.space.selected_nodes[0..count]);
+    if (self.editorSpace().selected_count == 1) {
+        const selected = self.editorSpace().selected_nodes[0];
+        if (self.editorSpace().isGroup(selected)) {
+            var group_index = selected.idx;
+            self.releaseSelectedKeyboards();
+
+            // Endpoint indices are not stable while swapRemove is compacting
+            // the graph.  Find one by its current owner before each removal.
+            while (true) {
+                var endpoint: ?VisualNode.Index = null;
+                for (self.dsp.nodes.items(.state), 0..) |state, index| {
+                    switch (state) {
+                        .group_input => |value| if (value.group.idx == group_index) {
+                            endpoint = .{ .idx = index };
+                            break;
+                        },
+                        .group_output => |value| if (value.group.idx == group_index) {
+                            endpoint = .{ .idx = index };
+                            break;
+                        },
+                        else => {},
+                    }
+                }
+                const current_endpoint = endpoint orelse break;
+                try self.remove(gpa, current_endpoint);
+            }
+
+            // Once endpoints are gone the group is the last node.  Removing
+            // a member swaps it into the group's old slot, so carry the group
+            // index along with that move and always read the current member
+            // table.
+            while (self.dsp.nodes.items(.state)[group_index].group.member_count != 0) {
+                const group_state = self.dsp.nodes.items(.state)[group_index].group;
+                const member = group_state.members[group_state.member_count - 1];
+                const group_moves = group_index == self.dsp.nodes.len - 1;
+                try self.remove(gpa, member);
+                if (group_moves) group_index = member.idx;
+            }
+            try self.remove(gpa, .{ .idx = group_index });
+            self.setNodeSelection(null);
+            try self.editorSpace().computePaths(gpa);
+            self.zsynth.cursor.dirty = true;
+            try self.write(gpa);
+            return;
+        }
+    }
+
+    var nodes: [Space.max_selected_nodes]VisualNode.Index = undefined;
+    const count = self.editorSpace().selected_count;
+    @memcpy(nodes[0..count], self.editorSpace().selected_nodes[0..count]);
     self.releaseSelectedKeyboards();
     var index = count;
     while (index > 0) {
@@ -930,7 +1194,7 @@ fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
         try self.remove(gpa, nodes[index]);
     }
     self.setNodeSelection(null);
-    try self.space.computePaths(gpa);
+    try self.editorSpace().computePaths(gpa);
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
@@ -952,6 +1216,7 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .noop => unreachable,
         .oscillator => |value| DSP.Node.Oscillator.create(source_name, value.parameters),
         .output => DSP.Node.Output.create(source_name),
+        .group, .group_input, .group_output => unreachable,
     };
 }
 
@@ -967,9 +1232,18 @@ fn duplicateNodeAt(
         return error.InvalidVisualNodeLayout;
     const duplicate_index = try self.dsp.addNode(gpa, self.duplicateNodeState(source));
     errdefer self.dsp.remove(gpa, duplicate_index);
-    try self.space.addNode(gpa, duplicate_index, position);
-    errdefer self.space.remove(gpa, duplicate_index) catch {};
-    if (!try self.space.rebuildOccupancy(gpa))
+    if (self.active_group) |group|
+        if (!self.dsp.addGroupMember(group, duplicate_index))
+            return error.InvalidGroup;
+    if (self.active_group) |_| {
+        const root_position = self.space.findFreePosition(duplicate_index, self.space.viewportCenter()) orelse
+            return error.InvalidVisualNodeLayout;
+        try self.space.addNode(gpa, duplicate_index, root_position);
+        errdefer self.space.remove(gpa, duplicate_index) catch {};
+    }
+    try self.editorSpace().addNode(gpa, duplicate_index, position);
+    errdefer self.editorSpace().remove(gpa, duplicate_index) catch {};
+    if (!try self.editorSpace().rebuildOccupancy(gpa))
         return error.InvalidVisualNodeLayout;
     if (link_parameters)
         _ = self.dsp.linkParameters(source, duplicate_index);
@@ -983,12 +1257,13 @@ fn duplicateSelectedNode(
     selected: VisualNode.Index,
     link_parameters: bool,
 ) !void {
-    if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output)
+    if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output or
+        self.editorSpace().isGroup(selected))
         return;
 
-    const source_position = self.space.nodePosition(selected);
-    const source_footprint = self.space.nodeFootprint(selected);
-    const duplicate_position = self.space.findFreePosition(
+    const source_position = self.editorSpace().nodePosition(selected);
+    const source_footprint = self.editorSpace().nodeFootprint(selected);
+    const duplicate_position = self.editorSpace().findFreePosition(
         selected,
         .{
             .x = source_position.x + @as(i32, @intCast(source_footprint.width)) + 3,
@@ -1002,9 +1277,9 @@ fn duplicateSelectedNode(
         link_parameters,
     );
 
-    try self.space.computePaths(gpa);
+    try self.editorSpace().computePaths(gpa);
     self.setNodeSelection(duplicate_index);
-    _ = self.space.revealNode(duplicate_index);
+    _ = self.editorSpace().revealNode(duplicate_index);
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }
@@ -1059,7 +1334,7 @@ fn beginParameterEdit(self: *Self, parameter: ParameterEditor.ParameterCell) voi
     if (self.parameter_editor.active != null)
         self.commitParameterEdit();
 
-    const node = self.space.singleSelectedNode() orelse return;
+    const node = self.editorSpace().singleSelectedNode() orelse return;
     self.parameter_editor.active = .{
         .node = .{ .idx = node.idx },
         .field_name = parameter.field_name,
@@ -1130,7 +1405,7 @@ fn commitParameterEdit(self: *Self) void {
     self.dsp.withGraphLock(&context, commitParameterLocked);
     var buffer: [64]u8 = undefined;
     const active = self.parameter_editor.active orelse return;
-    const node = self.space.singleSelectedNode() orelse return;
+    const node = self.editorSpace().singleSelectedNode() orelse return;
     self.parameter_editor.text_field.setInput(
         self.formatNodeParameter(
             node.idx,
@@ -1145,7 +1420,7 @@ fn commitParameterEdit(self: *Self) void {
 fn commitParameterLocked(context: *ParameterEditor.CommitContext) void {
     const self = context.editor;
     const active = self.parameter_editor.active orelse return;
-    if (active.node.idx >= self.dsp.nodes.len) return;
+    assert(active.node.idx < self.dsp.nodes.len);
 
     if (std.mem.eql(u8, active.field_name, node_name_field_name)) {
         const owned_name = self.serializer.allocator.dupe(
@@ -1183,7 +1458,7 @@ fn formatNodeParameter(
     array_index: ?usize,
     buffer: []u8,
 ) []const u8 {
-    if (node >= self.dsp.nodes.len) return "";
+    assert(node < self.dsp.nodes.len);
     if (std.mem.eql(u8, field_name, node_name_field_name))
         return self.dsp.nodes.items(.name)[node];
     const state = self.dsp.nodes.items(.state)[node];
@@ -1226,7 +1501,7 @@ fn formatReflectedParameter(
 fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
     const self = field.context;
     const active = self.parameter_editor.active orelse return "";
-    if (active.node.idx >= self.dsp.nodes.len) return "";
+    assert(active.node.idx < self.dsp.nodes.len);
 
     const state = self.dsp.nodes.items(.state)[active.node.idx];
     return switch (state) {
@@ -1355,8 +1630,8 @@ fn mouseButton(
 
     if (event.button == 3 and event.down) {
         if (self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y })) |cell| {
-            const world = self.space.worldPositionAtDisplayCell(cell[0], cell[1]);
-            if (self.space.outletAt(world)) |outlet|
+            const world = self.editorSpace().worldPositionAtDisplayCell(cell[0], cell[1]);
+            if (self.editorSpace().outletAt(world)) |outlet|
                 try self.disconnectOutlet(gpa, outlet);
         }
         return true;
@@ -1391,12 +1666,12 @@ fn mouseButton(
                 }
             }
             if (cell) |display_cell| {
-                const world = self.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
-                if (self.space.outletAt(world)) |outlet| {
+                const world = self.editorSpace().worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
+                if (self.editorSpace().outletAt(world)) |outlet| {
                     self.zsynth.cursor.left_mouse_down = false;
-                    _ = self.space.revealNode(outlet.node);
+                    _ = self.editorSpace().revealNode(outlet.node);
                     self.zsynth.cursor.dirty = true;
-                    const connection_position = self.space.worldPositionAtDisplayCell(
+                    const connection_position = self.editorSpace().worldPositionAtDisplayCell(
                         display_cell[0],
                         display_cell[1],
                     );
@@ -1411,16 +1686,23 @@ fn mouseButton(
             }
 
             const node = if (cell) |display_cell|
-                self.space.nodeAtDisplayCell(display_cell[0], display_cell[1])
+                self.editorSpace().nodeAtDisplayCell(display_cell[0], display_cell[1])
             else
                 null;
             if (node) |selected| {
-                if (control) {
+                if (event.clicks >= 2 and !control and self.editorSpace().isGroup(selected)) {
+                    try self.enterGroupView(gpa, selected);
+                    self.setNodeSelection(null);
+                    self.zsynth.cursor.dirty = true;
+                    try self.write(gpa);
+                    self.zsynth.cursor.left_mouse_down = false;
+                    return true;
+                } else if (control) {
                     self.releaseSelectedKeyboards();
-                    self.space.toggleSelection(selected);
+                    self.editorSpace().toggleSelection(selected);
                     self.refreshSelectionUi();
                     self.zsynth.cursor.left_mouse_down = false;
-                } else if (!(self.space.selected_count > 1 and self.space.isSelected(selected))) {
+                } else if (!(self.editorSpace().selected_count > 1 and self.editorSpace().isSelected(selected))) {
                     self.setNodeSelection(selected);
                 } else {
                     self.refreshSelectionUi();
@@ -1428,7 +1710,7 @@ fn mouseButton(
             } else {
                 self.setNodeSelection(null);
                 if (cell) |display_cell| {
-                    const world = self.space.worldPositionAtDisplayCell(
+                    const world = self.editorSpace().worldPositionAtDisplayCell(
                         display_cell[0],
                         display_cell[1],
                     );
@@ -1439,13 +1721,13 @@ fn mouseButton(
             }
             self.zsynth.cursor.dirty = true;
 
-            if (cell) |display_cell| if (!control) if (self.space.nodeAtDisplayCell(
+            if (cell) |display_cell| if (!control) if (self.editorSpace().nodeAtDisplayCell(
                 display_cell[0],
                 display_cell[1],
             )) |grabbed| {
-                if (!grabbed.isNoop() and self.space.isSelected(grabbed)) {
-                    _ = self.space.revealNode(grabbed);
-                    const world = self.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
+                if (!grabbed.isNoop() and self.editorSpace().isSelected(grabbed)) {
+                    _ = self.editorSpace().revealNode(grabbed);
+                    const world = self.editorSpace().worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
                     self.zsynth.cursor.drag_position = .{ world.x, world.y };
                 }
             };
@@ -1453,7 +1735,7 @@ fn mouseButton(
         } else {
             self.zsynth.cursor.left_mouse_down = false;
             if (self.zsynth.cursor.selection_dragging) {
-                self.space.selectRectangle(
+                self.editorSpace().selectRectangle(
                     .{
                         .x = self.zsynth.cursor.selection_anchor[0],
                         .y = self.zsynth.cursor.selection_anchor[1],
@@ -1468,7 +1750,7 @@ fn mouseButton(
                 self.zsynth.cursor.left_mouse_moved = false;
                 try self.write(gpa);
             } else if (self.zsynth.cursor.left_mouse_moved) {
-                try self.space.computePaths(gpa);
+                try self.editorSpace().computePaths(gpa);
                 self.zsynth.cursor.left_mouse_moved = false;
                 try self.write(gpa);
             } else {
@@ -1487,9 +1769,9 @@ fn mouseButton(
 
 /// Releases keyboard notes before a mouse selection replaces the current set.
 fn releaseSelectedKeyboards(self: *Self) void {
-    for (self.space.selected_nodes[0..self.space.selected_count]) |selected| {
-        if (selected.idx < self.dsp.nodes.len and
-            std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
+    for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |selected| {
+        assert(selected.idx < self.dsp.nodes.len);
+        if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
             self.dsp.keyboardReleaseAll(.{ .idx = selected.idx });
     }
 }
@@ -1523,6 +1805,34 @@ fn connectOutlets(
     if (first.node.idx == second.node.idx)
         return;
 
+    if (self.editorSpace().isGroupEndpoint(first.node) or
+        self.editorSpace().isGroupEndpoint(second.node))
+    {
+        const endpoint = if (self.editorSpace().isGroupEndpoint(first.node)) first else second;
+        const member = if (endpoint.node.idx == first.node.idx) second else first;
+        const group = self.editorSpace().endpointGroup(endpoint.node) orelse return;
+        const group_port = self.editorSpace().endpointPort(endpoint.node) orelse return;
+        const member_group = self.editorSpace().groupIndexForMember(member.node) orelse return;
+        if (member_group.idx != group.idx) return;
+
+        const tag = std.meta.activeTag(self.dsp.nodes.items(.state)[endpoint.node.idx]);
+        const bound = switch (tag) {
+            .group_input => if (member.direction == .input)
+                self.dsp.bindGroupInput(group, group_port, member.node, member.port)
+            else
+                false,
+            .group_output => if (member.direction == .output)
+                self.dsp.bindGroupOutput(group, group_port, member.node, member.port)
+            else
+                false,
+            else => false,
+        };
+        if (!bound) return;
+        try self.recomputeGroupViews(gpa);
+        try self.write(gpa);
+        return;
+    }
+
     const first_is_parameter = first.direction == .parameter_source or
         first.direction == .parameter_target;
     const second_is_parameter = second.direction == .parameter_source or
@@ -1535,13 +1845,14 @@ fn connectOutlets(
         const source = if (first.direction == .parameter_target) first else second;
         const target = if (first.direction == .parameter_source) first else second;
         if (!self.dsp.linkParameters(source.node, target.node)) return;
-        try self.space.computePaths(gpa);
+        try self.editorSpace().computePaths(gpa);
         try self.write(gpa);
         return;
     }
 
-    if (first.direction == second.direction)
+    if (first.direction == second.direction) {
         return;
+    }
 
     const output = if (first.direction == .output) first else second;
     const input = if (first.direction == .input) first else second;
@@ -1549,20 +1860,45 @@ fn connectOutlets(
     // An output can feed only one input, so replace its existing connection.
     self.dsp.disconnectOutput(output.node, output.port);
     self.dsp.plug(output.node, output.port, input.node, input.port);
-    try self.space.computePaths(gpa);
+    try self.editorSpace().computePaths(gpa);
     try self.write(gpa);
 }
 
 /// Remove the connection attached to an outlet.
 fn disconnectOutlet(self: *Self, gpa: std.mem.Allocator, outlet: Space.Outlet) !void {
+    if (self.editorSpace().isGroupEndpoint(outlet.node)) {
+        const group = self.editorSpace().endpointGroup(outlet.node) orelse return;
+        const port = self.editorSpace().endpointPort(outlet.node) orelse return;
+        switch (std.meta.activeTag(self.dsp.nodes.items(.state)[outlet.node.idx])) {
+            .group_input => self.dsp.unbindGroupInput(group, port),
+            .group_output => self.dsp.unbindGroupOutput(group, port),
+            else => unreachable,
+        }
+        try self.recomputeGroupViews(gpa);
+        try self.write(gpa);
+        return;
+    }
     switch (outlet.direction) {
         .input => self.dsp.disconnectInput(outlet.node, outlet.port),
         .output => self.dsp.disconnectOutput(outlet.node, outlet.port),
         .parameter_source => self.dsp.disconnectParameterSource(outlet.node),
         .parameter_target => self.dsp.disconnectParameterTarget(outlet.node),
     }
-    try self.space.computePaths(gpa);
+    try self.editorSpace().computePaths(gpa);
     try self.write(gpa);
+}
+
+/// Rebuilds routing after a group port binding changes both visual scopes.
+fn recomputeGroupViews(self: *Self, gpa: std.mem.Allocator) !void {
+    if (self.group_space) |*group_space| {
+        if (!try group_space.rebuildOccupancy(gpa))
+            return error.InvalidVisualNodeLayout;
+        try group_space.computePaths(gpa);
+    }
+
+    if (!try self.space.rebuildOccupancy(gpa))
+        return error.InvalidVisualNodeLayout;
+    try self.space.computePaths(gpa);
 }
 
 /// Converts middle-button mouse motion into whole-cell viewport movement.
@@ -1578,7 +1914,7 @@ fn mouseMoved(
         if (event.state.left == 0) {
             self.zsynth.cursor.left_mouse_down = false;
             if (self.zsynth.cursor.selection_dragging) {
-                self.space.selectRectangle(
+                self.editorSpace().selectRectangle(
                     .{
                         .x = self.zsynth.cursor.selection_anchor[0],
                         .y = self.zsynth.cursor.selection_anchor[1],
@@ -1593,7 +1929,7 @@ fn mouseMoved(
                 self.zsynth.cursor.left_mouse_moved = false;
                 try self.write(gpa);
             } else if (self.zsynth.cursor.left_mouse_moved) {
-                try self.space.computePaths(gpa);
+                try self.editorSpace().computePaths(gpa);
                 self.zsynth.cursor.left_mouse_moved = false;
                 try self.write(gpa);
             }
@@ -1601,7 +1937,7 @@ fn mouseMoved(
         }
 
         const cell = self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y }) orelse return true;
-        const world = self.space.worldPositionAtDisplayCell(cell[0], cell[1]);
+        const world = self.editorSpace().worldPositionAtDisplayCell(cell[0], cell[1]);
         const cursor_position = &self.zsynth.cursor;
         if (cursor_position.drag_position[0] == world.x and
             cursor_position.drag_position[1] == world.y)
@@ -1612,14 +1948,14 @@ fn mouseMoved(
         if (cursor_position.selection_dragging) {
             cursor_position.left_mouse_moved = true;
             try self.write(gpa);
-        } else if (self.space.selected_count != 0) {
-            const moved = try self.space.moveSelectedNodes(gpa, .{
+        } else if (self.editorSpace().selected_count != 0) {
+            const moved = try self.editorSpace().moveSelectedNodes(gpa, .{
                 .x = world.x - previous_world[0],
                 .y = world.y - previous_world[1],
             });
             if (moved) {
                 cursor_position.left_mouse_moved = true;
-                try self.space.computePaths(gpa);
+                try self.editorSpace().computePaths(gpa);
                 try self.write(gpa);
             }
         }
@@ -1689,10 +2025,12 @@ fn render(
     try self.writeDocumentName(gpa);
     // Draw selected-node parameters in the editor-owned transparent overlay.
     try self.writeSelectedParametersPane(gpa);
+    // Keep the scoped group identity visible while editing its interior.
+    try self.writeGroupTitle(gpa);
     // Draw outlet labels before the runtime adds the generic cursor glyph.
     if (self.zsynth.cursor.visible and self.zsynth.ui_display.impl == .graphic) {
         if (self.zsynth.displayCellAtWindowPosition(self.zsynth.cursor.position)) |cell| {
-            try self.space.writeUiOverlay(gpa, &self.zsynth.ui_display, cell[0], cell[1]);
+            try self.editorSpace().writeUiOverlay(gpa, &self.zsynth.ui_display, cell[0], cell[1]);
         }
     }
     // Submit the graphic display only when that display backend is active.
@@ -1702,8 +2040,19 @@ fn render(
 
 /// Removes a DSP node and its synchronized visual representation.
 fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
+    if (self.editorSpace().isGroupEndpoint(node)) {
+        const group = self.editorSpace().endpointGroup(node) orelse return;
+        const port = self.editorSpace().endpointPort(node) orelse return;
+        switch (self.dsp.nodes.items(.state)[node.idx]) {
+            .group_input => self.dsp.unbindGroupInput(group, port),
+            .group_output => self.dsp.unbindGroupOutput(group, port),
+            else => unreachable,
+        }
+    }
     self.dsp.remove(gpa, node);
-    try self.space.remove(gpa, node);
+    try self.editorSpace().remove(gpa, node);
+    if (self.active_group != null)
+        try self.space.remove(gpa, node);
     self.refreshSelectionUi();
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
@@ -1753,7 +2102,7 @@ fn addVisualNode(
     node: DSP.Node.Index,
     position: Space.Position,
 ) !void {
-    try self.space.addNode(allocator, node, position);
+    try self.editorSpace().addNode(allocator, node, position);
 }
 
 fn addNode(
@@ -2021,11 +2370,11 @@ fn simpleDSP(self: *Self, allocator: std.mem.Allocator) !void {
     // Crusher -> Output
     dsp.plug(crusher, 0, output, 0);
 
-    if (!try self.space.rebuildOccupancy(allocator))
+    if (!try self.editorSpace().rebuildOccupancy(allocator))
         return error.InvalidVisualNodeLayout;
 
     // Compute link paths after the complete graph and all visual nodes exist.
-    try self.space.computePaths(allocator);
+    try self.editorSpace().computePaths(allocator);
 }
 
 pub const CommandPalette = struct {
@@ -2257,18 +2606,29 @@ pub const CommandPalette = struct {
         };
         errdefer self.editor.dsp.remove(gpa, index);
 
-        const position = self.editor.space.findFreePosition(
+        if (self.editor.active_group) |group| {
+            if (!self.editor.dsp.addGroupMember(group, index))
+                return error.InvalidGroup;
+        }
+
+        const position = self.editor.editorSpace().findFreePosition(
             index,
-            self.editor.space.viewportCenter(),
+            self.editor.editorSpace().viewportCenter(),
         ) orelse return error.InvalidVisualNodeLayout;
 
-        try self.editor.space.addNode(gpa, index, position);
-        errdefer self.editor.space.remove(gpa, index) catch {};
-        if (!try self.editor.space.rebuildOccupancy(gpa))
+        if (self.editor.active_group) |_| {
+            const root_position = self.editor.space.findFreePosition(index, self.editor.space.viewportCenter()) orelse
+                return error.InvalidVisualNodeLayout;
+            try self.editor.space.addNode(gpa, index, root_position);
+            errdefer self.editor.space.remove(gpa, index) catch {};
+        }
+        try self.editor.editorSpace().addNode(gpa, index, position);
+        errdefer self.editor.editorSpace().remove(gpa, index) catch {};
+        if (!try self.editor.editorSpace().rebuildOccupancy(gpa))
             return error.InvalidVisualNodeLayout;
-        try self.editor.space.computePaths(gpa);
+        try self.editor.editorSpace().computePaths(gpa);
         self.editor.setNodeSelection(index);
-        _ = self.editor.space.revealNode(index);
+        _ = self.editor.editorSpace().revealNode(index);
         self.editor.zsynth.cursor.dirty = true;
         try self.editor.write(gpa);
         try self.finish(state_stack, gpa);
@@ -2363,7 +2723,7 @@ pub const CommandPalette = struct {
     /// Returns the stable palette spelling for a constructible processing node.
     fn nodeName(tag: DSP.Node.Tag) []const u8 {
         return switch (tag) {
-            .noop, .output => "",
+            .noop, .output, .group, .group_input, .group_output => "",
             else => DSP.node_metadata.get(tag).name,
         };
     }
@@ -2394,7 +2754,7 @@ pub const CommandPalette = struct {
             .noise => DSP.Node.Noise.create(name, .{
                 .seed = 0,
             }),
-            .noop, .output => unreachable,
+            .noop, .output, .group, .group_input, .group_output => unreachable,
         };
     }
 };
@@ -2453,7 +2813,7 @@ pub const OutletConnection = struct {
         // The editor rendered the base display first; this state only overlays the preview.
         const context = stateContext(state_stack, state);
         if (context.preview_path) |path|
-            try context.editor.space.writePreviewPath(
+            try context.editor.editorSpace().writePreviewPath(
                 gpa,
                 &context.editor.zsynth.display,
                 path,
@@ -2486,7 +2846,7 @@ pub const OutletConnection = struct {
     ) StateStack.State.Error!bool {
         const context = stateContext(state_stack, state);
         if (context.editor.zsynth.displayCellAtWindowPosition(.{ event.x, event.y })) |cell| {
-            context.mouse_position = context.editor.space.worldPositionAtDisplayCell(cell[0], cell[1]);
+            context.mouse_position = context.editor.editorSpace().worldPositionAtDisplayCell(cell[0], cell[1]);
             try context.updatePreview(gpa);
         }
         return true;
@@ -2501,8 +2861,8 @@ pub const OutletConnection = struct {
         const context = stateContext(state_stack, state);
         const cell = context.editor.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
         const clicked = if (cell) |display_cell|
-            context.editor.space.outletAt(
-                context.editor.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]),
+            context.editor.editorSpace().outletAt(
+                context.editor.editorSpace().worldPositionAtDisplayCell(display_cell[0], display_cell[1]),
             )
         else
             null;
@@ -2529,10 +2889,8 @@ pub const OutletConnection = struct {
 
     fn updatePreview(self: *OutletConnection, gpa: std.mem.Allocator) !void {
         self.clearPreview(gpa);
-        const mouse_target = if (self.editor.space.outletAt(self.mouse_position)) |outlet|
-            outlet.anchor
-        else
-            self.mouse_position;
+        const hovered = self.editor.editorSpace().outletAt(self.mouse_position);
+        const mouse_target = if (hovered) |outlet| outlet.anchor else self.mouse_position;
         const from = if (self.outlet.direction == .output)
             self.outlet.anchor
         else
@@ -2541,10 +2899,10 @@ pub const OutletConnection = struct {
             mouse_target
         else
             self.outlet.anchor;
-        if (try self.editor.space.previewPath(gpa, from, to)) |path| {
+        if (try self.editor.editorSpace().previewPath(gpa, from, to)) |path| {
             var colored_path = path;
             colored_path.color = if (self.outlet.direction == .output)
-                self.editor.space.nodeColor(self.outlet.node)
+                self.editor.editorSpace().nodeColor(self.outlet.node)
             else
                 Display.Color.curious_blue;
             self.preview_path = colored_path;
@@ -2778,7 +3136,7 @@ pub const OutputMeter = struct {
                 remaining.* = remaining.* -| elapsed_ms;
         }
         const node = self.parameters.node;
-        const sample_tap = dsp.sampleTap(node) orelse return;
+        const sample_tap = dsp.sampleTap(node);
         if (self.reader == null)
             self.reader = sample_tap.queue.reader();
         const reader = &self.reader.?;

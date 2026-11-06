@@ -195,7 +195,6 @@ pub const State = struct {
         AudioError,
         SdlError,
         StateStackOverflow,
-        InvalidVisualNodeIndex,
         InvalidVisualNodeLayout,
         EmptySynthPath,
         InvalidVisualGraph,
@@ -205,6 +204,7 @@ pub const State = struct {
         UnsupportedSynthSchema,
         InvalidSynthDocument,
         InvalidGraphReference,
+        InvalidGroup,
         IoError,
     };
 

@@ -1,15 +1,21 @@
 //! Visual representation of DSP node in unbounded space
 const std = @import("std");
+const assert = std.debug.assert;
 const DSP = @import("DSP.zig");
 const Display = @import("Display.zig");
 
 const Self = @This();
 
+/// Maximum number of nodes a single selection gesture can contain.
+pub const max_selected_nodes = 16;
+
 viewport: Viewport,
 dsp: *DSP,
+/// Determines which DSP nodes this layout exposes to its editor.
+scope: Scope = .root,
 nodes: std.MultiArrayList(VisualNode) = .empty,
 /// Fixed-capacity set of currently selected visual nodes.
-selected_nodes: [16]VisualNode.Index = undefined,
+selected_nodes: [max_selected_nodes]VisualNode.Index = undefined,
 /// Number of valid entries in `selected_nodes`.
 selected_count: u8 = 0,
 graph_north_west: Position = .{ .x = 0, .y = 0 },
@@ -28,6 +34,17 @@ const Viewport = struct {
 };
 
 const Bound = Viewport;
+
+/// Selects the input or output side of a node's displayed ports.
+const PortDirection = enum { input, output };
+
+/// Visual scope rendered by one editor state.
+pub const Scope = union(enum) {
+    /// The complete synth graph, excluding hidden group endpoints.
+    root,
+    /// One group's members and explicit boundary endpoint nodes.
+    group: VisualNode.Index,
+};
 
 pub const SearchBound = struct {
     left: i64,
@@ -86,6 +103,13 @@ pub const Outlet = struct {
 pub fn outletMetadata(self: *Self, outlet: Outlet) DSP.Node.OutletMetadata {
     const state = self.dsp.nodes.items(.state)[outlet.node.idx];
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    if (std.meta.activeTag(state) == .group) {
+        return self.dsp.groupOutletMetadata(outlet.node, switch (outlet.direction) {
+            .input => .input,
+            .output => .output,
+            else => unreachable,
+        }, outlet.port);
+    }
     return switch (outlet.direction) {
         .input => metadata.inputs[outlet.port],
         .output => metadata.outputs[outlet.port],
@@ -140,16 +164,32 @@ fn writeSelectedOutletLabels(
     const screen_left = @as(i64, footprint.x) - @as(i64, self.viewport.x);
     const screen_top = @as(i64, footprint.y) - @as(i64, self.viewport.y);
 
-    for (0..metadata.input_count) |port| {
-        const outlet = metadata.inputs[port];
-        const y = screen_top + self.outletYOffset(footprint, metadata.input_count, port);
+    for (0..DSP.max_outlets) |slot| {
+        const port = self.displayedPortAtSlot(node, .input, slot) orelse continue;
+        const outlet = if (std.meta.activeTag(state) == .group)
+            self.dsp.groupOutletMetadata(node, .input, port)
+        else
+            metadata.inputs[port];
+        const y = screen_top + self.outletYOffset(
+            footprint,
+            self.displayedPortCount(node, .input),
+            slot,
+        );
         const x = screen_left - @as(i64, @intCast(outlet.short_name.len));
         try writeUiText(gpa, display, x, y, outlet.short_name, outlet.color);
     }
 
-    for (0..metadata.output_count) |port| {
-        const outlet = metadata.outputs[port];
-        const y = screen_top + self.outletYOffset(footprint, metadata.output_count, port);
+    for (0..DSP.max_outlets) |slot| {
+        const port = self.displayedPortAtSlot(node, .output, slot) orelse continue;
+        const outlet = if (std.meta.activeTag(state) == .group)
+            self.dsp.groupOutletMetadata(node, .output, port)
+        else
+            metadata.outputs[port];
+        const y = screen_top + self.outletYOffset(
+            footprint,
+            self.displayedPortCount(node, .output),
+            slot,
+        );
         const x = screen_left + @as(i64, @intCast(footprint.width));
         try writeUiText(gpa, display, x, y, outlet.short_name, outlet.color);
     }
@@ -304,8 +344,8 @@ pub fn findFreeGroupOffset(
 
 /// Tests a translated group against existing occupancy and its own footprints.
 fn canPlaceGroupAtI64(self: *Self, nodes: []const VisualNode.Index, offset_x: i64, offset_y: i64) bool {
-    var positions: [16]Position = undefined;
-    var bounds: [16]SearchBound = undefined;
+    var positions: [max_selected_nodes]Position = undefined;
+    var bounds: [max_selected_nodes]SearchBound = undefined;
     for (nodes, 0..) |node, index| {
         const source = self.nodePosition(node);
         const x = @as(i64, source.x) + offset_x;
@@ -440,7 +480,165 @@ pub fn worldPositionAtDisplayCell(self: *Self, cell_x: u32, cell_y: u32) Positio
 
 /// Return the top-left position of a visual node.
 pub fn nodePosition(self: *Self, node: VisualNode.Index) Position {
+    assert(node.idx < self.nodes.len);
     return self.nodes.items(.position)[node.idx];
+}
+
+/// Returns whether a DSP node is a group wrapper.
+pub fn isGroup(self: *const Self, node: VisualNode.Index) bool {
+    assert(node.idx < self.dsp.nodes.len);
+    return std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx]) == .group;
+}
+
+/// Returns whether a DSP node is an explicit group boundary endpoint.
+pub fn isGroupEndpoint(self: *const Self, node: VisualNode.Index) bool {
+    assert(node.idx < self.dsp.nodes.len);
+    const tag = std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx]);
+    return tag == .group_input or tag == .group_output;
+}
+
+/// Returns the group that owns an explicit boundary endpoint.
+pub fn endpointGroup(self: *const Self, node: VisualNode.Index) ?VisualNode.Index {
+    if (!self.isGroupEndpoint(node)) return null;
+    return switch (self.dsp.nodes.items(.state)[node.idx]) {
+        .group_input => |endpoint| endpoint.group,
+        .group_output => |endpoint| endpoint.group,
+        else => null,
+    };
+}
+
+/// Returns the boundary port represented by an explicit endpoint node.
+pub fn endpointPort(self: *const Self, node: VisualNode.Index) ?u8 {
+    if (!self.isGroupEndpoint(node)) return null;
+    return switch (self.dsp.nodes.items(.state)[node.idx]) {
+        .group_input => |endpoint| endpoint.port,
+        .group_output => |endpoint| endpoint.port,
+        else => null,
+    };
+}
+
+/// Returns the number of displayed inputs or outputs for a node.
+fn displayedPortCount(self: *const Self, node: VisualNode.Index, direction: PortDirection) u8 {
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    if (state == .group) {
+        var count: u8 = 0;
+        const bindings = switch (direction) {
+            .input => state.group.input_bindings,
+            .output => state.group.output_bindings,
+        };
+        for (bindings) |binding| {
+            if (binding != null) count += 1;
+        }
+        return count;
+    }
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    return switch (direction) {
+        .input => metadata.input_count,
+        .output => metadata.output_count,
+    };
+}
+
+/// Maps a DSP port number to its compact displayed row, if it is visible.
+fn displayedPortSlot(
+    self: *const Self,
+    node: VisualNode.Index,
+    direction: PortDirection,
+    port: u8,
+) ?usize {
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    if (state != .group) {
+        const count = self.displayedPortCount(node, direction);
+        return if (port < count) port else null;
+    }
+
+    const bindings = switch (direction) {
+        .input => state.group.input_bindings,
+        .output => state.group.output_bindings,
+    };
+    if (port >= DSP.max_outlets or bindings[port] == null) return null;
+
+    var slot: usize = 0;
+    for (bindings[0..port]) |binding| {
+        if (binding != null) slot += 1;
+    }
+    return slot;
+}
+
+/// Maps a compact displayed row back to its DSP port number.
+fn displayedPortAtSlot(
+    self: *const Self,
+    node: VisualNode.Index,
+    direction: PortDirection,
+    slot: usize,
+) ?u8 {
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    if (state != .group) {
+        const count = self.displayedPortCount(node, direction);
+        return if (slot < count) @intCast(slot) else null;
+    }
+
+    const bindings = switch (direction) {
+        .input => state.group.input_bindings,
+        .output => state.group.output_bindings,
+    };
+    var current_slot: usize = 0;
+    for (bindings, 0..) |binding, port| {
+        if (binding == null) continue;
+        if (current_slot == slot) return @intCast(port);
+        current_slot += 1;
+    }
+    return null;
+}
+
+/// Returns the row offset for a node's displayed DSP port.
+fn displayedPortYOffset(
+    self: *const Self,
+    node: VisualNode.Index,
+    footprint: Bound,
+    direction: PortDirection,
+    port: u8,
+) ?i32 {
+    const slot = self.displayedPortSlot(node, direction, port) orelse return null;
+    return self.outletYOffset(footprint, self.displayedPortCount(node, direction), slot);
+}
+
+/// Returns whether a node is outside the current visual scope.
+fn isHiddenNode(self: *const Self, node: VisualNode.Index) bool {
+    return !self.isVisibleNode(node);
+}
+
+/// Returns whether a node belongs to the active visual scope.
+fn isVisibleNode(self: *const Self, node: VisualNode.Index) bool {
+    if (node.isNoop()) return false;
+    assert(node.idx < self.dsp.nodes.len);
+    switch (self.scope) {
+        .root => {
+            if (self.isGroupEndpoint(node)) return false;
+            if (self.isGroup(node)) return true;
+            return self.groupIndexForMember(node) == null;
+        },
+        .group => |group| {
+            if (self.endpointGroup(node)) |owner|
+                return owner.idx == group.idx;
+            if (self.isGroup(node)) return false;
+            const state = self.dsp.nodes.items(.state)[group.idx];
+            if (state != .group) return false;
+            for (state.group.members[0..state.group.member_count]) |member|
+                if (member.idx == node.idx) return true;
+            return false;
+        },
+    }
+}
+
+/// Finds the group containing a member, if any.
+pub fn groupIndexForMember(self: *const Self, member: VisualNode.Index) ?VisualNode.Index {
+    for (self.dsp.nodes.items(.state), 0..) |state, index| {
+        if (state != .group) continue;
+        for (state.group.members[0..state.group.member_count]) |candidate|
+            if (candidate.idx == member.idx)
+                return .{ .idx = index };
+    }
+    return null;
 }
 
 /// Adds one visual node and reserves the cells covered by its footprint.
@@ -450,13 +648,19 @@ pub fn addNode(
     node: DSP.Node.Index,
     position: Position,
 ) !void {
-    if (node.idx != self.nodes.len)
-        return error.InvalidVisualNodeIndex;
+    assert(node.idx == self.nodes.len);
 
     try self.nodes.append(gpa, .{
         .dsp_node = node,
         .position = position,
     });
+
+    // Hidden nodes remain in the index-aligned visual array, but do not take
+    // up layout space in this scope. Group wrappers and endpoints are also
+    // positioned by the enclosing layout and are checked during the complete
+    // occupancy rebuild.
+    if (!node.isNoop() and
+        (self.isHiddenNode(node) or self.isGroup(node) or self.isGroupEndpoint(node))) return;
 
     const footprint = if (node.isNoop()) null else self.nodeFootprint(node);
     if (footprint) |bounds| {
@@ -524,7 +728,8 @@ pub fn isSelected(self: *const Self, node: VisualNode.Index) bool {
 pub fn selectSingle(self: *Self, node: ?VisualNode.Index) void {
     self.clearSelection();
     if (node) |value| {
-        if (!value.isNoop() and value.idx < self.nodes.len) {
+        if (!value.isNoop()) {
+            assert(value.idx < self.nodes.len);
             self.selected_nodes[0] = value;
             self.selected_count = 1;
         }
@@ -534,7 +739,8 @@ pub fn selectSingle(self: *Self, node: ?VisualNode.Index) void {
 /// Adds or removes a node from the selection while keeping the output node
 /// out of multi-selections.
 pub fn toggleSelection(self: *Self, node: VisualNode.Index) void {
-    if (node.isNoop() or node.idx >= self.nodes.len) return;
+    if (node.isNoop()) return;
+    assert(node.idx < self.nodes.len);
 
     if (self.isSelected(node)) {
         var index: usize = 0;
@@ -576,7 +782,7 @@ pub fn selectRectangle(self: *Self, anchor: Position, endpoint: Position) void {
     var output: ?VisualNode.Index = null;
 
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
+        if (node.isNoop() or self.isHiddenNode(.{ .idx = node_index })) continue;
         const visual_node = VisualNode.Index{ .idx = node_index };
         const footprint = self.nodeFootprint(visual_node);
         const intersects = @as(i64, footprint.x) < right and
@@ -622,15 +828,17 @@ pub fn moveNode(
 }
 
 /// Moves every selected node by one shared delta and rolls back atomically if
-/// the resulting group collides with another node or leaves the integer space.
+/// the selection collides with another node or leaves the integer space.
 pub fn moveSelectedNodes(self: *Self, gpa: std.mem.Allocator, delta: Position) !bool {
     if (self.selected_count == 0 or (delta.x == 0 and delta.y == 0)) return false;
 
-    var previous: [16]Position = undefined;
-    for (self.selected_nodes[0..self.selected_count], 0..) |node, index|
+    const moving = self.selected_nodes[0..self.selected_count];
+
+    var previous: [max_selected_nodes]Position = undefined;
+    for (moving, 0..) |node, index|
         previous[index] = self.nodePosition(node);
 
-    for (self.selected_nodes[0..self.selected_count], 0..) |node, index| {
+    for (moving, 0..) |node, index| {
         const x = @addWithOverflow(previous[index].x, delta.x);
         const y = @addWithOverflow(previous[index].y, delta.y);
         if (x[1] != 0 or y[1] != 0) return false;
@@ -643,7 +851,7 @@ pub fn moveSelectedNodes(self: *Self, gpa: std.mem.Allocator, delta: Position) !
     self.updateGraphBounds();
     if (try self.rebuildOccupancy(gpa)) return true;
 
-    for (self.selected_nodes[0..self.selected_count], 0..) |node, index|
+    for (moving, 0..) |node, index|
         self.nodes.items(.position)[node.idx] = previous[index];
     self.updateGraphBounds();
     _ = try self.rebuildOccupancy(gpa);
@@ -663,7 +871,7 @@ pub fn updateGraphBounds(self: *Self) void {
     var found_node = false;
 
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
+        if (node.isNoop() or self.isHiddenNode(.{ .idx = node_index })) continue;
         const position = self.nodes.items(.position)[node_index];
         north_west.x = @min(north_west.x, position.x);
         north_west.y = @min(north_west.y, position.y);
@@ -725,8 +933,8 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
 
 /// Removes a visual node and rebuilds the spatial and routing state.
 pub fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
-    if (node.isNoop() or node.idx >= self.nodes.len)
-        return;
+    assert(!node.isNoop());
+    assert(node.idx < self.nodes.len);
 
     self.clearPaths(gpa);
     self.path_occupied.clearRetainingCapacity();
@@ -762,12 +970,20 @@ pub fn write(
     gpa: std.mem.Allocator,
     display: *Display,
 ) !void {
-    for (self.nodes.items(.dsp_node)) |node|
-        if (!node.isNoop())
-            try self.writeNode(gpa, display, node);
+    // Draw groups before ordinary nodes so their selection outline remains stable.
+    for (self.nodes.items(.dsp_node), 0..) |node, index| {
+        if (node.isNoop() or !self.isGroup(.{ .idx = index }) or
+            self.isHiddenNode(.{ .idx = index })) continue;
+        try self.writeNode(gpa, display, node);
+    }
+    for (self.nodes.items(.dsp_node), 0..) |node, index| {
+        if (node.isNoop() or self.isGroup(.{ .idx = index }) or
+            self.isHiddenNode(.{ .idx = index })) continue;
+        try self.writeNode(gpa, display, node);
+    }
 
     for (self.selected_nodes[0..self.selected_count]) |node| {
-        if (!node.isNoop() and node.idx < self.nodes.len) {
+        if (!node.isNoop() and !self.isHiddenNode(node)) {
             try self.writeNodeBody(gpa, display, node, .ebony);
             try self.writeOutgoingPaths(gpa, display, node, .ebony);
         }
@@ -804,8 +1020,10 @@ pub fn writeSelectionMarquee(
 
 /// Draws the fixed external-audio marker beyond the configured output node.
 fn writeOutputTail(self: *Self, gpa: std.mem.Allocator, display: *Display) !void {
+    if (self.scope != .root) return;
     const output = self.dsp.output;
-    if (output.isNoop() or output.idx >= self.nodes.len) return;
+    if (output.isNoop()) return;
+    assert(output.idx < self.nodes.len);
 
     const footprint = self.nodeFootprint(output);
     const state = self.dsp.nodes.items(.state)[output.idx];
@@ -857,6 +1075,7 @@ fn writeNodeBody(
     node: VisualNode.Index,
     background: Display.Color,
 ) !void {
+    if (self.isHiddenNode(node)) return;
     const footprint = self.nodeFootprint(node);
     if (!self.intersectsViewport(footprint)) return;
 
@@ -868,7 +1087,6 @@ fn writeNodeBody(
     const content_width = footprint.width - 2;
     const node_color = self.nodeColor(node);
 
-    // Clear the complete footprint first, clipping cells outside the display.
     for (0..footprint.width) |dx| {
         for (0..footprint.height) |dy| {
             const cell_x = x + @as(i64, @intCast(dx));
@@ -921,10 +1139,22 @@ fn writeNodeBody(
             try display.write(gpa, &glyph, @intCast(character_x), @intCast(name_y), background, .white);
     }
 
+    if (self.isGroup(node)) {
+        const marker = [_]u8{'+'};
+        const marker_x = x + @as(i64, @intCast(footprint.width - 2));
+        if (marker_x >= 0 and y >= 0)
+            try display.write(gpa, &marker, @intCast(marker_x), @intCast(y), background, .white);
+    }
+
     const outlet = [_]u8{0x09};
     const inputs = self.dsp.nodes.items(.inputs)[node.idx];
-    for (0..metadata.input_count) |port| {
-        const outlet_y = y + @as(i64, @intCast(self.outletYOffset(footprint, metadata.input_count, port)));
+    for (0..DSP.max_outlets) |slot| {
+        const port = self.displayedPortAtSlot(node, .input, slot) orelse continue;
+        const outlet_y = y + @as(i64, @intCast(self.outletYOffset(
+            footprint,
+            self.displayedPortCount(node, .input),
+            slot,
+        )));
         const color = if (!self.isOutputReachable(node) or inputs[port].isNoop())
             Display.Color.gray
         else
@@ -933,8 +1163,13 @@ fn writeNodeBody(
             try display.write(gpa, &outlet, @intCast(x), @intCast(outlet_y), background, color);
     }
 
-    for (0..metadata.output_count) |port| {
-        const outlet_y = y + @as(i64, @intCast(self.outletYOffset(footprint, metadata.output_count, port)));
+    for (0..DSP.max_outlets) |slot| {
+        const port = self.displayedPortAtSlot(node, .output, slot) orelse continue;
+        const outlet_y = y + @as(i64, @intCast(self.outletYOffset(
+            footprint,
+            self.displayedPortCount(node, .output),
+            slot,
+        )));
         const color = if (self.isOutputReachable(node) and
             self.dsp.nodes.items(.output_connected)[node.idx][port])
             Display.Color.green
@@ -1151,7 +1386,10 @@ fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Boun
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
 
     const outlet_count = @max(
-        @max(metadata.input_count, metadata.output_count),
+        @max(
+            self.displayedPortCount(node, .input),
+            self.displayedPortCount(node, .output),
+        ),
         @as(u8, 1),
     );
     const label_width = self.dsp.nodes.items(.name)[node.idx].len + 4;
@@ -1178,7 +1416,7 @@ pub fn nodeColor(self: *Self, node: VisualNode.Index) Display.Color {
     return DSP.node_metadata.get(std.meta.activeTag(state)).color;
 }
 
-fn outletYOffset(_: *Self, footprint: Bound, outlet_count: u8, port: usize) i32 {
+fn outletYOffset(_: *const Self, footprint: Bound, outlet_count: u8, port: usize) i32 {
     if (outlet_count == 1)
         return @intCast(footprint.height / 2);
     return 1 + @as(i32, @intCast(port * 2));
@@ -1186,8 +1424,10 @@ fn outletYOffset(_: *Self, footprint: Bound, outlet_count: u8, port: usize) i32 
 
 /// Return the node whose actual footprint contains a world-space position.
 pub fn nodeAt(self: *Self, position: Position) ?VisualNode.Index {
+    // Group members sit behind their enclosing group in the root view.
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
+        if (node.isNoop() or self.isGroup(.{ .idx = node_index }) or
+            self.isHiddenNode(.{ .idx = node_index })) continue;
 
         const footprint = self.nodeFootprint(.{ .idx = node_index });
         const x = @as(i64, position.x);
@@ -1200,21 +1440,39 @@ pub fn nodeAt(self: *Self, position: Position) ?VisualNode.Index {
             return .{ .idx = node_index };
     }
 
+    for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
+        if (node.isNoop() or !self.isGroup(.{ .idx = node_index }) or
+            self.isHiddenNode(.{ .idx = node_index })) continue;
+        const footprint = self.nodeFootprint(.{ .idx = node_index });
+        const x = @as(i64, position.x);
+        const y = @as(i64, position.y);
+        if (x >= footprint.x and
+            x < @as(i64, footprint.x) + @as(i64, footprint.width) and
+            y >= footprint.y and
+            y < @as(i64, footprint.y) + @as(i64, footprint.height))
+            return .{ .idx = node_index };
+    }
+
     return null;
 }
 
 /// Return the outlet glyph at a world-space position, if any.
 pub fn outletAt(self: *Self, position: Position) ?Outlet {
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
+        if (node.isNoop() or self.isHiddenNode(.{ .idx = node_index })) continue;
 
         const visual_node = VisualNode.Index{ .idx = node_index };
         const footprint = self.nodeFootprint(visual_node);
         const state = self.dsp.nodes.items(.state)[node_index];
         const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
 
-        for (0..metadata.input_count) |port| {
-            const y = footprint.y + self.outletYOffset(footprint, metadata.input_count, port);
+        for (0..DSP.max_outlets) |slot| {
+            const port = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
+            const y = footprint.y + self.outletYOffset(
+                footprint,
+                self.displayedPortCount(visual_node, .input),
+                slot,
+            );
             if (position.x == footprint.x and position.y == y)
                 return .{
                     .node = visual_node,
@@ -1224,8 +1482,13 @@ pub fn outletAt(self: *Self, position: Position) ?Outlet {
                 };
         }
 
-        for (0..metadata.output_count) |port| {
-            const y = footprint.y + self.outletYOffset(footprint, metadata.output_count, port);
+        for (0..DSP.max_outlets) |slot| {
+            const port = self.displayedPortAtSlot(visual_node, .output, slot) orelse continue;
+            const y = footprint.y + self.outletYOffset(
+                footprint,
+                self.displayedPortCount(visual_node, .output),
+                slot,
+            );
             if (position.x == footprint.x + @as(i32, @intCast(footprint.width - 1)) and
                 position.y == y)
                 return .{
@@ -1273,9 +1536,9 @@ pub fn rebuildOccupancy(self: *Self, gpa: std.mem.Allocator) !bool {
     self.occupied.clearRetainingCapacity();
 
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
-
         const visual_node = VisualNode.Index{ .idx = node_index };
+        if (node.isNoop() or self.isHiddenNode(visual_node)) continue;
+
         const footprint = self.nodeFootprint(visual_node);
         for (0..footprint.width) |dx| {
             for (0..footprint.height) |dy| {
@@ -1290,24 +1553,34 @@ pub fn rebuildOccupancy(self: *Self, gpa: std.mem.Allocator) !bool {
     }
 
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
-
         const visual_node = VisualNode.Index{ .idx = node_index };
+        if (node.isNoop() or self.isHiddenNode(visual_node)) continue;
+
         const footprint = self.nodeFootprint(visual_node);
         const state = self.dsp.nodes.items(.state)[node_index];
         const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
 
-        for (0..metadata.input_count) |port| {
-            const y = footprint.y + self.outletYOffset(footprint, metadata.input_count, port);
+        for (0..DSP.max_outlets) |slot| {
+            _ = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
+            const y = footprint.y + self.outletYOffset(
+                footprint,
+                self.displayedPortCount(visual_node, .input),
+                slot,
+            );
             if (!try self.tryOccupyLinkAnchor(gpa, .{ .x = footprint.x - 2, .y = y }, node) or
                 !try self.tryOccupyLinkAnchor(gpa, .{ .x = footprint.x - 1, .y = y }, node))
                 return false;
         }
 
-        for (0..metadata.output_count) |port| {
+        for (0..DSP.max_outlets) |slot| {
+            _ = self.displayedPortAtSlot(visual_node, .output, slot) orelse continue;
             if (!try self.tryOccupyLinkAnchor(gpa, .{
                 .x = footprint.x + @as(i32, @intCast(footprint.width)),
-                .y = footprint.y + self.outletYOffset(footprint, metadata.output_count, port),
+                .y = footprint.y + self.outletYOffset(
+                    footprint,
+                    self.displayedPortCount(visual_node, .output),
+                    slot,
+                ),
             }, node)) return false;
         }
 
@@ -1331,15 +1604,20 @@ pub fn rebuildOccupancy(self: *Self, gpa: std.mem.Allocator) !bool {
 /// Other links must route around these cells so they cannot overwrite ports.
 pub fn occupyLinkAnchors(self: *Self, gpa: std.mem.Allocator) !void {
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
-
         const visual_node = VisualNode.Index{ .idx = node_index };
+        if (node.isNoop() or self.isHiddenNode(visual_node)) continue;
+
         const footprint = self.nodeFootprint(visual_node);
         const state = self.dsp.nodes.items(.state)[node_index];
         const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
 
-        for (0..metadata.input_count) |port| {
-            const y = footprint.y + self.outletYOffset(footprint, metadata.input_count, port);
+        for (0..DSP.max_outlets) |slot| {
+            _ = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
+            const y = footprint.y + self.outletYOffset(
+                footprint,
+                self.displayedPortCount(visual_node, .input),
+                slot,
+            );
             try self.occupyLinkAnchor(gpa, .{
                 .x = footprint.x - 2,
                 .y = y,
@@ -1350,10 +1628,15 @@ pub fn occupyLinkAnchors(self: *Self, gpa: std.mem.Allocator) !void {
             }, node);
         }
 
-        for (0..metadata.output_count) |port| {
+        for (0..DSP.max_outlets) |slot| {
+            _ = self.displayedPortAtSlot(visual_node, .output, slot) orelse continue;
             try self.occupyLinkAnchor(gpa, .{
                 .x = footprint.x + @as(i32, @intCast(footprint.width)),
-                .y = footprint.y + self.outletYOffset(footprint, metadata.output_count, port),
+                .y = footprint.y + self.outletYOffset(
+                    footprint,
+                    self.displayedPortCount(visual_node, .output),
+                    slot,
+                ),
             }, node);
         }
 
@@ -1373,9 +1656,9 @@ pub fn occupyLinkAnchors(self: *Self, gpa: std.mem.Allocator) !void {
 /// Reserves one routing-clearance cell around every node footprint.
 pub fn occupyNodeMargins(self: *Self, gpa: std.mem.Allocator) !void {
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
-        if (node.isNoop()) continue;
-
         const visual_node = VisualNode.Index{ .idx = node_index };
+        if (node.isNoop() or self.isHiddenNode(visual_node)) continue;
+
         const footprint = self.nodeFootprint(visual_node);
         const right = footprint.x + @as(i32, @intCast(footprint.width));
         const bottom = footprint.y + @as(i32, @intCast(footprint.height));
@@ -1451,23 +1734,29 @@ pub fn computePaths(self: *Self, gpa: std.mem.Allocator) !void {
     const inputs = self.dsp.nodes.items(.inputs);
     for (inputs, 0..) |node_inputs, node_index| {
         const node = VisualNode.Index{ .idx = node_index };
+        if (node.isNoop() or self.isHiddenNode(node)) continue;
         const state = self.dsp.nodes.items(.state)[node_index];
         const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
 
         for (0..metadata.input_count) |input_port| {
-            _ = node_inputs;
+            const connection = node_inputs[input_port];
+            if (connection.isNoop() or self.isHiddenNode(connection.node)) continue;
             try self.computePathForInput(gpa, node, input_port, bound);
         }
     }
 
     for (self.dsp.nodes.items(.parameter_link), 0..) |link, node_index| {
-        if (link.source) |source|
+        const target = VisualNode.Index{ .idx = node_index };
+        if (self.isHiddenNode(target)) continue;
+        if (link.source) |source| {
+            if (self.isHiddenNode(source)) continue;
             try self.computePathForParameter(
                 gpa,
                 source,
-                .{ .idx = node_index },
+                target,
                 bound,
             );
+        }
     }
 
     try self.addPathJunctions(gpa);
@@ -1479,7 +1768,7 @@ fn computeOutputReachability(self: *Self) void {
     const output_reachable = self.nodes.items(.output_reachable);
     @memset(output_reachable, false);
 
-    if (self.dsp.output.idx >= node_count) return;
+    assert(self.dsp.output.idx < node_count);
     output_reachable[self.dsp.output.idx] = true;
 
     // Repeatedly propagate reachability from destinations to their sources.
@@ -1489,11 +1778,35 @@ fn computeOutputReachability(self: *Self) void {
         changed = false;
         for (self.dsp.nodes.items(.inputs), 0..) |node_inputs, destination_idx| {
             if (!output_reachable[destination_idx]) continue;
+            const destination_state = self.dsp.nodes.items(.state)[destination_idx];
+            if (destination_state == .group) {
+                for (destination_state.group.output_bindings) |binding| {
+                    const child = binding orelse continue;
+                    assert(child.node.idx < node_count);
+                    if (!output_reachable[child.node.idx]) {
+                        output_reachable[child.node.idx] = true;
+                        changed = true;
+                    }
+                }
+            }
             for (node_inputs) |connection| {
-                if (connection.isNoop() or connection.node.idx >= node_count) continue;
+                if (connection.isNoop()) continue;
+                assert(connection.node.idx < node_count);
                 if (output_reachable[connection.node.idx]) continue;
                 output_reachable[connection.node.idx] = true;
                 changed = true;
+            }
+        }
+
+        for (self.dsp.nodes.items(.state), 0..) |state, group_index| {
+            if (state != .group or !output_reachable[group_index]) continue;
+            for (self.dsp.nodes.items(.inputs)[group_index]) |connection| {
+                if (connection.isNoop()) continue;
+                assert(connection.node.idx < node_count);
+                if (!output_reachable[connection.node.idx]) {
+                    output_reachable[connection.node.idx] = true;
+                    changed = true;
+                }
             }
         }
     }
@@ -1512,25 +1825,25 @@ fn computePathForInput(
     const source = connection.node;
     const from_footprint = self.nodeFootprint(source);
     const to_footprint = self.nodeFootprint(destination);
-    const source_state = self.dsp.nodes.items(.state)[source.idx];
-    const source_metadata = DSP.node_metadata.get(std.meta.activeTag(source_state));
-    const destination_state = self.dsp.nodes.items(.state)[destination.idx];
-    const destination_metadata = DSP.node_metadata.get(std.meta.activeTag(destination_state));
+    const source_y = self.displayedPortYOffset(
+        source,
+        from_footprint,
+        .output,
+        connection.output_port,
+    ) orelse return;
+    const destination_y = self.displayedPortYOffset(
+        destination,
+        to_footprint,
+        .input,
+        @intCast(input_port),
+    ) orelse return;
     const from = Position{
         .x = from_footprint.x + @as(i32, @intCast(from_footprint.width)),
-        .y = from_footprint.y + self.outletYOffset(
-            from_footprint,
-            source_metadata.output_count,
-            connection.output_port,
-        ),
+        .y = from_footprint.y + source_y,
     };
     const to = Position{
         .x = to_footprint.x - 2,
-        .y = to_footprint.y + self.outletYOffset(
-            to_footprint,
-            destination_metadata.input_count,
-            input_port,
-        ),
+        .y = to_footprint.y + destination_y,
     };
 
     self.astar.reset();
@@ -1598,10 +1911,12 @@ pub fn recomputePathsForNode(self: *Self, gpa: std.mem.Allocator, node: VisualNo
 
     for (self.dsp.nodes.items(.inputs), 0..) |node_inputs, destination_index| {
         const destination = VisualNode.Index{ .idx = destination_index };
+        if (destination.isNoop() or self.isHiddenNode(destination)) continue;
         const state = self.dsp.nodes.items(.state)[destination_index];
         const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
         for (0..metadata.input_count) |input_port| {
             const connection = node_inputs[input_port];
+            if (connection.isNoop() or self.isHiddenNode(connection.node)) continue;
             if (destination_index == node.idx or
                 (!connection.isNoop() and connection.node.idx == node.idx))
                 try self.computePathForInput(gpa, destination, input_port, bound);
@@ -1609,14 +1924,18 @@ pub fn recomputePathsForNode(self: *Self, gpa: std.mem.Allocator, node: VisualNo
     }
 
     for (self.dsp.nodes.items(.parameter_link), 0..) |link, destination_index| {
-        if (link.source) |source|
+        const destination = VisualNode.Index{ .idx = destination_index };
+        if (self.isHiddenNode(destination)) continue;
+        if (link.source) |source| {
+            if (self.isHiddenNode(source)) continue;
             if (destination_index == node.idx or source.idx == node.idx)
                 try self.computePathForParameter(
                     gpa,
                     source,
-                    .{ .idx = destination_index },
+                    destination,
                     bound,
                 );
+        }
     }
 
     try self.addPathJunctions(gpa);

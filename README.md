@@ -22,8 +22,6 @@ and effects to be composed into a real-time sound pipeline.
 
 ## TODO
 
-- ability to group nodes under a meta-node with: that node combines the input of the leaf of that subtree and the outputs of the root
-- copy-paste nodes
 - color picker for nodes
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for

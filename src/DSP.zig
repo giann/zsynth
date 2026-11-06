@@ -16,6 +16,10 @@ pub const sample_rate = 48_000;
 pub const block_size = 256;
 /// Maximum number of input or output ports exposed by a node.
 pub const max_outlets = 8;
+/// Maximum number of ordinary nodes that one non-nested group may contain.
+pub const max_group_members = 16;
+/// Errors returned while constructing a group's fixed endpoint nodes.
+pub const GroupEndpointError = error{ OutOfMemory, InvalidGroup };
 /// Number of rendered blocks retained by each node's SampleTap.
 pub const sample_tap_capacity = 64;
 
@@ -148,6 +152,9 @@ pub fn plug(
     self.lockGraph();
     defer self.unlockGraph();
 
+    assert(source.idx < self.nodes.len);
+    assert(destination.idx < self.nodes.len);
+
     // Validate both ends before replacing the destination connection.
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[source.idx]);
     const source_metadata = node_metadata.get(source_tag);
@@ -165,15 +172,17 @@ pub fn plug(
         previous.output_port == source_output_port;
     assert(replacing_same_connection or !output_connected[source.idx][source_output_port]);
 
-    if (!previous.isNoop()) {
+    if (!previous.isNoop())
         output_connected[previous.node.idx][previous.output_port] = false;
-    }
 
     inputs[destination.idx][destination_port] = .{
         .node = source,
         .output_port = source_output_port,
     };
     output_connected[source.idx][source_output_port] = true;
+
+    if (std.meta.activeTag(self.nodes.items(.state)[destination.idx]) == .group)
+        self.syncGroupInputLocked(destination, destination_port);
 }
 
 /// Disconnects the edge feeding one input port.
@@ -181,8 +190,8 @@ pub fn disconnectInput(self: *DSP, destination: Node.Index, destination_port: u8
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (destination.idx >= self.nodes.len or destination_port >= max_outlets)
-        return;
+    assert(destination.idx < self.nodes.len);
+    assert(destination_port < max_outlets);
 
     const inputs = self.nodes.items(.inputs);
     const output_connected = self.nodes.items(.output_connected);
@@ -190,6 +199,9 @@ pub fn disconnectInput(self: *DSP, destination: Node.Index, destination_port: u8
     if (!previous.isNoop())
         output_connected[previous.node.idx][previous.output_port] = false;
     inputs[destination.idx][destination_port] = .{};
+
+    if (std.meta.activeTag(self.nodes.items(.state)[destination.idx]) == .group)
+        self.syncGroupInputLocked(destination, destination_port);
 }
 
 /// Disconnects every edge leaving one output port.
@@ -197,19 +209,201 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (source.idx >= self.nodes.len or source_output_port >= max_outlets)
-        return;
+    assert(source.idx < self.nodes.len);
+    assert(source_output_port < max_outlets);
 
     const inputs = self.nodes.items(.inputs);
-    for (inputs) |*node_inputs| {
-        for (node_inputs) |*connection| {
+    for (inputs, 0..) |*node_inputs, destination_idx| {
+        for (node_inputs, 0..) |*connection, destination_port| {
             if (!connection.isNoop() and
                 connection.node.idx == source.idx and
                 connection.output_port == source_output_port)
+            {
                 connection.* = .{};
+                if (std.meta.activeTag(self.nodes.items(.state)[destination_idx]) == .group)
+                    self.syncGroupInputLocked(.{ .idx = destination_idx }, @intCast(destination_port));
+            }
         }
     }
     self.nodes.items(.output_connected)[source.idx][source_output_port] = false;
+}
+
+/// Returns whether an index identifies a valid group with the requested port.
+fn validGroupPortLocked(self: *DSP, group: Node.Index, port: u8, _: bool) bool {
+    assert(group.idx < self.nodes.len);
+    assert(port < max_outlets);
+    return std.meta.activeTag(self.nodes.items(.state)[group.idx]) == .group;
+}
+
+/// Returns whether a node is a member with a valid input or output port.
+fn validGroupMemberPortLocked(
+    self: *DSP,
+    group: Node.Index,
+    member: Node.Index,
+    port: u8,
+    input: bool,
+) bool {
+    assert(group.idx < self.nodes.len);
+    assert(member.idx < self.nodes.len);
+    assert(port < max_outlets);
+    if (group.idx == member.idx) return false;
+    const group_state = self.nodes.items(.state)[group.idx];
+    if (group_state != .group) return false;
+    var is_member = false;
+    for (group_state.group.members[0..group_state.group.member_count]) |candidate| {
+        if (candidate.idx == member.idx) {
+            is_member = true;
+            break;
+        }
+    }
+    if (!is_member or std.meta.activeTag(self.nodes.items(.state)[member.idx]) == .group)
+        return false;
+    const metadata = node_metadata.get(std.meta.activeTag(self.nodes.items(.state)[member.idx]));
+    return port < if (input) metadata.input_count else metadata.output_count;
+}
+
+/// Clears a group input binding and disconnects its child proxy connection.
+fn clearGroupInputBindingLocked(self: *DSP, group: Node.Index, group_port: u8) void {
+    const group_state = &self.nodes.items(.state)[group.idx].group;
+    const binding = group_state.input_bindings[group_port] orelse return;
+    assert(binding.node.idx < self.nodes.len);
+    const child_input = &self.nodes.items(.inputs)[binding.node.idx][binding.port];
+    if (!child_input.isNoop() and
+        child_input.node.idx == group_state.input_nodes[group_port].idx and
+        child_input.output_port == 0)
+    {
+        child_input.* = .{};
+        if (!group_state.input_nodes[group_port].isNoop())
+            self.nodes.items(.output_connected)[group_state.input_nodes[group_port].idx][0] = false;
+    }
+    group_state.input_bindings[group_port] = null;
+}
+
+/// Mirrors a bound group input into its child input proxy.
+fn syncGroupInputLocked(self: *DSP, group: Node.Index, group_port: u8) void {
+    const group_state = &self.nodes.items(.state)[group.idx].group;
+    const binding = group_state.input_bindings[group_port] orelse return;
+    assert(binding.node.idx < self.nodes.len);
+
+    const child_input = &self.nodes.items(.inputs)[binding.node.idx][binding.port];
+    if (!child_input.isNoop())
+        self.nodes.items(.output_connected)[child_input.node.idx][child_input.output_port] = false;
+    child_input.* = .{
+        .node = group_state.input_nodes[group_port],
+        .output_port = 0,
+    };
+    self.nodes.items(.output_connected)[group_state.input_nodes[group_port].idx][0] = true;
+}
+
+/// Binds one group input to one member input and replaces the member's current source.
+pub fn bindGroupInput(
+    self: *DSP,
+    group: Node.Index,
+    group_port: u8,
+    member: Node.Index,
+    member_port: u8,
+) bool {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (!self.validGroupPortLocked(group, group_port, false) or
+        !self.validGroupMemberPortLocked(group, member, member_port, true))
+        return false;
+
+    self.clearGroupInputBindingLocked(group, group_port);
+    self.nodes.items(.state)[group.idx].group.input_bindings[group_port] = .{
+        .node = member,
+        .port = member_port,
+    };
+    self.syncGroupInputLocked(group, group_port);
+    return true;
+}
+
+/// Binds one group output to one member output, replacing the old binding.
+pub fn bindGroupOutput(
+    self: *DSP,
+    group: Node.Index,
+    group_port: u8,
+    member: Node.Index,
+    member_port: u8,
+) bool {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (!self.validGroupPortLocked(group, group_port, true) or
+        !self.validGroupMemberPortLocked(group, member, member_port, false))
+        return false;
+
+    const group_state = &self.nodes.items(.state)[group.idx].group;
+    const endpoint = group_state.output_nodes[group_port];
+    if (!endpoint.isNoop()) {
+        const previous_input = &self.nodes.items(.inputs)[endpoint.idx][0];
+        if (!previous_input.isNoop())
+            self.nodes.items(.output_connected)[previous_input.node.idx][previous_input.output_port] = false;
+        previous_input.* = .{};
+    }
+    group_state.output_bindings[group_port] = .{
+        .node = member,
+        .port = member_port,
+    };
+    if (!endpoint.isNoop()) {
+        self.nodes.items(.inputs)[endpoint.idx][0] = .{
+            .node = member,
+            .output_port = member_port,
+        };
+        self.nodes.items(.output_connected)[member.idx][member_port] = true;
+    }
+    return true;
+}
+
+/// Removes a group input binding while leaving its external group connection intact.
+pub fn unbindGroupInput(self: *DSP, group: Node.Index, group_port: u8) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+    if (!self.validGroupPortLocked(group, group_port, false)) return;
+    self.clearGroupInputBindingLocked(group, group_port);
+}
+
+/// Removes a group output binding while leaving its external group connection intact.
+pub fn unbindGroupOutput(self: *DSP, group: Node.Index, group_port: u8) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+    if (!self.validGroupPortLocked(group, group_port, true)) return;
+    const group_state = &self.nodes.items(.state)[group.idx].group;
+    const endpoint = group_state.output_nodes[group_port];
+    if (!endpoint.isNoop()) {
+        const previous = self.nodes.items(.inputs)[endpoint.idx][0];
+        if (!previous.isNoop())
+            self.nodes.items(.output_connected)[previous.node.idx][previous.output_port] = false;
+        self.nodes.items(.inputs)[endpoint.idx][0] = .{};
+    }
+    group_state.output_bindings[group_port] = null;
+}
+
+/// Returns the child port metadata currently exposed by a group port.
+pub fn groupOutletMetadata(
+    self: *const DSP,
+    group: Node.Index,
+    direction: enum { input, output },
+    port: u8,
+) Node.OutletMetadata {
+    assert(group.idx < self.nodes.len);
+    assert(port < max_outlets);
+    const state = self.nodes.items(.state)[group.idx];
+    if (state != .group) return .{};
+    const binding = switch (direction) {
+        .input => state.group.input_bindings[port],
+        .output => state.group.output_bindings[port],
+    } orelse return switch (direction) {
+        .input => .{ .name = "group input", .short_name = "in", .color = .gray },
+        .output => .{ .name = "group output", .short_name = "out", .color = .gray },
+    };
+    assert(binding.node.idx < self.nodes.len);
+    const metadata = node_metadata.get(std.meta.activeTag(self.nodes.items(.state)[binding.node.idx]));
+    return switch (direction) {
+        .input => metadata.inputs[binding.port],
+        .output => metadata.outputs[binding.port],
+    };
 }
 
 /// Connects one node's parameter source to another node's parameter target.
@@ -220,10 +414,11 @@ pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (source.isNoop() or target.isNoop() or
-        source.idx >= self.nodes.len or target.idx >= self.nodes.len or
-        source.idx == target.idx)
-        return false;
+    assert(!source.isNoop());
+    assert(!target.isNoop());
+    assert(source.idx < self.nodes.len);
+    assert(target.idx < self.nodes.len);
+    if (source.idx == target.idx) return false;
 
     const states = self.nodes.items(.state);
     const source_state = states[source.idx];
@@ -236,19 +431,19 @@ pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
     // Walking toward the root source detects whether this link would close a cycle.
     var ancestor = source;
     while (self.nodes.items(.parameter_link)[ancestor.idx].source) |next| {
-        if (next.idx >= self.nodes.len or next.idx == target.idx)
-            return false;
+        assert(next.idx < self.nodes.len);
+        if (next.idx == target.idx) return false;
         ancestor = next;
     }
 
     const links = self.nodes.items(.parameter_link);
     if (links[target.idx].source) |previous_source| {
-        if (previous_source.idx < self.nodes.len)
-            links[previous_source.idx].target = null;
+        assert(previous_source.idx < self.nodes.len);
+        links[previous_source.idx].target = null;
     }
     if (links[source.idx].target) |previous_target| {
-        if (previous_target.idx < self.nodes.len)
-            links[previous_target.idx].source = null;
+        assert(previous_target.idx < self.nodes.len);
+        links[previous_target.idx].source = null;
     }
 
     links[source.idx].target = target;
@@ -261,11 +456,11 @@ pub fn disconnectParameterSource(self: *DSP, target: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (target.idx >= self.nodes.len) return;
+    assert(target.idx < self.nodes.len);
     const links = self.nodes.items(.parameter_link);
     if (links[target.idx].source) |source| {
-        if (source.idx < self.nodes.len)
-            links[source.idx].target = null;
+        assert(source.idx < self.nodes.len);
+        links[source.idx].target = null;
         links[target.idx].source = null;
     }
 }
@@ -275,11 +470,11 @@ pub fn disconnectParameterTarget(self: *DSP, source: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (source.idx >= self.nodes.len) return;
+    assert(source.idx < self.nodes.len);
     const links = self.nodes.items(.parameter_link);
     if (links[source.idx].target) |target| {
-        if (target.idx < self.nodes.len)
-            links[target.idx].source = null;
+        assert(target.idx < self.nodes.len);
+        links[target.idx].source = null;
         links[source.idx].target = null;
     }
 }
@@ -289,8 +484,8 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (node.isNoop() or node.idx >= self.nodes.len)
-        return;
+    assert(!node.isNoop());
+    assert(node.idx < self.nodes.len);
 
     const last_index = self.nodes.len - 1;
     const removing_output = self.output.idx == node.idx;
@@ -299,12 +494,12 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     // node's indices after swapRemove below.
     const links = self.nodes.items(.parameter_link);
     if (links[node.idx].source) |source| {
-        if (source.idx < self.nodes.len)
-            links[source.idx].target = null;
+        assert(source.idx < self.nodes.len);
+        links[source.idx].target = null;
     }
     if (links[node.idx].target) |target| {
-        if (target.idx < self.nodes.len)
-            links[target.idx].source = null;
+        assert(target.idx < self.nodes.len);
+        links[target.idx].source = null;
     }
 
     // Unplug every input owned by the removed node.
@@ -317,10 +512,12 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
 
     // Remove every edge whose source is the node being removed.
     const inputs = self.nodes.items(.inputs);
-    for (inputs) |*node_inputs| {
-        for (node_inputs) |*connection| {
+    for (inputs, 0..) |*node_inputs, destination_idx| {
+        for (node_inputs, 0..) |*connection, destination_port| {
             if (connection.node.idx == node.idx) {
                 connection.* = .{};
+                if (std.meta.activeTag(self.nodes.items(.state)[destination_idx]) == .group)
+                    self.syncGroupInputLocked(.{ .idx = destination_idx }, @intCast(destination_port));
             }
         }
     }
@@ -353,7 +550,109 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
                     link.target = .{ .idx = node.idx };
             }
         }
+
+        for (self.nodes.items(.state)) |*state| {
+            switch (state.*) {
+                .group_input => |*endpoint| {
+                    if (endpoint.group.idx == last_index)
+                        endpoint.group = .{ .idx = node.idx };
+                },
+                .group_output => |*endpoint| {
+                    if (endpoint.group.idx == last_index)
+                        endpoint.group = .{ .idx = node.idx };
+                },
+                else => {},
+            }
+        }
     }
+
+    // Repair or clear group bindings after swap removal. Groups are not
+    // nested, but their fixed binding tables still contain node indices.
+    for (self.nodes.items(.state)) |*state| {
+        if (state.* != .group) continue;
+        var group = &state.group;
+        var member_count: usize = 0;
+        for (group.members[0..group.member_count]) |member| {
+            if (member.idx == node.idx) continue;
+            var repaired = member;
+            if (node.idx != last_index and member.idx == last_index)
+                repaired = .{ .idx = node.idx };
+            group.members[member_count] = repaired;
+            member_count += 1;
+        }
+        group.member_count = @intCast(member_count);
+        for (&group.input_bindings) |*binding| {
+            if (binding.*) |value| {
+                if (value.node.idx == node.idx) binding.* = null else if (node.idx != last_index and value.node.idx == last_index)
+                    binding.*.?.node = .{ .idx = node.idx };
+            }
+        }
+        for (&group.output_bindings) |*binding| {
+            if (binding.*) |value| {
+                if (value.node.idx == node.idx) binding.* = null else if (node.idx != last_index and value.node.idx == last_index)
+                    binding.*.?.node = .{ .idx = node.idx };
+            }
+        }
+        for (&group.input_nodes) |*endpoint| {
+            if (endpoint.*.idx == node.idx) endpoint.* = .noop else if (node.idx != last_index and endpoint.*.idx == last_index)
+                endpoint.* = .{ .idx = node.idx };
+        }
+        for (&group.output_nodes) |*endpoint| {
+            if (endpoint.*.idx == node.idx) endpoint.* = .noop else if (node.idx != last_index and endpoint.*.idx == last_index)
+                endpoint.* = .{ .idx = node.idx };
+        }
+    }
+}
+
+/// Appends the sixteen fixed boundary endpoint nodes owned by a group.
+pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) GroupEndpointError!void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    assert(group.idx < self.nodes.len);
+    if (self.nodes.items(.state)[group.idx] != .group)
+        return error.InvalidGroup;
+
+    var input_nodes: [max_outlets]Node.Index = @splat(.noop);
+    var output_nodes: [max_outlets]Node.Index = @splat(.noop);
+    for (0..max_outlets) |port| {
+        try self.nodes.append(gpa, Node.GroupInput.create("group input", group, @intCast(port)));
+        const input_index = self.nodes.len - 1;
+        errdefer _ = self.nodes.pop();
+        self.nodes.items(.sample_tap)[input_index].queue =
+            try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
+        input_nodes[port] = .{ .idx = input_index };
+
+        try self.nodes.append(gpa, Node.GroupOutput.create("group output", group, @intCast(port)));
+        const output_index = self.nodes.len - 1;
+        errdefer _ = self.nodes.pop();
+        self.nodes.items(.sample_tap)[output_index].queue =
+            try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
+        output_nodes[port] = .{ .idx = output_index };
+    }
+    self.nodes.items(.state)[group.idx].group.input_nodes = input_nodes;
+    self.nodes.items(.state)[group.idx].group.output_nodes = output_nodes;
+}
+
+/// Adds one ordinary node to a non-nested group's member table.
+pub fn addGroupMember(self: *DSP, group: Node.Index, member: Node.Index) bool {
+    self.lockGraph();
+    defer self.unlockGraph();
+    assert(group.idx < self.nodes.len);
+    assert(member.idx < self.nodes.len);
+    if (group.idx == member.idx) return false;
+    if (std.meta.activeTag(self.nodes.items(.state)[group.idx]) != .group)
+        return false;
+    const member_tag = std.meta.activeTag(self.nodes.items(.state)[member.idx]);
+    if (member_tag == .group or member_tag == .group_input or member_tag == .group_output)
+        return false;
+    var state = &self.nodes.items(.state)[group.idx].group;
+    if (state.member_count >= max_group_members) return false;
+    for (state.members[0..state.member_count]) |existing|
+        if (existing.idx == member.idx) return true;
+    state.members[state.member_count] = member;
+    state.member_count += 1;
+    return true;
 }
 
 /// Appends a node and returns its index in the graph.
@@ -402,9 +701,8 @@ pub fn keyboardReleaseAll(self: *DSP, node: Node.Index) void {
 ///
 /// The returned pointer must not be retained across graph mutation. The UI
 /// stores only the node index and resolves the tap again for each update.
-pub fn sampleTap(self: *DSP, node: Node.Index) ?*SampleTap {
-    if (node.idx >= self.nodes.len)
-        return null;
+pub fn sampleTap(self: *DSP, node: Node.Index) *SampleTap {
+    assert(node.idx < self.nodes.len);
     return &self.nodes.items(.sample_tap)[node.idx];
 }
 
@@ -445,6 +743,7 @@ pub fn withGraphLock(self: *DSP, context: anytype, callback: anytype) void {
 
 /// Evaluates one node and all of its dependencies for the requested sample count.
 fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
+    assert(node.idx < self.nodes.len);
     const cache = &self.nodes.items(.cache)[node.idx];
 
     // Reuse a result already rendered during this generation and block size.
@@ -467,22 +766,21 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
 
     // If has parameter link, copy parameters from source
     if (self.nodes.items(.parameter_link)[node.idx].source) |source| {
-        if (source.idx < self.nodes.len) {
-            const destination = &self.nodes.items(.state)[node.idx];
-            const source_state = &self.nodes.items(.state)[source.idx];
-            switch (destination.*) {
-                inline else => |*destination_state| {
-                    if (@hasField(@TypeOf(destination_state.*), "parameters")) {
-                        switch (source_state.*) {
-                            inline else => |source_value| {
-                                if (@TypeOf(destination_state.*) == @TypeOf(source_value) and
-                                    @hasField(@TypeOf(source_value), "parameters"))
-                                    destination_state.parameters = source_value.parameters;
-                            },
-                        }
+        assert(source.idx < self.nodes.len);
+        const destination = &self.nodes.items(.state)[node.idx];
+        const source_state = &self.nodes.items(.state)[source.idx];
+        switch (destination.*) {
+            inline else => |*destination_state| {
+                if (@hasField(@TypeOf(destination_state.*), "parameters")) {
+                    switch (source_state.*) {
+                        inline else => |source_value| {
+                            if (@TypeOf(destination_state.*) == @TypeOf(source_value) and
+                                @hasField(@TypeOf(source_value), "parameters"))
+                                destination_state.parameters = source_value.parameters;
+                        },
                     }
-                },
-            }
+                }
+            },
         }
     }
 
@@ -847,6 +1145,14 @@ pub const Node = struct {
         input_count: u8 = 1,
     };
 
+    /// One child port exposed through a group boundary.
+    pub const PortBinding = struct {
+        /// Member node owning the exposed port.
+        node: Index,
+        /// Input or output port on `node`.
+        port: u8,
+    };
+
     /// Index into the DSP node list.
     pub const Index = struct {
         /// Index zero is reserved for the no-op sentinel node.
@@ -882,6 +1188,8 @@ pub const Node = struct {
         sample_count: u32 = 0,
         /// Cached output buffers for all possible ports.
         outputs: [max_outlets]Buffer = undefined,
+        /// Preallocated buffers carrying external signals into group members.
+        input_buffers: [max_outlets]Buffer = undefined,
     };
 
     /// Error set reserved for node processing failures.
@@ -907,6 +1215,9 @@ pub const Node = struct {
         noop,
         oscillator,
         output,
+        group,
+        group_input,
+        group_output,
     };
 
     /// Tagged union containing the concrete state for each node kind.
@@ -937,6 +1248,10 @@ pub const Node = struct {
         oscillator: Oscillator,
         /// Graph output forwarding state.
         output: Output,
+        /// Non-nested proxy around a fixed set of member nodes.
+        group: Group,
+        group_input: GroupInput,
+        group_output: GroupOutput,
     };
 
     /// A node that produces silence and represents an unplugged connection.
@@ -1035,6 +1350,153 @@ pub const Node = struct {
                 into[0].samples[0..into[0].sample_count],
                 source.samples[0..source.sample_count],
             );
+        }
+    };
+
+    /// Proxy node exposing selected child ports at a reusable graph boundary.
+    pub const Group = struct {
+        /// Port metadata for an unbound group boundary.
+        pub const metadata = Node.Metadata{
+            .name = "Group",
+            .short_name = "grp",
+            .color = .astral,
+            .can_link_parameters = false,
+            .meterable = false,
+            .inputs = @splat(.{ .name = "group input", .short_name = "in", .color = .gray }),
+            .outputs = @splat(.{ .name = "group output", .short_name = "out", .color = .gray }),
+            .input_count = max_outlets,
+            .output_count = max_outlets,
+        };
+
+        /// Member nodes owned by this group.
+        members: [max_group_members]Index = @splat(.noop),
+        /// Number of valid entries in `members`.
+        member_count: u8 = 0,
+        /// Child inputs exposed through group inputs.
+        input_bindings: [max_outlets]?Node.PortBinding = @splat(null),
+        /// Child outputs exposed through group outputs.
+        output_bindings: [max_outlets]?Node.PortBinding = @splat(null),
+        /// Explicit nodes displayed at the left boundary of the group editor.
+        input_nodes: [max_outlets]Index = @splat(.noop),
+        /// Explicit nodes displayed at the right boundary of the group editor.
+        output_nodes: [max_outlets]Index = @splat(.noop),
+        /// Creates a group with an initially empty port-binding table.
+        pub fn create(name: []const u8, members: []const Index) Node {
+            assert(members.len <= max_group_members);
+            var group = Group{};
+            for (members, 0..) |member, index|
+                group.members[index] = member;
+            group.member_count = @intCast(members.len);
+            return .{
+                .state = .{ .group = group },
+                .name = name,
+                .process = process,
+            };
+        }
+
+        /// Renders bound member outputs and feeds bound member inputs.
+        fn process(
+            dsp: *DSP,
+            node: Index,
+            into: []const *Buffer,
+        ) ProcessError!void {
+            const cache = &dsp.nodes.items(.cache)[node.idx];
+            const group_inputs = dsp.nodes.items(.inputs)[node.idx];
+
+            // Materialize each external group input in fixed storage before
+            // rendering children. The audio callback never allocates here.
+            for (0..max_outlets) |port| {
+                const input = group_inputs[port];
+                const buffer = &cache.input_buffers[port];
+                buffer.sample_count = into[0].sample_count;
+                if (input.isNoop()) {
+                    @memset(buffer.samples[0..buffer.sample_count], 0);
+                    continue;
+                }
+                const source = try dsp.getOutput(input, into[0].sample_count);
+                @memcpy(
+                    buffer.samples[0..buffer.sample_count],
+                    source.samples[0..source.sample_count],
+                );
+            }
+
+            const state = dsp.nodes.items(.state)[node.idx].group;
+            for (state.output_bindings, 0..) |binding, port| {
+                const selected = binding orelse continue;
+                assert(selected.node.idx < dsp.nodes.len);
+                try dsp.renderNode(selected.node, into[0].sample_count);
+                const source = &dsp.nodes.items(.cache)[selected.node.idx].outputs[selected.port];
+                @memcpy(
+                    into[port].samples[0..into[port].sample_count],
+                    source.samples[0..source.sample_count],
+                );
+            }
+        }
+    };
+
+    /// A fixed boundary node exposing one external group input.
+    pub const GroupInput = struct {
+        /// Group owning this endpoint.
+        group: Index,
+        /// Port exposed by the owning group.
+        port: u8,
+
+        /// Port metadata for a group input endpoint.
+        pub const metadata = Node.Metadata{
+            .name = "Group Input",
+            .short_name = "in",
+            .color = .gray,
+            .can_link_parameters = false,
+            .meterable = false,
+            .inputs = @splat(.{}),
+            .outputs = @splat(.{ .name = "group input", .short_name = "out", .color = .gray }),
+            .input_count = 0,
+        };
+
+        /// Creates a group input endpoint.
+        pub fn create(name: []const u8, group: Index, port: u8) Node {
+            return .{ .state = .{ .group_input = .{ .group = group, .port = port } }, .name = name, .process = process };
+        }
+
+        /// Copies the owning group's materialized input buffer.
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+            const state = dsp.nodes.items(.state)[node.idx].group_input;
+            assert(state.group.idx < dsp.nodes.len);
+            const source = &dsp.nodes.items(.cache)[state.group.idx].input_buffers[state.port];
+            @memcpy(into[0].samples[0..source.sample_count], source.samples[0..source.sample_count]);
+        }
+    };
+
+    /// A fixed boundary node receiving one internal group output.
+    pub const GroupOutput = struct {
+        /// Group owning this endpoint.
+        group: Index,
+        /// Port exposed by the owning group.
+        port: u8,
+
+        /// Port metadata for a group output endpoint.
+        pub const metadata = Node.Metadata{
+            .name = "Group Output",
+            .short_name = "out",
+            .color = .gray,
+            .can_link_parameters = false,
+            .meterable = false,
+            .inputs = @splat(.{ .name = "group output", .short_name = "in", .color = .gray }),
+            .outputs = @splat(.{}),
+            .output_count = 0,
+        };
+
+        /// Creates a group output endpoint.
+        pub fn create(name: []const u8, group: Index, port: u8) Node {
+            return .{ .state = .{ .group_output = .{ .group = group, .port = port } }, .name = name, .process = process };
+        }
+
+        /// Forwards the member signal into the endpoint cache.
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+            const input = dsp.nodes.items(.inputs)[node.idx][0];
+            if (input.isNoop()) return;
+            const source = try dsp.getOutput(input, into[0].sample_count);
+            @memcpy(into[0].samples[0..source.sample_count], source.samples[0..source.sample_count]);
         }
     };
 
@@ -2572,5 +3034,8 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .noop = Node.Noop.metadata,
         .oscillator = Node.Oscillator.metadata,
         .output = Node.Output.metadata,
+        .group = Node.Group.metadata,
+        .group_input = Node.GroupInput.metadata,
+        .group_output = Node.GroupOutput.metadata,
     },
 );

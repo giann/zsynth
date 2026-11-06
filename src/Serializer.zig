@@ -63,6 +63,40 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             .y = self.space.nodePosition(.{ .idx = index }).y,
         };
 
+        if (std.meta.activeTag(state) == .group) {
+            const group = state.group;
+            for (group.members[0..group.member_count]) |member|
+                try node.group_members.append(arena_gpa, @intCast(member.idx));
+            for (group.input_bindings, 0..) |binding, group_port| {
+                if (binding) |value|
+                    try node.group_inputs.append(arena_gpa, .{
+                        .group_port = @intCast(group_port),
+                        .member_node = @intCast(value.node.idx),
+                        .member_port = value.port,
+                    });
+            }
+            for (group.output_bindings, 0..) |binding, group_port| {
+                if (binding) |value|
+                    try node.group_outputs.append(arena_gpa, .{
+                        .group_port = @intCast(group_port),
+                        .member_node = @intCast(value.node.idx),
+                        .member_port = value.port,
+                    });
+            }
+        }
+
+        switch (state) {
+            .group_input => |endpoint| {
+                node.group_owner = @intCast(endpoint.group.idx);
+                node.group_port = endpoint.port;
+            },
+            .group_output => |endpoint| {
+                node.group_owner = @intCast(endpoint.group.idx);
+                node.group_port = endpoint.port;
+            },
+            else => {},
+        }
+
         if (self.dsp.nodes.items(.parameter_link)[index].source) |source|
             node.parameter_source = @intCast(source.idx);
 
@@ -78,6 +112,11 @@ pub fn save(self: *Serializer, path: []const u8) !void {
         node.parameters = try parametersToProto(state, arena_gpa);
         try document.nodes.append(arena_gpa, node);
     }
+
+    // Do not persist a graph whose swap-remove references have already
+    // diverged.  Loading validates before mutating the live graph, so saving
+    // must apply the same invariant before creating or truncating the file.
+    try validateDocument(document);
 
     var file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
     defer file.close(self.io);
@@ -127,6 +166,35 @@ pub fn load(self: *Serializer, path: []const u8) !void {
             .x = serialized.x,
             .y = serialized.y,
         });
+        switch (node.state) {
+            .group_input => |endpoint| {
+                std.debug.assert(endpoint.group.idx < self.dsp.nodes.len);
+                std.debug.assert(endpoint.port < DSP.max_outlets);
+                self.dsp.nodes.items(.state)[endpoint.group.idx].group.input_nodes[endpoint.port] = actual;
+            },
+            .group_output => |endpoint| {
+                std.debug.assert(endpoint.group.idx < self.dsp.nodes.len);
+                std.debug.assert(endpoint.port < DSP.max_outlets);
+                self.dsp.nodes.items(.state)[endpoint.group.idx].group.output_nodes[endpoint.port] = actual;
+            },
+            else => {},
+        }
+    }
+
+    // Older group documents predate explicit endpoint nodes. Append their
+    // deterministic endpoint set after restoring the persisted graph.
+    var endpoint_group_index: usize = 1;
+    while (endpoint_group_index < self.dsp.nodes.len) : (endpoint_group_index += 1) {
+        const state = self.dsp.nodes.items(.state)[endpoint_group_index];
+        if (state != .group or !state.group.input_nodes[0].isNoop()) continue;
+        const group = DSP.Node.Index{ .idx = endpoint_group_index };
+        try self.dsp.addGroupEndpoints(self.allocator, group);
+        const position = self.space.nodePosition(group);
+        const endpoints = self.dsp.nodes.items(.state)[endpoint_group_index].group;
+        for (0..DSP.max_outlets) |port| {
+            try self.space.addNode(self.allocator, endpoints.input_nodes[port], position);
+            try self.space.addNode(self.allocator, endpoints.output_nodes[port], position);
+        }
     }
 
     self.dsp.output = .{ .idx = @intCast(document.output_node) };
@@ -141,12 +209,32 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         }
     }
 
+    for (document.nodes.items, 0..) |serialized, group_index| {
+        if (!std.mem.eql(u8, serialized.kind, "group")) continue;
+        for (serialized.group_inputs.items) |binding| {
+            std.debug.assert(self.dsp.bindGroupInput(
+                .{ .idx = group_index },
+                @intCast(binding.group_port),
+                .{ .idx = @intCast(binding.member_node) },
+                @intCast(binding.member_port),
+            ));
+        }
+        for (serialized.group_outputs.items) |binding| {
+            std.debug.assert(self.dsp.bindGroupOutput(
+                .{ .idx = group_index },
+                @intCast(binding.group_port),
+                .{ .idx = @intCast(binding.member_node) },
+                @intCast(binding.member_port),
+            ));
+        }
+    }
+
     for (document.nodes.items, 0..) |serialized, target_index| {
         if (serialized.parameter_source == 0) continue;
-        if (!self.dsp.linkParameters(
+        std.debug.assert(self.dsp.linkParameters(
             .{ .idx = @intCast(serialized.parameter_source) },
             .{ .idx = target_index },
-        )) return error.InvalidGraphReference;
+        ));
     }
 
     if (!try self.space.rebuildOccupancy(self.allocator))
@@ -188,7 +276,7 @@ fn parametersToProto(
     gpa: std.mem.Allocator,
 ) !?P.Node.parameters_union {
     return switch (state) {
-        .noop, .add, .multiply, .output => null,
+        .noop, .add, .multiply, .output, .group, .group_input, .group_output => null,
         .keyboard => |value| .{ .keyboard = .{
             .octave = value.parameters.octave,
         } },
@@ -259,6 +347,18 @@ fn nodeFromProto(
     if (std.mem.eql(u8, serialized.kind, "multiply")) return DSP.Node.Multiply.create(name);
     if (std.mem.eql(u8, serialized.kind, "output")) return DSP.Node.Output.create(name);
     if (std.mem.eql(u8, serialized.kind, "noop")) return DSP.Node.Noop.create(name);
+    if (std.mem.eql(u8, serialized.kind, "group")) {
+        var members: [DSP.max_group_members]DSP.Node.Index = undefined;
+        if (serialized.group_members.items.len > members.len)
+            return error.InvalidGraphReference;
+        for (serialized.group_members.items, 0..) |member, index|
+            members[index] = .{ .idx = @intCast(member) };
+        return DSP.Node.Group.create(name, members[0..serialized.group_members.items.len]);
+    }
+    if (std.mem.eql(u8, serialized.kind, "group_input"))
+        return DSP.Node.GroupInput.create(name, .{ .idx = @intCast(serialized.group_owner orelse 0) }, @intCast(serialized.group_port orelse 0));
+    if (std.mem.eql(u8, serialized.kind, "group_output"))
+        return DSP.Node.GroupOutput.create(name, .{ .idx = @intCast(serialized.group_owner orelse 0) }, @intCast(serialized.group_port orelse 0));
 
     if (std.mem.eql(u8, serialized.kind, "constant")) {
         const value = try requiredParameters(serialized, .constant);
@@ -405,6 +505,8 @@ fn validateDocument(document: P.SynthDocument) !void {
             switch (tag) {
                 .noop => unreachable,
                 .add, .multiply, .output, .constant, .keyboard, .oscillator, .mixer, .monophonic_sequencer, .adsr, .multimode_filter, .bit_crusher, .noise => try validateNodeParameters(node, tag),
+                .group => try validateGroup(node, index, document.nodes.items),
+                .group_input, .group_output => try validateGroupEndpoint(node, index, document.nodes.items),
             }
         }
         for (node.inputs.items, 0..) |connection, connection_index| {
@@ -463,6 +565,56 @@ fn validateDocument(document: P.SynthDocument) !void {
     }
 }
 
+/// Validates a non-nested group and every persisted port binding.
+fn validateGroup(node: P.Node, group_index: usize, nodes: []const P.Node) !void {
+    if (node.group_members.items.len < 2 or node.group_members.items.len > DSP.max_group_members)
+        return error.InvalidGraphReference;
+    for (node.group_members.items) |member| {
+        if (member == 0 or member >= nodes.len or member >= group_index)
+            return error.InvalidGraphReference;
+        if (std.mem.eql(u8, nodes[member].kind, "group"))
+            return error.InvalidGraphReference;
+    }
+    for (node.group_inputs.items) |binding|
+        try validateGroupBinding(binding, group_index, node.group_members.items, nodes, true);
+    for (node.group_outputs.items) |binding|
+        try validateGroupBinding(binding, group_index, node.group_members.items, nodes, false);
+}
+
+/// Validates the owner and port carried by an explicit group endpoint node.
+fn validateGroupEndpoint(node: P.Node, endpoint_index: usize, nodes: []const P.Node) !void {
+    const owner = node.group_owner orelse return error.InvalidGraphReference;
+    const port = node.group_port orelse return error.InvalidGraphReference;
+    if (owner == 0 or owner >= nodes.len or owner >= endpoint_index or port >= DSP.max_outlets)
+        return error.InvalidGraphReference;
+    if (!std.mem.eql(u8, nodes[owner].kind, "group"))
+        return error.InvalidGraphReference;
+}
+
+/// Validates one persisted group port-to-child binding.
+fn validateGroupBinding(
+    binding: P.GroupBinding,
+    group_index: usize,
+    members: []const u32,
+    nodes: []const P.Node,
+    input: bool,
+) !void {
+    if (binding.group_port >= DSP.max_outlets or binding.member_node == 0 or
+        binding.member_node >= nodes.len or binding.member_node == group_index)
+        return error.InvalidGraphReference;
+    var is_member = false;
+    for (members) |member| {
+        if (member == binding.member_node) is_member = true;
+    }
+    if (!is_member or std.mem.eql(u8, nodes[binding.member_node].kind, "group"))
+        return error.InvalidGraphReference;
+    const tag = std.meta.stringToEnum(DSP.Node.Tag, nodes[binding.member_node].kind) orelse
+        return error.UnknownNodeKind;
+    const metadata = DSP.node_metadata.get(tag);
+    const count = if (input) metadata.input_count else metadata.output_count;
+    if (binding.member_port >= count) return error.InvalidGraphReference;
+}
+
 /// Validates the typed parameter message for one node kind without mutation.
 fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
     switch (tag) {
@@ -512,6 +664,6 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
             if (octave < std.math.minInt(i8) or octave > std.math.maxInt(i8))
                 return error.InvalidNodeParameters;
         },
-        .add, .multiply, .noop, .output => {},
+        .add, .multiply, .noop, .output, .group, .group_input, .group_output => {},
     }
 }
