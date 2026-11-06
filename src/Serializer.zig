@@ -19,66 +19,70 @@ fn serializedGroupSubgraphHash(nodes: []const P.Node, group_index: usize) ?u64 {
     if (group_index >= nodes.len or !std.mem.eql(u8, nodes[group_index].kind, "group")) return null;
     const group = nodes[group_index];
     if (group.group_members.items.len > DSP.max_group_members) return null;
-    var key = DSP.Node.GroupSubgraphKey{};
-    key.member_count = @intCast(group.group_members.items.len);
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(&[_]u8{@intCast(group.group_members.items.len)});
 
-    for (group.group_members.items, 0..) |member, slot| {
+    for (group.group_members.items) |member| {
         if (member >= nodes.len) return null;
         const tag = std.meta.stringToEnum(DSP.Node.Tag, nodes[member].kind) orelse return null;
-        key.member_tags[slot] = @backingInt(tag);
-        for (nodes[member].inputs.items) |connection| {
-            if (connection.input_port >= DSP.max_outlets) return null;
-            const descriptor = &key.inputs[slot][connection.input_port];
-            if (connection.source_port >= DSP.max_outlets) return null;
-            if (serializedGroupMemberSlot(group, connection.source_node)) |source_slot| {
-                descriptor.* = .{
-                    .kind = 1,
-                    .index = source_slot,
-                    .port = @intCast(connection.source_port),
-                };
-            } else if (connection.source_node < nodes.len and
-                std.mem.eql(u8, nodes[connection.source_node].kind, "group_input") and
-                (nodes[connection.source_node].group_owner orelse std.math.maxInt(u32)) == group_index)
-            {
-                const group_port = nodes[connection.source_node].group_port orelse return null;
-                if (group_port >= DSP.max_outlets) return null;
-                descriptor.* = .{
-                    .kind = 2,
-                    .index = @intCast(group_port),
-                };
-            } else {
-                return null;
+        hasher.update(&[_]u8{@backingInt(tag)});
+        for (0..DSP.max_outlets) |input_port| {
+            var found = false;
+            for (nodes[member].inputs.items) |connection| {
+                if (connection.input_port != input_port) continue;
+                found = true;
+                if (connection.source_port >= DSP.max_outlets) return null;
+                if (serializedGroupMemberSlot(group, connection.source_node)) |source_slot| {
+                    hasher.update(&[_]u8{ 1, source_slot, @intCast(connection.source_port) });
+                } else if (connection.source_node < nodes.len and
+                    std.mem.eql(u8, nodes[connection.source_node].kind, "group_input") and
+                    (nodes[connection.source_node].group_owner orelse std.math.maxInt(u32)) == group_index)
+                {
+                    const group_port = nodes[connection.source_node].group_port orelse return null;
+                    if (group_port >= DSP.max_outlets) return null;
+                    hasher.update(&[_]u8{ 2, @intCast(group_port), 0 });
+                } else {
+                    return null;
+                }
+                break;
             }
+            if (!found) hasher.update(&[_]u8{ 0, 0, 0 });
         }
         if (nodes[member].parameter_source != 0) {
             if (serializedGroupMemberSlot(group, nodes[member].parameter_source)) |source_slot|
-                key.parameter_sources[slot] = source_slot
+                hasher.update(&[_]u8{ 1, source_slot })
             else
                 return null;
+        } else {
+            hasher.update(&[_]u8{0});
         }
     }
 
-    for (group.group_inputs.items) |binding| {
-        if (binding.group_port >= DSP.max_outlets or binding.member_port >= DSP.max_outlets) return null;
-        const slot = serializedGroupMemberSlot(group, binding.member_node) orelse {
-            return null;
-        };
-        key.input_bindings[binding.group_port] = .{
-            .node = .{ .idx = slot },
-            .port = @intCast(binding.member_port),
-        };
+    for (0..DSP.max_outlets) |group_port| {
+        var found = false;
+        for (group.group_inputs.items) |binding| {
+            if (binding.group_port != group_port) continue;
+            found = true;
+            if (binding.member_port >= DSP.max_outlets) return null;
+            const slot = serializedGroupMemberSlot(group, binding.member_node) orelse return null;
+            hasher.update(&[_]u8{ 1, slot, @intCast(binding.member_port) });
+            break;
+        }
+        if (!found) hasher.update(&[_]u8{0});
     }
-    for (group.group_outputs.items) |binding| {
-        if (binding.group_port >= DSP.max_outlets or binding.member_port >= DSP.max_outlets) return null;
-        const slot = serializedGroupMemberSlot(group, binding.member_node) orelse {
-            return null;
-        };
-        key.output_bindings[binding.group_port] = .{
-            .node = .{ .idx = slot },
-            .port = @intCast(binding.member_port),
-        };
+    for (0..DSP.max_outlets) |group_port| {
+        var found = false;
+        for (group.group_outputs.items) |binding| {
+            if (binding.group_port != group_port) continue;
+            found = true;
+            if (binding.member_port >= DSP.max_outlets) return null;
+            const slot = serializedGroupMemberSlot(group, binding.member_node) orelse return null;
+            hasher.update(&[_]u8{ 1, slot, @intCast(binding.member_port) });
+            break;
+        }
+        if (!found) hasher.update(&[_]u8{0});
     }
-    return key.hash();
+    return hasher.final();
 }
 
 /// Saves and loads one live DSP graph without serializing runtime audio state.

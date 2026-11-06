@@ -64,8 +64,18 @@ const ParameterEditor = struct {
 
 /// Number of parameter rows available after applying the pane padding.
 const parameters_pane_padding: u32 = 1;
+/// Minimum selected-pane height, including its border and horizontal meter.
+const parameters_pane_min_height: u32 = 5;
 /// Maximum number of parameter rows packed into one selected-pane column.
 const parameters_pane_max_rows: u32 = 5;
+/// Label prefix used by the fixed playback status HUD.
+const output_status_label = "Playback: ";
+/// Longest playback state shown by the fixed playback status HUD.
+const output_status_playing = "playing";
+/// Number of horizontal meter cells needed to match the longest status text.
+const output_meter_cell_count: u32 = @intCast(
+    output_status_label.len + output_status_playing.len - 1,
+);
 
 /// Runtime owning the display, renderer, and audio engine used by this state.
 zsynth: *ZSynth,
@@ -78,8 +88,12 @@ serializer: Serializer,
 document_path: ?[]u8 = null,
 /// Allocated names entered for nodes created through the command palette.
 owned_node_names: std.ArrayList([]u8) = .empty,
+/// Output meter bound to the graph's audio output node.
+output_meter: OutputMeter = .{
+    .parameters = .{ .meter_cell_count = output_meter_cell_count },
+},
 /// Output meter bound to the currently selected DSP node.
-output_meter: OutputMeter = .{},
+selected_output_meter: OutputMeter = .{},
 /// State used to edit scalar and enum properties in the selected pane.
 parameter_editor: ParameterEditor = .{},
 /// Temporary scoped layout used while a group view is active.
@@ -205,7 +219,10 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
         self.leaveGroupView(gpa);
     self.parameter_editor.active = null;
     self.parameter_editor.cell_count = 0;
-    self.output_meter = .{};
+    self.output_meter = .{
+        .parameters = .{ .meter_cell_count = output_meter_cell_count },
+    };
+    self.selected_output_meter = .{};
 
     self.dsp.reset(gpa);
     self.editorSpace().reset(gpa);
@@ -227,6 +244,7 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
         self.editorSpace().viewportCenter(),
     );
     self.dsp.output = output;
+    self.output_meter.configure(&self.dsp, self.dsp.output);
     if (!try self.editorSpace().rebuildOccupancy(gpa))
         return error.InvalidVisualNodeLayout;
     try self.editorSpace().computePaths(gpa);
@@ -274,7 +292,7 @@ fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.owned_node_names.deinit(gpa);
 }
 
-/// Updates the selected node's output meter from the main thread.
+/// Updates both the fixed output meter and the selected-node meter.
 fn update(
     state_stack: *StateStack,
     _: std.mem.Allocator,
@@ -282,56 +300,24 @@ fn update(
     dt: u64,
 ) StateStack.State.Error!void {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    if (self.output_meter.output_count != 0)
+        self.output_meter.update(&self.dsp, dt);
+
     const selected_node = self.editorSpace().singleSelectedNode() orelse return;
-    if (self.output_meter.output_count == 0) return;
-    assert(self.output_meter.parameters.node.idx == selected_node.idx);
-    self.output_meter.update(&self.dsp, dt);
+    if (self.selected_output_meter.output_count == 0) return;
+    assert(self.selected_output_meter.parameters.node.idx == selected_node.idx);
+    self.selected_output_meter.update(&self.dsp, dt);
 }
 
 /// Rebuilds the parameter editor and output meter for the current selection.
 fn refreshSelectionUi(self: *Self) void {
     self.parameter_editor.active = null;
     self.parameter_editor.cell_count = 0;
-
-    const previous_parameters = self.output_meter.parameters;
-    self.output_meter = .{
-        .parameters = .{
-            .direction = previous_parameters.direction,
-            .node = undefined,
-            .meter_cell_count = previous_parameters.meter_cell_count,
-        },
-    };
+    self.selected_output_meter = .{};
 
     const selected_node = self.editorSpace().singleSelectedNode() orelse return;
     assert(selected_node.idx < self.dsp.nodes.len);
-
-    const state = self.dsp.nodes.items(.state)[selected_node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
-    if (!metadata.meterable) return;
-
-    self.output_meter.parameters.node = selected_node;
-    self.output_meter.output_count = metadata.output_count;
-    assert(self.output_meter.parameters.meter_cell_count > 0);
-
-    const horizontal = switch (self.output_meter.parameters.direction) {
-        .left, .right => true,
-        .up, .down => false,
-    };
-    self.output_meter.height = if (horizontal) 3 else self.output_meter.parameters.meter_cell_count + 2;
-
-    for (metadata.outputs[0..metadata.output_count], 0..) |output, output_port| {
-        self.output_meter.output_short_names[output_port] = output.short_name;
-        const group_width = if (horizontal)
-            @max(
-                self.output_meter.parameters.meter_cell_count + 1,
-                @as(u32, @intCast(output.short_name.len)),
-            )
-        else
-            @max(2, @as(u32, @intCast(output.short_name.len)));
-        self.output_meter.width += @max(group_width, @as(u32, @intCast(output.short_name.len)));
-        if (output_port + 1 < metadata.output_count)
-            self.output_meter.width += 1;
-    }
+    self.selected_output_meter.configure(&self.dsp, selected_node);
 }
 
 /// Changes the single selection and resets the meter source to match it.
@@ -395,6 +381,7 @@ fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
     if (self.group_space != null)
         self.leaveGroupView(gpa);
     try self.serializer.load(path);
+    self.output_meter.configure(&self.dsp, self.dsp.output);
     try self.rememberDocumentPath(gpa, path);
 }
 
@@ -463,6 +450,69 @@ fn writeGroupTitle(self: *Self, gpa: std.mem.Allocator) !void {
     );
 }
 
+/// Draws the fixed output meter and current playback status in screen space.
+fn writeOutputStatus(self: *Self, gpa: std.mem.Allocator) !void {
+    if (self.active_group != null or self.output_meter.output_count == 0)
+        return;
+    if (self.zsynth.ui_display.impl != .graphic)
+        return;
+
+    const display = &self.zsynth.ui_display.impl.graphic;
+    const label = output_status_label;
+    const playing = self.dsp.isPlaying();
+    const state = if (playing) output_status_playing else "paused";
+    const status_width = @as(u32, @intCast(label.len + state.len));
+    assert(self.output_meter.width == @as(
+        u32,
+        @intCast(output_status_label.len + output_status_playing.len),
+    ));
+    const hud_width = @max(status_width, self.output_meter.width);
+    const box_width = hud_width + 2;
+    const box_height = self.output_meter.height + 3;
+    if (display.width < box_width or display.height < box_height)
+        return;
+
+    const box_x = display.width - box_width;
+    const box_y = display.height - box_height;
+    const status_x = box_x + 1;
+    const status_y = box_y + 1;
+    const meter_x = box_x + 1;
+    const meter_y = box_y + 2;
+
+    // Paint the panel before drawing its contents so the HUD remains readable
+    // over the graph and stale transparent-overlay cells are cleared.
+    try self.zsynth.ui_display.fill(
+        gpa,
+        .ebony,
+        .transparent,
+        ' ',
+        box_x,
+        box_y,
+        box_width,
+        box_height,
+    );
+    try self.zsynth.ui_display.writeBox(
+        gpa,
+        box_x,
+        box_y,
+        box_width,
+        box_height,
+        .ebony,
+        .port_gore,
+        .single,
+    );
+    try self.zsynth.ui_display.write(gpa, label, status_x, status_y, .ebony, .logan);
+    try self.zsynth.ui_display.write(
+        gpa,
+        state,
+        status_x + @as(u32, @intCast(label.len)),
+        status_y,
+        .ebony,
+        if (playing) .amber else .logan,
+    );
+    try self.output_meter.write(gpa, &self.zsynth.ui_display, .{ meter_x, meter_y });
+}
+
 /// Draws the selected node's reflected parameters in the bottom UI pane.
 fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     self.parameter_editor.cell_count = 0;
@@ -490,7 +540,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
                     self.dsp.nodes.items(.name)[selected.idx],
                     graphic.height,
                     graphic.width,
-                    &self.output_meter,
+                    &self.selected_output_meter,
                     parameters_editable,
                 );
             } else {
@@ -501,7 +551,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
                     self.dsp.nodes.items(.name)[selected.idx],
                     graphic.height,
                     graphic.width,
-                    &self.output_meter,
+                    &self.selected_output_meter,
                     parameters_editable,
                 );
             }
@@ -670,7 +720,7 @@ fn writeReflectedParameters(
     const pane_height = @min(
         display_height,
         @max(
-            parameters_pane_max_rows + 2,
+            parameters_pane_min_height,
             output_meter.height + 2,
         ),
     );
@@ -928,7 +978,6 @@ fn keyUpDown(
         .l => if (command) {
             self.loadDocument(gpa, "./simpleDSP.zsynth") catch return error.IoError;
             self.setNodeSelection(null);
-            self.output_meter = .{};
             self.zsynth.cursor.dirty = true;
             try self.write(gpa);
         } else return false,
@@ -941,8 +990,11 @@ fn keyUpDown(
         .space => {
             const was_playing = self.dsp.isPlaying();
             self.dsp.toggle() catch return error.AudioError;
-            if (was_playing and self.output_meter.output_count != 0) {
-                self.output_meter.reset();
+            if (was_playing) {
+                if (self.output_meter.output_count != 0)
+                    self.output_meter.reset();
+                if (self.selected_output_meter.output_count != 0)
+                    self.selected_output_meter.reset();
                 try self.writeSelectedParametersPane(gpa);
             }
         },
@@ -2161,6 +2213,8 @@ fn render(
     try self.writeSelectedParametersPane(gpa);
     // Keep the scoped group identity visible while editing its interior.
     try self.writeGroupTitle(gpa);
+    // Draw the fixed output HUD above all graph and parameter-pane content.
+    try self.writeOutputStatus(gpa);
     // Draw outlet labels before the runtime adds the generic cursor glyph.
     if (self.zsynth.cursor.visible and self.zsynth.ui_display.impl == .graphic) {
         if (self.zsynth.displayCellAtWindowPosition(self.zsynth.cursor.position)) |cell| {
@@ -2700,7 +2754,6 @@ pub const CommandPalette = struct {
                 if (self.text_field.inputSlice().len == 0) return;
                 self.editor.loadDocument(gpa, self.inputSlice()) catch return error.IoError;
                 self.editor.setNodeSelection(null);
-                self.editor.output_meter = .{};
                 self.editor.zsynth.cursor.dirty = true;
                 try self.editor.write(gpa);
                 try self.finish(state_stack, gpa);
@@ -3113,6 +3166,47 @@ pub const OutputMeter = struct {
     peak_dbfs: [DSP.max_outlets][2]f32 = @splat(.{ -120, -120 }),
     /// Remaining clipping-indicator time in milliseconds per output/channel.
     clipping_remaining_ms: [DSP.max_outlets][2]u64 = @splat(.{ 0, 0 }),
+
+    /// Rebinds the meter to a node and rebuilds its output layout.
+    pub fn configure(self: *OutputMeter, dsp: *const DSP, node: DSP.Node.Index) void {
+        assert(node.idx < dsp.nodes.len);
+        const previous_parameters = self.parameters;
+        self.* = .{
+            .parameters = .{
+                .direction = previous_parameters.direction,
+                .node = undefined,
+                .meter_cell_count = previous_parameters.meter_cell_count,
+            },
+        };
+
+        const state = dsp.nodes.items(.state)[node.idx];
+        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        if (!metadata.meterable) return;
+
+        self.parameters.node = node;
+        self.output_count = metadata.output_count;
+        assert(self.parameters.meter_cell_count > 0);
+
+        const horizontal = switch (self.parameters.direction) {
+            .left, .right => true,
+            .up, .down => false,
+        };
+        self.height = if (horizontal) 3 else self.parameters.meter_cell_count + 2;
+
+        for (metadata.outputs[0..metadata.output_count], 0..) |output, output_port| {
+            self.output_short_names[output_port] = output.short_name;
+            const group_width = if (horizontal)
+                @max(
+                    self.parameters.meter_cell_count + 1,
+                    @as(u32, @intCast(output.short_name.len)),
+                )
+            else
+                @max(2, @as(u32, @intCast(output.short_name.len)));
+            self.width += @max(group_width, @as(u32, @intCast(output.short_name.len)));
+            if (output_port + 1 < metadata.output_count)
+                self.width += 1;
+        }
+    }
 
     /// Resets every measured value while preserving the meter source and layout.
     pub fn reset(self: *OutputMeter) void {
