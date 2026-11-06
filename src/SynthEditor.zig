@@ -200,28 +200,18 @@ fn update(
     dt: u64,
 ) StateStack.State.Error!void {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
-    const selected_node = self.space.selected_node orelse return;
+    const selected_node = self.space.singleSelectedNode() orelse return;
     if (self.output_meter.output_count == 0) return;
     assert(self.output_meter.parameters.node.idx == selected_node.idx);
     self.output_meter.update(&self.dsp, dt);
 }
 
-/// Changes the selected node and resets the meter source to match it.
-fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
-    const selected = if (node) |value| if (value.isNoop()) null else value else null;
-    const previous_idx = if (self.space.selected_node) |previous| previous.idx else null;
-    const selected_idx = if (selected) |current| current.idx else null;
-    if (previous_idx != selected_idx) {
-        if (previous_idx) |previous| {
-            if (previous < self.dsp.nodes.len and
-                std.meta.activeTag(self.dsp.nodes.items(.state)[previous]) == .keyboard)
-                self.dsp.keyboardReleaseAll(.{ .idx = previous });
-        }
-        self.parameter_editor.active = null;
-        self.parameter_editor.cell_count = 0;
-    }
+/// Rebuilds the parameter editor and output meter for the current selection.
+fn refreshSelectionUi(self: *Self) void {
+    self.parameter_editor.active = null;
+    self.parameter_editor.cell_count = 0;
+
     const previous_parameters = self.output_meter.parameters;
-    self.space.selected_node = selected;
     self.output_meter = .{
         .parameters = .{
             .direction = previous_parameters.direction,
@@ -230,12 +220,8 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
         },
     };
 
-    const selected_node = selected orelse return;
-    if (selected_node.idx >= self.dsp.nodes.len) {
-        self.space.selected_node = null;
-        self.output_meter = .{};
-        return;
-    }
+    const selected_node = self.space.singleSelectedNode() orelse return;
+    if (selected_node.idx >= self.dsp.nodes.len) return;
 
     const state = self.dsp.nodes.items(.state)[selected_node.idx];
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
@@ -249,10 +235,7 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
         .left, .right => true,
         .up, .down => false,
     };
-    self.output_meter.height = if (horizontal)
-        3
-    else
-        self.output_meter.parameters.meter_cell_count + 2;
+    self.output_meter.height = if (horizontal) 3 else self.output_meter.parameters.meter_cell_count + 2;
 
     for (metadata.outputs[0..metadata.output_count], 0..) |output, output_port| {
         self.output_meter.output_short_names[output_port] = output.short_name;
@@ -263,19 +246,50 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
             )
         else
             @max(2, @as(u32, @intCast(output.short_name.len)));
-        self.output_meter.width += @max(
-            group_width,
-            @as(u32, @intCast(output.short_name.len)),
-        );
+        self.output_meter.width += @max(group_width, @as(u32, @intCast(output.short_name.len)));
         if (output_port + 1 < metadata.output_count)
             self.output_meter.width += 1;
     }
+}
+
+/// Changes the single selection and resets the meter source to match it.
+fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
+    const selected = if (node) |value| if (value.isNoop()) null else value else null;
+    const previous_count = self.space.selected_count;
+    const previous_single = self.space.singleSelectedNode();
+    const selected_idx = if (selected) |current| current.idx else null;
+    const changed = previous_count != 1 or
+        (if (previous_single) |previous| previous.idx else null) != selected_idx;
+
+    if (changed) {
+        for (self.space.selected_nodes[0..self.space.selected_count]) |previous| {
+            if (previous.idx < self.dsp.nodes.len and
+                std.meta.activeTag(self.dsp.nodes.items(.state)[previous.idx]) == .keyboard)
+                self.dsp.keyboardReleaseAll(.{ .idx = previous.idx });
+        }
+    }
+
+    self.space.selectSingle(selected);
+    if (changed) self.refreshSelectionUi();
 }
 
 /// Redraws the editor's status text in the runtime-owned display.
 fn write(self: *Self, gpa: std.mem.Allocator) !void {
     self.zsynth.display.reset();
     try self.space.write(gpa, &self.zsynth.display);
+    if (self.zsynth.cursor.selection_dragging)
+        try self.space.writeSelectionMarquee(
+            gpa,
+            &self.zsynth.display,
+            .{
+                .x = self.zsynth.cursor.selection_anchor[0],
+                .y = self.zsynth.cursor.selection_anchor[1],
+            },
+            .{
+                .x = self.zsynth.cursor.drag_position[0],
+                .y = self.zsynth.cursor.drag_position[1],
+            },
+        );
 }
 
 /// Remembers a successfully saved or loaded graph path for the UI title.
@@ -350,7 +364,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     if (display.impl != .graphic) return;
 
     const graphic = &display.impl.graphic;
-    const selected = self.space.selected_node orelse return;
+    const selected = self.space.singleSelectedNode() orelse return;
     if (selected.isNoop() or selected.idx >= self.dsp.nodes.len) return;
 
     if (graphic.height < 2 or graphic.width <= parameters_pane_padding * 2)
@@ -681,7 +695,7 @@ fn writeReflectedParameters(
     }
 
     if (self.parameter_editor.active) |active| {
-        if (self.space.selected_node) |selected| {
+        if (self.space.singleSelectedNode()) |selected| {
             if (active.node.idx == selected.idx) {
                 for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |cell| {
                     if (!cell.editable or !sameParameter(
@@ -721,7 +735,7 @@ fn keyUpDown(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
     if (self.parameter_editor.active == null) {
-        if (self.space.selected_node) |selected| {
+        if (self.space.singleSelectedNode()) |selected| {
             if (selected.idx < self.dsp.nodes.len and
                 std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
             {
@@ -825,10 +839,9 @@ fn keyUpDown(
         },
         .d => {
             if (command) {
-                const selected = self.space.selected_node orelse return false;
-                try self.duplicateSelectedNode(gpa, selected, shift);
-            } else if (self.space.selected_node) |selected| {
-                try self.remove(gpa, selected);
+                try self.duplicateSelectedNodes(gpa, shift);
+            } else if (self.space.selected_count != 0) {
+                try self.removeSelectedNodes(gpa);
             } else return false;
         },
         .escape => {
@@ -842,21 +855,90 @@ fn keyUpDown(
     return true;
 }
 
-/// Duplicates a node with fresh runtime state and rebuilds the editor graph.
-fn duplicateSelectedNode(
-    self: *Self,
-    gpa: std.mem.Allocator,
-    selected: VisualNode.Index,
-    link_parameters: bool,
-) !void {
-    if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output)
+/// Duplicates the complete current selection using one shared group offset.
+fn duplicateSelectedNodes(self: *Self, gpa: std.mem.Allocator, link_parameters: bool) !void {
+    if (self.space.selected_count == 0) return;
+    if (self.space.selected_count == 1) {
+        try self.duplicateSelectedNode(gpa, self.space.selected_nodes[0], link_parameters);
         return;
+    }
 
-    const source_position = self.space.nodePosition(selected);
-    const source_footprint = self.space.nodeFootprint(selected);
-    const source_name = self.dsp.nodes.items(.name)[selected.idx];
-    const source_state = self.dsp.nodes.items(.state)[selected.idx];
-    const duplicate = switch (source_state) {
+    var sources: [16]VisualNode.Index = undefined;
+    var source_count: usize = 0;
+    var north_west = Space.Position{ .x = std.math.maxInt(i32), .y = std.math.maxInt(i32) };
+    var south_east = Space.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
+    for (self.space.selected_nodes[0..self.space.selected_count]) |source| {
+        if (std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]) == .output) continue;
+        sources[source_count] = source;
+        source_count += 1;
+        const footprint = self.space.nodeFootprint(source);
+        const position = self.space.nodePosition(source);
+        north_west.x = @min(north_west.x, position.x);
+        north_west.y = @min(north_west.y, position.y);
+        south_east.x = @max(south_east.x, position.x + @as(i32, @intCast(footprint.width)));
+        south_east.y = @max(south_east.y, position.y + @as(i32, @intCast(footprint.height)));
+    }
+    if (source_count == 0) return;
+
+    const offset = self.space.findFreeGroupOffset(sources[0..source_count], .{
+        .x = south_east.x - north_west.x + 3,
+        .y = 0,
+    }) orelse return error.InvalidVisualNodeLayout;
+
+    var duplicates: [16]VisualNode.Index = undefined;
+    var duplicate_count: usize = 0;
+    errdefer {
+        while (duplicate_count > 0) {
+            duplicate_count -= 1;
+            const duplicate = duplicates[duplicate_count];
+            self.dsp.remove(gpa, duplicate);
+            self.space.remove(gpa, duplicate) catch {};
+        }
+    }
+
+    for (sources[0..source_count]) |source| {
+        const position = self.space.nodePosition(source);
+        duplicates[duplicate_count] = try self.duplicateNodeAt(
+            gpa,
+            source,
+            .{ .x = position.x + offset.x, .y = position.y + offset.y },
+            link_parameters,
+        );
+        duplicate_count += 1;
+    }
+
+    self.releaseSelectedKeyboards();
+    self.space.selectSingle(duplicates[0]);
+    for (duplicates[1..duplicate_count]) |duplicate|
+        self.space.toggleSelection(duplicate);
+    self.refreshSelectionUi();
+    try self.space.computePaths(gpa);
+    _ = self.space.revealNode(duplicates[0]);
+    self.zsynth.cursor.dirty = true;
+    try self.write(gpa);
+}
+
+/// Removes every currently selected node while preserving index validity.
+fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
+    var nodes: [16]VisualNode.Index = undefined;
+    const count = self.space.selected_count;
+    @memcpy(nodes[0..count], self.space.selected_nodes[0..count]);
+    self.releaseSelectedKeyboards();
+    var index = count;
+    while (index > 0) {
+        index -= 1;
+        try self.remove(gpa, nodes[index]);
+    }
+    self.setNodeSelection(null);
+    try self.space.computePaths(gpa);
+    self.zsynth.cursor.dirty = true;
+    try self.write(gpa);
+}
+
+/// Creates a fresh runtime node with the same user-facing state as a source.
+fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
+    const source_name = self.dsp.nodes.items(.name)[source.idx];
+    return switch (self.dsp.nodes.items(.state)[source.idx]) {
         .add => DSP.Node.Add.create(source_name),
         .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
         .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
@@ -871,23 +953,54 @@ fn duplicateSelectedNode(
         .oscillator => |value| DSP.Node.Oscillator.create(source_name, value.parameters),
         .output => DSP.Node.Output.create(source_name),
     };
-    const duplicate_index = try self.dsp.addNode(gpa, duplicate);
-    errdefer self.dsp.remove(gpa, duplicate_index);
+}
 
+/// Adds a duplicate at an explicit visual position and optionally links its parameters.
+fn duplicateNodeAt(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    source: VisualNode.Index,
+    position: Space.Position,
+    link_parameters: bool,
+) !VisualNode.Index {
+    if (std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]) == .output)
+        return error.InvalidVisualNodeLayout;
+    const duplicate_index = try self.dsp.addNode(gpa, self.duplicateNodeState(source));
+    errdefer self.dsp.remove(gpa, duplicate_index);
+    try self.space.addNode(gpa, duplicate_index, position);
+    errdefer self.space.remove(gpa, duplicate_index) catch {};
+    if (!try self.space.rebuildOccupancy(gpa))
+        return error.InvalidVisualNodeLayout;
+    if (link_parameters)
+        _ = self.dsp.linkParameters(source, duplicate_index);
+    return duplicate_index;
+}
+
+/// Duplicates a node with fresh runtime state and rebuilds the editor graph.
+fn duplicateSelectedNode(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    selected: VisualNode.Index,
+    link_parameters: bool,
+) !void {
+    if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output)
+        return;
+
+    const source_position = self.space.nodePosition(selected);
+    const source_footprint = self.space.nodeFootprint(selected);
     const duplicate_position = self.space.findFreePosition(
-        duplicate_index,
+        selected,
         .{
             .x = source_position.x + @as(i32, @intCast(source_footprint.width)) + 3,
             .y = source_position.y,
         },
     ) orelse return error.InvalidVisualNodeLayout;
-    try self.space.addNode(gpa, duplicate_index, duplicate_position);
-    errdefer self.space.remove(gpa, duplicate_index) catch {};
-    if (!try self.space.rebuildOccupancy(gpa))
-        return error.InvalidVisualNodeLayout;
-
-    if (link_parameters)
-        _ = self.dsp.linkParameters(selected, duplicate_index);
+    const duplicate_index = try self.duplicateNodeAt(
+        gpa,
+        selected,
+        duplicate_position,
+        link_parameters,
+    );
 
     try self.space.computePaths(gpa);
     self.setNodeSelection(duplicate_index);
@@ -946,7 +1059,7 @@ fn beginParameterEdit(self: *Self, parameter: ParameterEditor.ParameterCell) voi
     if (self.parameter_editor.active != null)
         self.commitParameterEdit();
 
-    const node = self.space.selected_node orelse return;
+    const node = self.space.singleSelectedNode() orelse return;
     self.parameter_editor.active = .{
         .node = .{ .idx = node.idx },
         .field_name = parameter.field_name,
@@ -1017,7 +1130,7 @@ fn commitParameterEdit(self: *Self) void {
     self.dsp.withGraphLock(&context, commitParameterLocked);
     var buffer: [64]u8 = undefined;
     const active = self.parameter_editor.active orelse return;
-    const node = self.space.selected_node orelse return;
+    const node = self.space.singleSelectedNode() orelse return;
     self.parameter_editor.text_field.setInput(
         self.formatNodeParameter(
             node.idx,
@@ -1250,10 +1363,15 @@ fn mouseButton(
     }
 
     if (event.button == 1) {
-        self.zsynth.cursor.left_mouse_down = event.down;
-        self.zsynth.cursor.left_mouse_moved = false;
-
         if (event.down) {
+            self.zsynth.cursor.left_mouse_down = true;
+            self.zsynth.cursor.left_mouse_moved = false;
+            self.zsynth.cursor.selection_dragging = false;
+            const keyboard_state = sdl.getKeyboardState();
+            const control = (keyboard_state.len > @backingInt(sdl.Scancode.lctrl) and
+                keyboard_state[@backingInt(sdl.Scancode.lctrl)]) or
+                (keyboard_state.len > @backingInt(sdl.Scancode.rctrl) and
+                    keyboard_state[@backingInt(sdl.Scancode.rctrl)]);
             const cell = self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
             if (cell) |display_cell| {
                 if (self.parameterCellAt(display_cell)) |parameter| {
@@ -1292,31 +1410,70 @@ fn mouseButton(
                 }
             }
 
-            self.setNodeSelection(if (cell) |display_cell|
+            const node = if (cell) |display_cell|
                 self.space.nodeAtDisplayCell(display_cell[0], display_cell[1])
             else
-                null);
+                null;
+            if (node) |selected| {
+                if (control) {
+                    self.releaseSelectedKeyboards();
+                    self.space.toggleSelection(selected);
+                    self.refreshSelectionUi();
+                    self.zsynth.cursor.left_mouse_down = false;
+                } else if (!(self.space.selected_count > 1 and self.space.isSelected(selected))) {
+                    self.setNodeSelection(selected);
+                } else {
+                    self.refreshSelectionUi();
+                }
+            } else {
+                self.setNodeSelection(null);
+                if (cell) |display_cell| {
+                    const world = self.space.worldPositionAtDisplayCell(
+                        display_cell[0],
+                        display_cell[1],
+                    );
+                    self.zsynth.cursor.selection_anchor = .{ world.x, world.y };
+                    self.zsynth.cursor.drag_position = .{ world.x, world.y };
+                    self.zsynth.cursor.selection_dragging = true;
+                }
+            }
             self.zsynth.cursor.dirty = true;
 
-            if (cell) |display_cell| if (self.space.selected_node) |node| {
-                if (!node.isNoop()) {
-                    _ = self.space.revealNode(node);
+            if (cell) |display_cell| if (!control) if (self.space.nodeAtDisplayCell(
+                display_cell[0],
+                display_cell[1],
+            )) |grabbed| {
+                if (!grabbed.isNoop() and self.space.isSelected(grabbed)) {
+                    _ = self.space.revealNode(grabbed);
                     const world = self.space.worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
-                    const position = self.space.nodePosition(node);
-                    self.zsynth.cursor.drag_offset = .{
-                        world.x - position.x,
-                        world.y - position.y,
-                    };
                     self.zsynth.cursor.drag_position = .{ world.x, world.y };
                 }
             };
             try self.write(gpa);
-        } else if (self.zsynth.cursor.left_mouse_moved) {
-            try self.space.computePaths(gpa);
-            self.zsynth.cursor.left_mouse_moved = false;
-            try self.write(gpa);
         } else {
-            self.zsynth.cursor.left_mouse_moved = false;
+            self.zsynth.cursor.left_mouse_down = false;
+            if (self.zsynth.cursor.selection_dragging) {
+                self.space.selectRectangle(
+                    .{
+                        .x = self.zsynth.cursor.selection_anchor[0],
+                        .y = self.zsynth.cursor.selection_anchor[1],
+                    },
+                    .{
+                        .x = self.zsynth.cursor.drag_position[0],
+                        .y = self.zsynth.cursor.drag_position[1],
+                    },
+                );
+                self.refreshSelectionUi();
+                self.zsynth.cursor.selection_dragging = false;
+                self.zsynth.cursor.left_mouse_moved = false;
+                try self.write(gpa);
+            } else if (self.zsynth.cursor.left_mouse_moved) {
+                try self.space.computePaths(gpa);
+                self.zsynth.cursor.left_mouse_moved = false;
+                try self.write(gpa);
+            } else {
+                self.zsynth.cursor.left_mouse_moved = false;
+            }
         }
         return true;
     }
@@ -1326,6 +1483,15 @@ fn mouseButton(
     self.zsynth.cursor.middle_mouse_down = event.down;
     self.zsynth.cursor.viewport_pan_remainder = .{ 0, 0 };
     return true;
+}
+
+/// Releases keyboard notes before a mouse selection replaces the current set.
+fn releaseSelectedKeyboards(self: *Self) void {
+    for (self.space.selected_nodes[0..self.space.selected_count]) |selected| {
+        if (selected.idx < self.dsp.nodes.len and
+            std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
+            self.dsp.keyboardReleaseAll(.{ .idx = selected.idx });
+    }
 }
 
 /// Enter the temporary state used while connecting an outlet to another outlet.
@@ -1411,7 +1577,22 @@ fn mouseMoved(
     if (self.zsynth.cursor.left_mouse_down) {
         if (event.state.left == 0) {
             self.zsynth.cursor.left_mouse_down = false;
-            if (self.zsynth.cursor.left_mouse_moved) {
+            if (self.zsynth.cursor.selection_dragging) {
+                self.space.selectRectangle(
+                    .{
+                        .x = self.zsynth.cursor.selection_anchor[0],
+                        .y = self.zsynth.cursor.selection_anchor[1],
+                    },
+                    .{
+                        .x = self.zsynth.cursor.drag_position[0],
+                        .y = self.zsynth.cursor.drag_position[1],
+                    },
+                );
+                self.refreshSelectionUi();
+                self.zsynth.cursor.selection_dragging = false;
+                self.zsynth.cursor.left_mouse_moved = false;
+                try self.write(gpa);
+            } else if (self.zsynth.cursor.left_mouse_moved) {
                 try self.space.computePaths(gpa);
                 self.zsynth.cursor.left_mouse_moved = false;
                 try self.write(gpa);
@@ -1425,19 +1606,21 @@ fn mouseMoved(
         if (cursor_position.drag_position[0] == world.x and
             cursor_position.drag_position[1] == world.y)
             return true;
+        const previous_world = cursor_position.drag_position;
         cursor_position.drag_position = .{ world.x, world.y };
 
-        if (self.space.selected_node) |node| {
-            if (!node.isNoop()) {
-                const position = Space.Position{
-                    .x = world.x - cursor_position.drag_offset[0],
-                    .y = world.y - cursor_position.drag_offset[1],
-                };
-                if (try self.space.moveNode(gpa, node, position)) {
-                    cursor_position.left_mouse_moved = true;
-                    try self.space.recomputePathsForNode(gpa, node);
-                    try self.write(gpa);
-                }
+        if (cursor_position.selection_dragging) {
+            cursor_position.left_mouse_moved = true;
+            try self.write(gpa);
+        } else if (self.space.selected_count != 0) {
+            const moved = try self.space.moveSelectedNodes(gpa, .{
+                .x = world.x - previous_world[0],
+                .y = world.y - previous_world[1],
+            });
+            if (moved) {
+                cursor_position.left_mouse_moved = true;
+                try self.space.computePaths(gpa);
+                try self.write(gpa);
             }
         }
         return true;
@@ -1521,7 +1704,7 @@ fn render(
 fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
     self.dsp.remove(gpa, node);
     try self.space.remove(gpa, node);
-    self.setNodeSelection(self.space.selected_node);
+    self.refreshSelectionUi();
     self.zsynth.cursor.dirty = true;
     try self.write(gpa);
 }

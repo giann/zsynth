@@ -8,7 +8,10 @@ const Self = @This();
 viewport: Viewport,
 dsp: *DSP,
 nodes: std.MultiArrayList(VisualNode) = .empty,
-selected_node: ?VisualNode.Index = null,
+/// Fixed-capacity set of currently selected visual nodes.
+selected_nodes: [16]VisualNode.Index = undefined,
+/// Number of valid entries in `selected_nodes`.
+selected_count: u8 = 0,
 graph_north_west: Position = .{ .x = 0, .y = 0 },
 graph_south_east: Position = .{ .x = 0, .y = 0 },
 // Keep track of occupied positions
@@ -107,7 +110,7 @@ pub fn writeUiOverlay(
     cell_x: u32,
     cell_y: u32,
 ) !void {
-    if (self.selected_node) |node|
+    if (self.singleSelectedNode()) |node|
         try self.writeSelectedOutletLabels(gpa, display, node);
 
     const hovered = self.outletAt(self.worldPositionAtDisplayCell(cell_x, cell_y)) orelse return;
@@ -263,6 +266,88 @@ pub fn findFreePosition(
     return null;
 }
 
+/// Finds one translation that places a group of nodes outside the occupied
+/// layout while preserving each node's position relative to the group.
+pub fn findFreeGroupOffset(
+    self: *Self,
+    nodes: []const VisualNode.Index,
+    preferred: Position,
+) ?Position {
+    var radius: i64 = 0;
+    while (radius <= std.math.maxInt(i32)) : (radius += 1) {
+        const left = @as(i64, preferred.x) - radius;
+        const right = @as(i64, preferred.x) + radius;
+        const top = @as(i64, preferred.y) - radius;
+        const bottom = @as(i64, preferred.y) + radius;
+
+        if (self.canPlaceGroupAtI64(nodes, preferred.x, preferred.y))
+            return preferred;
+        if (radius == 0) continue;
+
+        var x = left;
+        while (x <= right) : (x += 1) {
+            if (self.canPlaceGroupAtI64(nodes, x, top))
+                return .{ .x = @intCast(x), .y = @intCast(top) };
+            if (self.canPlaceGroupAtI64(nodes, x, bottom))
+                return .{ .x = @intCast(x), .y = @intCast(bottom) };
+        }
+        var y = top + 1;
+        while (y < bottom) : (y += 1) {
+            if (self.canPlaceGroupAtI64(nodes, left, y))
+                return .{ .x = @intCast(left), .y = @intCast(y) };
+            if (self.canPlaceGroupAtI64(nodes, right, y))
+                return .{ .x = @intCast(right), .y = @intCast(y) };
+        }
+    }
+    return null;
+}
+
+/// Tests a translated group against existing occupancy and its own footprints.
+fn canPlaceGroupAtI64(self: *Self, nodes: []const VisualNode.Index, offset_x: i64, offset_y: i64) bool {
+    var positions: [16]Position = undefined;
+    var bounds: [16]SearchBound = undefined;
+    for (nodes, 0..) |node, index| {
+        const source = self.nodePosition(node);
+        const x = @as(i64, source.x) + offset_x;
+        const y = @as(i64, source.y) + offset_y;
+        if (x < std.math.minInt(i32) + 2 or y < std.math.minInt(i32) + 1 or
+            x > std.math.maxInt(i32) - 32 or y > std.math.maxInt(i32) - 32)
+            return false;
+        positions[index] = .{ .x = @intCast(x), .y = @intCast(y) };
+        const footprint = self.nodeFootprintAt(node, positions[index]);
+        bounds[index] = .{
+            .left = x - 2,
+            .top = y - 1,
+            .right = x + @as(i64, @intCast(footprint.width)),
+            .bottom = y + @as(i64, @intCast(footprint.height)),
+        };
+
+        var occupied_y = bounds[index].top;
+        while (occupied_y <= bounds[index].bottom) : (occupied_y += 1) {
+            var occupied_x = bounds[index].left;
+            while (occupied_x <= bounds[index].right) : (occupied_x += 1)
+                if (self.occupied.get(.{
+                    .x = @intCast(occupied_x),
+                    .y = @intCast(occupied_y),
+                }) != null)
+                    return false;
+        }
+    }
+
+    for (nodes, 0..) |_, first| {
+        for (nodes[first + 1 ..], first + 1..) |_, second| {
+            const first_bound = bounds[first];
+            const second_bound = bounds[second];
+            if (first_bound.left <= second_bound.right and
+                first_bound.right >= second_bound.left and
+                first_bound.top <= second_bound.bottom and
+                first_bound.bottom >= second_bound.top)
+                return false;
+        }
+    }
+    return true;
+}
+
 /// Returns the world-space center cell of the current viewport.
 pub fn viewportCenter(self: *Self) Position {
     return self.worldPositionAtDisplayCell(self.viewport.width / 2, self.viewport.height / 2);
@@ -412,9 +497,107 @@ pub fn reset(self: *Self, gpa: std.mem.Allocator) void {
     self.nodes.clearRetainingCapacity();
     self.occupied.clearRetainingCapacity();
     self.path_occupied.clearRetainingCapacity();
-    self.selected_node = null;
+    self.clearSelection();
     self.graph_north_west = .{ .x = 0, .y = 0 };
     self.graph_south_east = .{ .x = 0, .y = 0 };
+}
+
+/// Returns the selected node when the selection contains exactly one node.
+pub fn singleSelectedNode(self: *const Self) ?VisualNode.Index {
+    if (self.selected_count != 1) return null;
+    return self.selected_nodes[0];
+}
+
+/// Clears every selected node.
+pub fn clearSelection(self: *Self) void {
+    self.selected_count = 0;
+}
+
+/// Returns whether a node is currently selected.
+pub fn isSelected(self: *const Self, node: VisualNode.Index) bool {
+    for (self.selected_nodes[0..self.selected_count]) |selected|
+        if (selected.idx == node.idx) return true;
+    return false;
+}
+
+/// Selects one node, preserving the editor's single-click behavior.
+pub fn selectSingle(self: *Self, node: ?VisualNode.Index) void {
+    self.clearSelection();
+    if (node) |value| {
+        if (!value.isNoop() and value.idx < self.nodes.len) {
+            self.selected_nodes[0] = value;
+            self.selected_count = 1;
+        }
+    }
+}
+
+/// Adds or removes a node from the selection while keeping the output node
+/// out of multi-selections.
+pub fn toggleSelection(self: *Self, node: VisualNode.Index) void {
+    if (node.isNoop() or node.idx >= self.nodes.len) return;
+
+    if (self.isSelected(node)) {
+        var index: usize = 0;
+        while (index < self.selected_count) : (index += 1) {
+            if (self.selected_nodes[index].idx != node.idx) continue;
+            const last = self.selected_count - 1;
+            if (index != last)
+                self.selected_nodes[index] = self.selected_nodes[last];
+            self.selected_count -= 1;
+            return;
+        }
+    }
+
+    const is_output = std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx]) == .output;
+    if (is_output) {
+        self.selectSingle(node);
+        return;
+    }
+
+    if (self.selected_count == 1) {
+        const selected = self.selected_nodes[0];
+        if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output)
+            self.clearSelection();
+    }
+    if (self.selected_count >= self.selected_nodes.len) return;
+    self.selected_nodes[self.selected_count] = node;
+    self.selected_count += 1;
+}
+
+/// Selects nodes whose footprints intersect the inclusive world-space drag
+/// rectangle, excluding the output node when other nodes are selected.
+pub fn selectRectangle(self: *Self, anchor: Position, endpoint: Position) void {
+    self.clearSelection();
+
+    const left = @as(i64, @min(anchor.x, endpoint.x));
+    const top = @as(i64, @min(anchor.y, endpoint.y));
+    const right = @as(i64, @max(anchor.x, endpoint.x)) + 1;
+    const bottom = @as(i64, @max(anchor.y, endpoint.y)) + 1;
+    var output: ?VisualNode.Index = null;
+
+    for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
+        if (node.isNoop()) continue;
+        const visual_node = VisualNode.Index{ .idx = node_index };
+        const footprint = self.nodeFootprint(visual_node);
+        const intersects = @as(i64, footprint.x) < right and
+            @as(i64, footprint.x) + @as(i64, footprint.width) > left and
+            @as(i64, footprint.y) < bottom and
+            @as(i64, footprint.y) + @as(i64, footprint.height) > top;
+        if (!intersects) continue;
+
+        if (std.meta.activeTag(self.dsp.nodes.items(.state)[node_index]) == .output) {
+            output = visual_node;
+            continue;
+        }
+        if (self.selected_count < self.selected_nodes.len) {
+            self.selected_nodes[self.selected_count] = visual_node;
+            self.selected_count += 1;
+        }
+    }
+
+    if (self.selected_count == 0)
+        if (output) |node|
+            self.selectSingle(node);
 }
 
 /// Move one visual node and rebuild the cells used by routing.
@@ -433,6 +616,35 @@ pub fn moveNode(
     if (try self.rebuildOccupancy(gpa)) return true;
 
     self.nodes.items(.position)[node.idx] = previous;
+    self.updateGraphBounds();
+    _ = try self.rebuildOccupancy(gpa);
+    return false;
+}
+
+/// Moves every selected node by one shared delta and rolls back atomically if
+/// the resulting group collides with another node or leaves the integer space.
+pub fn moveSelectedNodes(self: *Self, gpa: std.mem.Allocator, delta: Position) !bool {
+    if (self.selected_count == 0 or (delta.x == 0 and delta.y == 0)) return false;
+
+    var previous: [16]Position = undefined;
+    for (self.selected_nodes[0..self.selected_count], 0..) |node, index|
+        previous[index] = self.nodePosition(node);
+
+    for (self.selected_nodes[0..self.selected_count], 0..) |node, index| {
+        const x = @addWithOverflow(previous[index].x, delta.x);
+        const y = @addWithOverflow(previous[index].y, delta.y);
+        if (x[1] != 0 or y[1] != 0) return false;
+        self.nodes.items(.position)[node.idx] = .{
+            .x = x[0],
+            .y = y[0],
+        };
+    }
+
+    self.updateGraphBounds();
+    if (try self.rebuildOccupancy(gpa)) return true;
+
+    for (self.selected_nodes[0..self.selected_count], 0..) |node, index|
+        self.nodes.items(.position)[node.idx] = previous[index];
     self.updateGraphBounds();
     _ = try self.rebuildOccupancy(gpa);
     return false;
@@ -519,12 +731,19 @@ pub fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void
     self.clearPaths(gpa);
     self.path_occupied.clearRetainingCapacity();
 
-    if (self.selected_node) |selected| {
+    var selected_index: usize = 0;
+    while (selected_index < self.selected_count) {
+        const selected = self.selected_nodes[selected_index];
         if (selected.idx == node.idx) {
-            self.selected_node = null;
-        } else if (selected.idx == self.nodes.len - 1) {
-            self.selected_node = .{ .idx = node.idx };
+            const last_selected = self.selected_count - 1;
+            if (selected_index != last_selected)
+                self.selected_nodes[selected_index] = self.selected_nodes[last_selected];
+            self.selected_count -= 1;
+            continue;
         }
+        if (selected.idx == self.nodes.len - 1 and node.idx != self.nodes.len - 1)
+            self.selected_nodes[selected_index] = .{ .idx = node.idx };
+        selected_index += 1;
     }
 
     const last_index = self.nodes.len - 1;
@@ -547,14 +766,40 @@ pub fn write(
         if (!node.isNoop())
             try self.writeNode(gpa, display, node);
 
-    if (self.selected_node) |node| {
-        if (!node.isNoop()) {
+    for (self.selected_nodes[0..self.selected_count]) |node| {
+        if (!node.isNoop() and node.idx < self.nodes.len) {
             try self.writeNodeBody(gpa, display, node, .ebony);
             try self.writeOutgoingPaths(gpa, display, node, .ebony);
         }
     }
 
     try self.writeOutputTail(gpa, display);
+}
+
+/// Draws the transient amber marquee used to select nodes in empty space.
+pub fn writeSelectionMarquee(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    display: *Display,
+    anchor: Position,
+    endpoint: Position,
+) !void {
+    const left = @as(i64, @min(anchor.x, endpoint.x)) - self.viewport.x;
+    const top = @as(i64, @min(anchor.y, endpoint.y)) - self.viewport.y;
+    const right = @as(i64, @max(anchor.x, endpoint.x)) - self.viewport.x;
+    const bottom = @as(i64, @max(anchor.y, endpoint.y)) - self.viewport.y;
+
+    var y = top;
+    while (y <= bottom) : (y += 1) {
+        var x = left;
+        while (x <= right) : (x += 1) {
+            if (x != left and x != right and y != top and y != bottom) continue;
+            if (x < 0 or y < 0 or
+                x >= self.viewport.width or y >= self.viewport.height)
+                continue;
+            try display.write(gpa, "+", @intCast(x), @intCast(y), .amber, .mine_shaft);
+        }
+    }
 }
 
 /// Draws the fixed external-audio marker beyond the configured output node.

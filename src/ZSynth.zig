@@ -43,6 +43,10 @@ pub const CursorState = struct {
     drag_offset: [2]i32 = .{ 0, 0 },
     /// Last world/display-cell position observed during the drag.
     drag_position: [2]i32 = .{ 0, 0 },
+    /// World/display-cell position where an empty-space selection began.
+    selection_anchor: [2]i32 = .{ 0, 0 },
+    /// Whether the current left drag is drawing a selection marquee.
+    selection_dragging: bool = false,
 };
 
 /// The I/O context shared with the renderer and asset loader.
