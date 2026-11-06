@@ -277,35 +277,28 @@ fn groupMemberSlotLocked(self: *const DSP, group: Node.Index, member: Node.Index
     return null;
 }
 
-/// Rebuilds one cached group identity after a structural graph mutation.
+/// Rebuilds one cached group hash after a structural graph mutation.
 fn rebuildGroupSubgraphHashLocked(self: *DSP, group: Node.Index) void {
     assert(group.idx < self.nodes.len);
     assert(std.meta.activeTag(self.nodes.items(.state)[group.idx]) == .group);
 
     const old_hash = self.nodes.items(.group_subgraph_hash)[group.idx];
-    var key = Node.GroupSubgraphKey{};
+    var hasher = std.hash.Fnv1a_64.init();
     const group_state = self.nodes.items(.state)[group.idx].group;
-    key.member_count = group_state.member_count;
+    hasher.update(&[_]u8{group_state.member_count});
 
-    for (group_state.members[0..group_state.member_count], 0..) |member, slot| {
+    for (group_state.members[0..group_state.member_count]) |member| {
         assert(member.idx < self.nodes.len);
-        key.member_tags[slot] = @backingInt(std.meta.activeTag(self.nodes.items(.state)[member.idx]));
+        hasher.update(&[_]u8{@backingInt(std.meta.activeTag(self.nodes.items(.state)[member.idx]))});
 
-        for (self.nodes.items(.inputs)[member.idx], 0..) |connection, input_port| {
-            if (connection.isNoop()) continue;
-            const descriptor = &key.inputs[slot][input_port];
-            if (self.groupMemberSlotLocked(group, connection.node)) |source_slot| {
-                descriptor.* = .{
-                    .kind = 1,
-                    .index = source_slot,
-                    .port = connection.output_port,
-                };
-                continue;
-            }
-
-            switch (self.nodes.items(.state)[connection.node.idx]) {
+        for (self.nodes.items(.inputs)[member.idx]) |connection| {
+            if (connection.isNoop()) {
+                hasher.update(&[_]u8{ 0, 0, 0 });
+            } else if (self.groupMemberSlotLocked(group, connection.node)) |source_slot| {
+                hasher.update(&[_]u8{ 1, source_slot, connection.output_port });
+            } else switch (self.nodes.items(.state)[connection.node.idx]) {
                 .group_input => |endpoint| if (endpoint.group.idx == group.idx) {
-                    descriptor.* = .{ .kind = 2, .index = endpoint.port };
+                    hasher.update(&[_]u8{ 2, endpoint.port, 0 });
                 } else {
                     assert(false);
                     unreachable;
@@ -319,34 +312,40 @@ fn rebuildGroupSubgraphHashLocked(self: *DSP, group: Node.Index) void {
 
         if (self.nodes.items(.parameter_link)[member.idx].source) |source| {
             if (self.groupMemberSlotLocked(group, source)) |source_slot| {
-                key.parameter_sources[slot] = source_slot;
+                hasher.update(&[_]u8{ 1, source_slot });
             } else {
                 assert(false);
                 unreachable;
             }
+        } else {
+            hasher.update(&[_]u8{0});
         }
     }
 
-    for (group_state.input_bindings, 0..) |binding, port| {
+    for (group_state.input_bindings) |binding| {
         if (binding) |value| {
             const slot = self.groupMemberSlotLocked(group, value.node) orelse {
                 assert(false);
                 unreachable;
             };
-            key.input_bindings[port] = .{ .node = .{ .idx = slot }, .port = value.port };
+            hasher.update(&[_]u8{ 1, slot, value.port });
+        } else {
+            hasher.update(&[_]u8{0});
         }
     }
-    for (group_state.output_bindings, 0..) |binding, port| {
+    for (group_state.output_bindings) |binding| {
         if (binding) |value| {
             const slot = self.groupMemberSlotLocked(group, value.node) orelse {
                 assert(false);
                 unreachable;
             };
-            key.output_bindings[port] = .{ .node = .{ .idx = slot }, .port = value.port };
+            hasher.update(&[_]u8{ 1, slot, value.port });
+        } else {
+            hasher.update(&[_]u8{0});
         }
     }
 
-    const hash = key.hash();
+    const hash = hasher.final();
     self.nodes.items(.group_subgraph_hash)[group.idx] = hash;
     if (old_hash == hash) return;
 
@@ -1270,14 +1269,6 @@ pub const Note = struct {
 
 /// A processable node in the audio graph.
 pub const Node = struct {
-    /// Reciprocal one-to-one parameter relationships for a node.
-    pub const ParameterLink = struct {
-        /// Node whose parameters this node copies, if any.
-        source: ?Node.Index = null,
-        /// Node that copies this node's parameters, if any.
-        target: ?Node.Index = null,
-    };
-
     /// Concrete node parameters and mutable runtime state.
     state: State,
     /// Cached hash of the group's structural identity.
@@ -1296,6 +1287,67 @@ pub const Node = struct {
     process: Process,
     /// Reciprocal parameter source and target links.
     parameter_link: ParameterLink = .{},
+
+    pub const Tag = enum {
+        add,
+        adsr,
+        bit_crusher,
+        constant,
+        keyboard,
+        mixer,
+        monophonic_sequencer,
+        multimode_filter,
+        multiply,
+        noise,
+        noop,
+        oscillator,
+        output,
+        group,
+        group_input,
+        group_output,
+    };
+
+    /// Tagged union containing the concrete state for each node kind.
+    pub const State = union(Tag) {
+        /// Sum node state.
+        add: Add,
+        /// Envelope generator state.
+        adsr: ADSR,
+        /// Sample-rate and bit-depth reduction state.
+        bit_crusher: BitCrusher,
+        /// Constant-value source state.
+        constant: Constant,
+        /// Computer-keyboard note source state.
+        keyboard: Keyboard,
+        /// Multi-input mixer state.
+        mixer: Mixer,
+        /// Monophonic note sequencer state.
+        monophonic_sequencer: MonophonicSequencer,
+        /// State-variable filter state.
+        multimode_filter: MultimodeFilter,
+        /// Product node state.
+        multiply: Multiply,
+        /// Colored-noise generator state.
+        noise: Noise,
+        /// Unplugged-input sentinel state.
+        noop: Noop,
+        /// Oscillator state.
+        oscillator: Oscillator,
+        /// Graph output forwarding state.
+        output: Output,
+        /// Non-nested proxy around a fixed set of member nodes.
+        group: Group,
+        group_input: GroupInput,
+        group_output: GroupOutput,
+    };
+
+    /// Reciprocal one-to-one parameter relationships for a node.
+    pub const ParameterLink = struct {
+        /// Node whose parameters this node copies, if any.
+        source: ?Node.Index = null,
+        /// Node that copies this node's parameters, if any.
+        target: ?Node.Index = null,
+    };
 
     /// Static metadata for one node input or output.
     pub const OutletMetadata = struct {
@@ -1320,61 +1372,6 @@ pub const Node = struct {
         outputs: [max_outlets]OutletMetadata = @splat(.{}),
         output_count: u8 = 1,
         input_count: u8 = 1,
-    };
-
-    /// One cached source descriptor used by a group's structural identity.
-    pub const GroupSubgraphConnection = struct {
-        /// Zero is unconnected, one is a member slot, and two is a group input.
-        kind: u8 = 0,
-        /// Member slot or group-input port, depending on `kind`.
-        index: u8 = 0,
-        /// Source output port, or zero for a group-input boundary.
-        port: u8 = 0,
-    };
-
-    /// Exact bounded identity for a group's ordered subgraph.
-    pub const GroupSubgraphKey = struct {
-        /// Number of ordered member slots represented by the key.
-        member_count: u8 = 0,
-        /// Node kind for every member slot.
-        member_tags: [max_group_members]u8 = @splat(0),
-        /// Source descriptors for each member input port.
-        inputs: [max_group_members][max_outlets]GroupSubgraphConnection = @splat(@splat(.{})),
-        /// Internal parameter source slot for each member, if present.
-        parameter_sources: [max_group_members]?u8 = @splat(null),
-        /// Member binding for each exposed group input port.
-        input_bindings: [max_outlets]?Node.PortBinding = @splat(null),
-        /// Member binding for each exposed group output port.
-        output_bindings: [max_outlets]?Node.PortBinding = @splat(null),
-
-        /// Hashes the canonical structural representation without hashing padding.
-        pub fn hash(self: GroupSubgraphKey) u64 {
-            var hasher = std.hash.Fnv1a_64.init();
-            hasher.update(&[_]u8{self.member_count});
-            hasher.update(&self.member_tags);
-            for (self.inputs) |member_inputs| {
-                for (member_inputs) |connection| {
-                    hasher.update(&[_]u8{ connection.kind, connection.index, connection.port });
-                }
-            }
-            for (self.parameter_sources) |source| {
-                hasher.update(&[_]u8{@intFromBool(source != null)});
-                if (source) |slot| hasher.update(&[_]u8{slot});
-            }
-            for (self.input_bindings) |binding| {
-                hasher.update(&[_]u8{@intFromBool(binding != null)});
-                if (binding) |value| {
-                    hasher.update(&[_]u8{ @intCast(value.node.idx), value.port });
-                }
-            }
-            for (self.output_bindings) |binding| {
-                hasher.update(&[_]u8{@intFromBool(binding != null)});
-                if (binding) |value| {
-                    hasher.update(&[_]u8{ @intCast(value.node.idx), value.port });
-                }
-            }
-            return hasher.final();
-        }
     };
 
     /// One child port exposed through a group boundary.
@@ -1432,59 +1429,6 @@ pub const Node = struct {
         node: Index,
         outputs: []const *Buffer,
     ) ProcessError!void;
-
-    pub const Tag = enum {
-        add,
-        adsr,
-        bit_crusher,
-        constant,
-        keyboard,
-        mixer,
-        monophonic_sequencer,
-        multimode_filter,
-        multiply,
-        noise,
-        noop,
-        oscillator,
-        output,
-        group,
-        group_input,
-        group_output,
-    };
-
-    /// Tagged union containing the concrete state for each node kind.
-    pub const State = union(Tag) {
-        /// Sum node state.
-        add: Add,
-        /// Envelope generator state.
-        adsr: ADSR,
-        /// Sample-rate and bit-depth reduction state.
-        bit_crusher: BitCrusher,
-        /// Constant-value source state.
-        constant: Constant,
-        /// Computer-keyboard note source state.
-        keyboard: Keyboard,
-        /// Multi-input mixer state.
-        mixer: Mixer,
-        /// Monophonic note sequencer state.
-        monophonic_sequencer: MonophonicSequencer,
-        /// State-variable filter state.
-        multimode_filter: MultimodeFilter,
-        /// Product node state.
-        multiply: Multiply,
-        /// Colored-noise generator state.
-        noise: Noise,
-        /// Unplugged-input sentinel state.
-        noop: Noop,
-        /// Oscillator state.
-        oscillator: Oscillator,
-        /// Graph output forwarding state.
-        output: Output,
-        /// Non-nested proxy around a fixed set of member nodes.
-        group: Group,
-        group_input: GroupInput,
-        group_output: GroupOutput,
-    };
 
     /// A node that produces silence and represents an unplugged connection.
     pub const Noop = struct {
