@@ -65,10 +65,13 @@ pub const VisualNode = struct {
     /// Whether this node can contribute to the configured DSP output.
     output_reachable: bool = false,
     paths: [DSP.max_outlets]?Path = @splat(null),
+    /// Routed parameter link entering this node from its source.
+    parameter_path: ?Path = null,
 };
 
 pub const Outlet = struct {
-    pub const Kind = enum { input, output };
+    /// Audio and parameter connection endpoint kinds.
+    pub const Kind = enum { input, output, parameter_source, parameter_target };
 
     node: VisualNode.Index,
     direction: Kind,
@@ -83,6 +86,16 @@ pub fn outletMetadata(self: *Self, outlet: Outlet) DSP.Node.OutletMetadata {
     return switch (outlet.direction) {
         .input => metadata.inputs[outlet.port],
         .output => metadata.outputs[outlet.port],
+        .parameter_source => .{
+            .name = "parameter source",
+            .short_name = "src",
+            .color = .curious_blue,
+        },
+        .parameter_target => .{
+            .name = "parameter target",
+            .short_name = "dst",
+            .color = .curious_blue,
+        },
     };
 }
 
@@ -136,6 +149,27 @@ fn writeSelectedOutletLabels(
         const y = screen_top + self.outletYOffset(footprint, metadata.output_count, port);
         const x = screen_left + @as(i64, @intCast(footprint.width));
         try writeUiText(gpa, display, x, y, outlet.short_name, outlet.color);
+    }
+
+    if (metadata.can_link_parameters) {
+        const source_x = @as(i64, self.parameterSourceX(node)) - @as(i64, self.viewport.x);
+        const target_x = @as(i64, self.parameterTargetX(node)) - @as(i64, self.viewport.x);
+        try writeUiText(
+            gpa,
+            display,
+            source_x - @as(i64, "src".len / 2),
+            screen_top - 1,
+            "src",
+            .curious_blue,
+        );
+        try writeUiText(
+            gpa,
+            display,
+            target_x - @as(i64, "dst".len / 2),
+            screen_top + @as(i64, @intCast(footprint.height)),
+            "dst",
+            .curious_blue,
+        );
     }
 }
 
@@ -622,7 +656,8 @@ fn writeNodeBody(
             try display.write(gpa, &glyph, @intCast(right_x), @intCast(left_y), background, node_color);
     }
 
-    const displayed_metadata_name = metadata.short_name[0..@min(metadata.short_name.len, content_width)];
+    // Keep one header cell available for the parameter-source outlet.
+    const displayed_metadata_name = metadata.short_name;
     const metadata_name_x = x + 1;
     for (displayed_metadata_name, 0..) |character, index| {
         const glyph = [_]u8{character};
@@ -664,6 +699,34 @@ fn writeNodeBody(
         if (outlet_x >= 0 and outlet_y >= 0)
             try display.write(gpa, &outlet, @intCast(outlet_x), @intCast(outlet_y), background, color);
     }
+
+    if (metadata.can_link_parameters) {
+        const links = self.dsp.nodes.items(.parameter_link)[node.idx];
+        const source_color = if (links.source != null)
+            Display.Color.curious_blue
+        else
+            Display.Color.gray;
+        const target_color = if (links.target != null)
+            Display.Color.curious_blue
+        else
+            Display.Color.gray;
+        const source_x = x + @as(i64, @intCast(self.parameterSourceX(node) - footprint.x));
+        const target_x = x + @as(i64, @intCast(self.parameterTargetX(node) - footprint.x));
+        const top_outlet = [_]u8{0x09};
+        const bottom_outlet = [_]u8{0x09};
+        if (source_x >= 0 and y >= 0)
+            try display.write(gpa, &top_outlet, @intCast(source_x), @intCast(y), background, source_color);
+        const bottom_y = y + @as(i64, @intCast(footprint.height - 1));
+        if (target_x >= 0 and bottom_y >= 0)
+            try display.write(
+                gpa,
+                &bottom_outlet,
+                @intCast(target_x),
+                @intCast(bottom_y),
+                background,
+                target_color,
+            );
+    }
 }
 
 fn writePaths(
@@ -676,6 +739,8 @@ fn writePaths(
     for (self.nodes.items(.paths)[node.idx]) |maybe_path|
         if (maybe_path) |path|
             try self.writePath(gpa, display, path, background);
+    if (self.nodes.items(.parameter_path)[node.idx]) |path|
+        try self.writePath(gpa, display, path, background);
 }
 
 fn writeOutgoingPaths(
@@ -692,6 +757,11 @@ fn writeOutgoingPaths(
                     try self.writePath(gpa, display, path, background);
             }
         }
+    }
+    for (self.nodes.items(.parameter_path)) |maybe_path| {
+        if (maybe_path) |path|
+            if (path.source.idx == source.idx)
+                try self.writePath(gpa, display, path, background);
     }
 }
 
@@ -740,9 +810,17 @@ fn writePath(
     }
 
     const final_point = path.points[path.points.len - 1].position;
-    const arrow_x = @as(i64, final_point.x) - @as(i64, self.viewport.x) + 1;
+    // Horizontal audio arrows sit just beyond the destination anchor. A
+    // vertical parameter arrow belongs on the vertical route itself; using
+    // the horizontal offset would draw it beside the route.
+    const arrow_x_offset: i64 = switch (path.end_direction) {
+        Direction.left => -1,
+        Direction.right => 1,
+        else => 0,
+    };
+    const arrow_x = @as(i64, final_point.x) - @as(i64, self.viewport.x) + arrow_x_offset;
     const arrow_y = @as(i64, final_point.y) - @as(i64, self.viewport.y);
-    const arrow = [_]u8{0x1A};
+    const arrow = [_]u8{path.arrow};
     if (arrow_x >= 0 and arrow_y >= 0)
         try display.write(gpa, &arrow, @intCast(arrow_x), @intCast(arrow_y), background, link_color);
 }
@@ -810,6 +888,18 @@ pub fn nodeFootprint(self: *Self, node: VisualNode.Index) Bound {
     return self.nodeFootprintAt(node, position);
 }
 
+/// Returns the world-space x-coordinate of the top `src` outlet.
+fn parameterSourceX(self: *Self, node: VisualNode.Index) i32 {
+    const footprint = self.nodeFootprint(node);
+    return footprint.x + @as(i32, @intCast(footprint.width / 2));
+}
+
+/// Returns the world-space x-coordinate of the bottom `dst` outlet.
+fn parameterTargetX(self: *Self, node: VisualNode.Index) i32 {
+    const footprint = self.nodeFootprint(node);
+    return footprint.x + @as(i32, @intCast(footprint.width / 2));
+}
+
 /// Returns the footprint a node would occupy at a candidate position.
 fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Bound {
     const state = self.dsp.nodes.items(.state)[node.idx];
@@ -820,7 +910,14 @@ fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Boun
         @as(u8, 1),
     );
     const label_width = self.dsp.nodes.items(.name)[node.idx].len + 4;
-    const width = @min(label_width, @as(usize, 16));
+    const minimum_width_for_parameter_label = if (metadata.can_link_parameters)
+        (metadata.short_name.len + 1) * 2
+    else
+        0;
+    const width = @max(
+        @min(label_width, @as(usize, 16)),
+        minimum_width_for_parameter_label,
+    );
 
     return .{
         .x = position.x,
@@ -893,6 +990,29 @@ pub fn outletAt(self: *Self, position: Position) ?Outlet {
                     .anchor = .{ .x = footprint.x + @as(i32, @intCast(footprint.width)), .y = y },
                 };
         }
+
+        if (metadata.can_link_parameters) {
+            if (position.x == self.parameterSourceX(visual_node) and
+                position.y == footprint.y)
+                return .{
+                    .node = visual_node,
+                    .direction = .parameter_source,
+                    .port = 0,
+                    .anchor = .{ .x = self.parameterSourceX(visual_node), .y = footprint.y - 1 },
+                };
+
+            if (position.x == self.parameterTargetX(visual_node) and
+                position.y == footprint.y + @as(i32, @intCast(footprint.height - 1)))
+                return .{
+                    .node = visual_node,
+                    .direction = .parameter_target,
+                    .port = 0,
+                    .anchor = .{
+                        .x = self.parameterTargetX(visual_node),
+                        .y = footprint.y + @as(i32, @intCast(footprint.height)),
+                    },
+                };
+        }
     }
 
     return null;
@@ -945,6 +1065,17 @@ pub fn rebuildOccupancy(self: *Self, gpa: std.mem.Allocator) !bool {
                 .y = footprint.y + self.outletYOffset(footprint, metadata.output_count, port),
             }, node)) return false;
         }
+
+        if (metadata.can_link_parameters) {
+            if (!try self.tryOccupyLinkAnchor(gpa, .{
+                .x = self.parameterSourceX(visual_node),
+                .y = footprint.y - 1,
+            }, node)) return false;
+            if (!try self.tryOccupyLinkAnchor(gpa, .{
+                .x = self.parameterTargetX(visual_node),
+                .y = footprint.y + @as(i32, @intCast(footprint.height)),
+            }, node)) return false;
+        }
     }
 
     try self.occupyNodeMargins(gpa);
@@ -978,6 +1109,17 @@ pub fn occupyLinkAnchors(self: *Self, gpa: std.mem.Allocator) !void {
             try self.occupyLinkAnchor(gpa, .{
                 .x = footprint.x + @as(i32, @intCast(footprint.width)),
                 .y = footprint.y + self.outletYOffset(footprint, metadata.output_count, port),
+            }, node);
+        }
+
+        if (metadata.can_link_parameters) {
+            try self.occupyLinkAnchor(gpa, .{
+                .x = self.parameterSourceX(visual_node),
+                .y = footprint.y - 1,
+            }, node);
+            try self.occupyLinkAnchor(gpa, .{
+                .x = self.parameterTargetX(visual_node),
+                .y = footprint.y + @as(i32, @intCast(footprint.height)),
             }, node);
         }
     }
@@ -1073,6 +1215,16 @@ pub fn computePaths(self: *Self, gpa: std.mem.Allocator) !void {
         }
     }
 
+    for (self.dsp.nodes.items(.parameter_link), 0..) |link, node_index| {
+        if (link.source) |source|
+            try self.computePathForParameter(
+                gpa,
+                source,
+                .{ .idx = node_index },
+                bound,
+            );
+    }
+
     try self.addPathJunctions(gpa);
 }
 
@@ -1150,6 +1302,47 @@ fn computePathForInput(
     }
 }
 
+/// Computes the routed path from a parameter source's `dst` outlet to a
+/// target node's `src` outlet.
+fn computePathForParameter(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    source: VisualNode.Index,
+    target: VisualNode.Index,
+    bound: SearchBound,
+) !void {
+    const source_state = self.dsp.nodes.items(.state)[source.idx];
+    if (!DSP.node_metadata.get(std.meta.activeTag(source_state)).can_link_parameters)
+        return;
+
+    const source_footprint = self.nodeFootprint(source);
+    const target_footprint = self.nodeFootprint(target);
+    const from = Position{
+        .x = self.parameterTargetX(source),
+        .y = source_footprint.y + @as(i32, @intCast(source_footprint.height)),
+    };
+    const to = Position{
+        .x = self.parameterSourceX(target),
+        .y = target_footprint.y - 1,
+    };
+
+    self.astar.reset();
+    if (try self.astar.search(gpa, self, .{
+        .from = from,
+        .to = to,
+        .bound = bound,
+    })) |path| {
+        var colored_path = path;
+        colored_path.source = source;
+        colored_path.color = self.nodeColor(source);
+        colored_path.arrow = 0x19;
+        colored_path.start_direction = Direction.up;
+        colored_path.end_direction = Direction.down;
+        try self.occupyPath(gpa, colored_path);
+        self.nodes.items(.parameter_path)[target.idx] = colored_path;
+    }
+}
+
 /// Recompute only paths entering or leaving one node.
 pub fn recomputePathsForNode(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
     self.updateGraphBounds();
@@ -1170,6 +1363,17 @@ pub fn recomputePathsForNode(self: *Self, gpa: std.mem.Allocator, node: VisualNo
         }
     }
 
+    for (self.dsp.nodes.items(.parameter_link), 0..) |link, destination_index| {
+        if (link.source) |source|
+            if (destination_index == node.idx or source.idx == node.idx)
+                try self.computePathForParameter(
+                    gpa,
+                    source,
+                    .{ .idx = destination_index },
+                    bound,
+                );
+    }
+
     try self.addPathJunctions(gpa);
 }
 
@@ -1182,6 +1386,13 @@ fn clearPathsForNode(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index
             maybe_path.* = null;
         }
     }
+
+    for (self.nodes.items(.parameter_path), 0..) |*maybe_path, destination_index| {
+        const is_outbound = if (maybe_path.*) |path| path.source.idx == node.idx else false;
+        if (destination_index != node.idx and !is_outbound) continue;
+        if (maybe_path.*) |path| deinitPath(path, gpa);
+        maybe_path.* = null;
+    }
 }
 
 fn rebuildPathOccupancy(self: *Self, gpa: std.mem.Allocator) !void {
@@ -1191,12 +1402,15 @@ fn rebuildPathOccupancy(self: *Self, gpa: std.mem.Allocator) !void {
                 try self.occupyPath(gpa, path);
         }
     }
+    for (self.nodes.items(.parameter_path)) |maybe_path|
+        if (maybe_path) |path|
+            try self.occupyPath(gpa, path);
 }
 
 fn occupyPath(self: *Self, gpa: std.mem.Allocator, path: Path) !void {
     if (path.points.len == 0) return;
 
-    try self.recordPathDirection(gpa, path.points[0].position, Direction.left);
+    try self.recordPathDirection(gpa, path.points[0].position, path.start_direction);
 
     for (path.points[0 .. path.points.len - 1], 0..) |from, index| {
         const to = path.points[index + 1];
@@ -1222,7 +1436,7 @@ fn occupyPath(self: *Self, gpa: std.mem.Allocator, path: Path) !void {
     try self.recordPathDirection(
         gpa,
         path.points[path.points.len - 1].position,
-        Direction.right,
+        path.end_direction,
     );
 }
 
@@ -1244,12 +1458,21 @@ fn addPathJunctions(self: *Self, gpa: std.mem.Allocator) !void {
         }
     }
 
+    for (self.nodes.items(.parameter_path)) |maybe_path| {
+        if (maybe_path) |path|
+            try addPathCells(&cells, gpa, path);
+    }
+
     for (self.nodes.items(.paths)) |*paths| {
         for (paths) |*maybe_path| {
             if (maybe_path.*) |*path|
                 try insertJunctionPoints(path, &cells, gpa);
         }
     }
+
+    for (self.nodes.items(.parameter_path)) |*maybe_path|
+        if (maybe_path.*) |*path|
+            try insertJunctionPoints(path, &cells, gpa);
 }
 
 fn addPathCells(
@@ -1259,7 +1482,7 @@ fn addPathCells(
 ) !void {
     if (path.points.len == 0) return;
 
-    try recordPathCell(cells, gpa, path.points[0].position, Direction.left, true);
+    try recordPathCell(cells, gpa, path.points[0].position, path.start_direction, true);
 
     for (path.points[0 .. path.points.len - 1], 0..) |from, index| {
         const to = path.points[index + 1];
@@ -1286,7 +1509,7 @@ fn addPathCells(
         cells,
         gpa,
         path.points[path.points.len - 1].position,
-        Direction.right,
+        path.end_direction,
         false,
     );
 }
@@ -1382,6 +1605,12 @@ fn clearPaths(self: *Self, gpa: std.mem.Allocator) void {
             }
         }
     }
+    for (self.nodes.items(.parameter_path)) |*maybe_path| {
+        if (maybe_path.*) |path| {
+            deinitPath(path, gpa);
+            maybe_path.* = null;
+        }
+    }
 }
 
 pub fn traversalCost(self: *Self, criteria: PathCriteria, from: Position, to: Position) ?u32 {
@@ -1412,6 +1641,12 @@ pub const Path = struct {
     points: []const Point,
     source: VisualNode.Index = .noop,
     color: Display.Color = Display.Color.curious_blue,
+    /// CP437 arrow glyph used at the path destination.
+    arrow: u8 = 0x1A,
+    /// Direction connecting the path start to its source outlet.
+    start_direction: u4 = Direction.left,
+    /// Direction connecting the path end to its destination outlet.
+    end_direction: u4 = Direction.right,
 };
 
 /// Generic A* path finder for unbounded orthogonal space.

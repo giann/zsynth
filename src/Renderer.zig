@@ -82,7 +82,6 @@ pub fn init(
             @intCast(screen_height),
             .{
                 .high_pixel_density = true,
-                .mouse_grabbed = true,
                 .fullscreen = fullscreen,
             },
         ),
@@ -109,8 +108,6 @@ pub fn init(
         ),
     );
 
-    try self.regrabMouse();
-
     return self;
 }
 
@@ -125,20 +122,6 @@ pub fn toggleFullscreen(self: *Self) !void {
         return sdl.makeError();
 
     self.is_fullscreen = fullscreen;
-
-    try self.regrabMouse();
-}
-
-/// Reapplies the mouse grab after a window geometry or cursor-mode change.
-pub fn regrabMouse(self: *Self) !void {
-    // Fullscreen changes are asynchronous on some windowing systems. Refresh
-    // the grab rectangle after the new window bounds have been applied.
-    if (!sdl.syncWindow(self.window))
-        return sdl.makeError();
-    if (!sdl.setWindowMouseGrab(self.window, false))
-        return sdl.makeError();
-    if (!sdl.setWindowMouseGrab(self.window, true))
-        return sdl.makeError();
 }
 
 /// Enables or disables relative mouse input without repeating the SDL call.

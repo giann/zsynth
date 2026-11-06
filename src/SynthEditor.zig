@@ -356,7 +356,9 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     if (graphic.height < 2 or graphic.width <= parameters_pane_padding * 2)
         return;
 
-    const state = self.dsp.nodes.items(.state)[selected.idx];
+    const parameter_node = self.dsp.nodes.items(.parameter_link)[selected.idx].source orelse selected;
+    const parameters_editable = self.dsp.nodes.items(.parameter_link)[selected.idx].source == null;
+    const state = self.dsp.nodes.items(.state)[parameter_node.idx];
     switch (state) {
         inline else => |node_state| {
             if (@hasField(@TypeOf(node_state), "parameters")) {
@@ -368,6 +370,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
                     graphic.height,
                     graphic.width,
                     &self.output_meter,
+                    parameters_editable,
                 );
             } else {
                 try self.writeReflectedParameters(
@@ -378,6 +381,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
                     graphic.height,
                     graphic.width,
                     &self.output_meter,
+                    parameters_editable,
                 );
             }
         },
@@ -455,6 +459,7 @@ fn writeReflectedParameters(
     display_height: u32,
     display_width: u32,
     output_meter: *const OutputMeter,
+    parameters_editable: bool,
 ) !void {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
     const item_count = comptime reflectedParameterItemCount(@TypeOf(parameters));
@@ -506,7 +511,8 @@ fn writeReflectedParameters(
                         @TypeOf(element),
                         formatted_value.len,
                     );
-                    editable[reflected_item_index] = isEditableParameterType(@TypeOf(element));
+                    editable[reflected_item_index] = parameters_editable and
+                        isEditableParameterType(@TypeOf(element));
                     cell_names[reflected_item_index] = field_name;
                     cell_array_indices[reflected_item_index] = array_index;
                     reflected_item_index += 1;
@@ -531,7 +537,8 @@ fn writeReflectedParameters(
                     @TypeOf(value),
                     formatted_value.len,
                 );
-                editable[reflected_item_index] = isEditableParameterType(@TypeOf(value));
+                editable[reflected_item_index] = parameters_editable and
+                    isEditableParameterType(@TypeOf(value));
                 cell_names[reflected_item_index] = field_name;
                 cell_array_indices[reflected_item_index] = null;
                 reflected_item_index += 1;
@@ -768,7 +775,8 @@ fn keyUpDown(
     }
 
     const modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
-    const delta: i32 = if ((modifiers & sdl.Keymod.shift) != 0) 5 else 1;
+    const shift = (modifiers & sdl.Keymod.shift) != 0;
+    const delta: i32 = if (shift) 5 else 1;
 
     const command = (modifiers & (sdl.Keymod.lgui | sdl.Keymod.rgui)) != 0;
 
@@ -815,8 +823,14 @@ fn keyUpDown(
             else
                 return false;
         },
-        .d => if (self.space.selected_node) |selected|
-            try self.remove(gpa, selected),
+        .d => {
+            if (command) {
+                const selected = self.space.selected_node orelse return false;
+                try self.duplicateSelectedNode(gpa, selected, shift);
+            } else if (self.space.selected_node) |selected| {
+                try self.remove(gpa, selected);
+            } else return false;
+        },
         .escape => {
             self.setNodeSelection(null);
             self.zsynth.cursor.dirty = true;
@@ -826,6 +840,60 @@ fn keyUpDown(
     }
 
     return true;
+}
+
+/// Duplicates a node with fresh runtime state and rebuilds the editor graph.
+fn duplicateSelectedNode(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    selected: VisualNode.Index,
+    link_parameters: bool,
+) !void {
+    if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output)
+        return;
+
+    const source_position = self.space.nodePosition(selected);
+    const source_footprint = self.space.nodeFootprint(selected);
+    const source_name = self.dsp.nodes.items(.name)[selected.idx];
+    const source_state = self.dsp.nodes.items(.state)[selected.idx];
+    const duplicate = switch (source_state) {
+        .add => DSP.Node.Add.create(source_name),
+        .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
+        .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
+        .constant => |value| DSP.Node.Constant.create(source_name, value.parameters),
+        .keyboard => |value| DSP.Node.Keyboard.create(source_name, value.parameters),
+        .mixer => |value| DSP.Node.Mixer.create(source_name, value.parameters),
+        .monophonic_sequencer => |value| DSP.Node.MonophonicSequencer.create(source_name, value.parameters),
+        .multimode_filter => |value| DSP.Node.MultimodeFilter.create(source_name, value.parameters),
+        .multiply => DSP.Node.Multiply.create(source_name),
+        .noise => |value| DSP.Node.Noise.create(source_name, value.parameters),
+        .noop => unreachable,
+        .oscillator => |value| DSP.Node.Oscillator.create(source_name, value.parameters),
+        .output => DSP.Node.Output.create(source_name),
+    };
+    const duplicate_index = try self.dsp.addNode(gpa, duplicate);
+    errdefer self.dsp.remove(gpa, duplicate_index);
+
+    const duplicate_position = self.space.findFreePosition(
+        duplicate_index,
+        .{
+            .x = source_position.x + @as(i32, @intCast(source_footprint.width)) + 3,
+            .y = source_position.y,
+        },
+    ) orelse return error.InvalidVisualNodeLayout;
+    try self.space.addNode(gpa, duplicate_index, duplicate_position);
+    errdefer self.space.remove(gpa, duplicate_index) catch {};
+    if (!try self.space.rebuildOccupancy(gpa))
+        return error.InvalidVisualNodeLayout;
+
+    if (link_parameters)
+        _ = self.dsp.linkParameters(selected, duplicate_index);
+
+    try self.space.computePaths(gpa);
+    self.setNodeSelection(duplicate_index);
+    _ = self.space.revealNode(duplicate_index);
+    self.zsynth.cursor.dirty = true;
+    try self.write(gpa);
 }
 
 /// Handles SDL text input for the active selected-pane property field.
@@ -1286,7 +1354,27 @@ fn connectOutlets(
     first: Space.Outlet,
     second: Space.Outlet,
 ) !void {
-    if (first.node.idx == second.node.idx or first.direction == second.direction)
+    if (first.node.idx == second.node.idx)
+        return;
+
+    const first_is_parameter = first.direction == .parameter_source or
+        first.direction == .parameter_target;
+    const second_is_parameter = second.direction == .parameter_source or
+        second.direction == .parameter_target;
+    if (first_is_parameter or second_is_parameter) {
+        if (!first_is_parameter or !second_is_parameter or
+            first.direction == second.direction)
+            return;
+
+        const source = if (first.direction == .parameter_target) first else second;
+        const target = if (first.direction == .parameter_source) first else second;
+        if (!self.dsp.linkParameters(source.node, target.node)) return;
+        try self.space.computePaths(gpa);
+        try self.write(gpa);
+        return;
+    }
+
+    if (first.direction == second.direction)
         return;
 
     const output = if (first.direction == .output) first else second;
@@ -1304,6 +1392,8 @@ fn disconnectOutlet(self: *Self, gpa: std.mem.Allocator, outlet: Space.Outlet) !
     switch (outlet.direction) {
         .input => self.dsp.disconnectInput(outlet.node, outlet.port),
         .output => self.dsp.disconnectOutput(outlet.node, outlet.port),
+        .parameter_source => self.dsp.disconnectParameterSource(outlet.node),
+        .parameter_target => self.dsp.disconnectParameterTarget(outlet.node),
     }
     try self.space.computePaths(gpa);
     try self.write(gpa);

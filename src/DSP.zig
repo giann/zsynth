@@ -212,6 +212,78 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
     self.nodes.items(.output_connected)[source.idx][source_output_port] = false;
 }
 
+/// Connects one node's parameter source to another node's parameter target.
+///
+/// Parameter links are one-to-one and may form acyclic chains. Existing links
+/// at either endpoint are replaced, matching the editor's audio-link behavior.
+pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (source.isNoop() or target.isNoop() or
+        source.idx >= self.nodes.len or target.idx >= self.nodes.len or
+        source.idx == target.idx)
+        return false;
+
+    const states = self.nodes.items(.state);
+    const source_state = states[source.idx];
+    const target_state = states[target.idx];
+    if (std.meta.activeTag(source_state) != std.meta.activeTag(target_state) or
+        !node_metadata.get(std.meta.activeTag(source_state)).has_parameters or
+        !node_metadata.get(std.meta.activeTag(source_state)).can_link_parameters)
+        return false;
+
+    // Walking toward the root source detects whether this link would close a cycle.
+    var ancestor = source;
+    while (self.nodes.items(.parameter_link)[ancestor.idx].source) |next| {
+        if (next.idx >= self.nodes.len or next.idx == target.idx)
+            return false;
+        ancestor = next;
+    }
+
+    const links = self.nodes.items(.parameter_link);
+    if (links[target.idx].source) |previous_source| {
+        if (previous_source.idx < self.nodes.len)
+            links[previous_source.idx].target = null;
+    }
+    if (links[source.idx].target) |previous_target| {
+        if (previous_target.idx < self.nodes.len)
+            links[previous_target.idx].source = null;
+    }
+
+    links[source.idx].target = target;
+    links[target.idx].source = source;
+    return true;
+}
+
+/// Disconnects the parameter source feeding a node.
+pub fn disconnectParameterSource(self: *DSP, target: Node.Index) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (target.idx >= self.nodes.len) return;
+    const links = self.nodes.items(.parameter_link);
+    if (links[target.idx].source) |source| {
+        if (source.idx < self.nodes.len)
+            links[source.idx].target = null;
+        links[target.idx].source = null;
+    }
+}
+
+/// Disconnects the parameter target fed by a node.
+pub fn disconnectParameterTarget(self: *DSP, source: Node.Index) void {
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    if (source.idx >= self.nodes.len) return;
+    const links = self.nodes.items(.parameter_link);
+    if (links[source.idx].target) |target| {
+        if (target.idx < self.nodes.len)
+            links[target.idx].source = null;
+        links[source.idx].target = null;
+    }
+}
+
 /// Removes a node, releases its SampleTap, and repairs graph references.
 pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     self.lockGraph();
@@ -222,6 +294,18 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
 
     const last_index = self.nodes.len - 1;
     const removing_output = self.output.idx == node.idx;
+
+    // Detach parameter links before removing the node and repair the moved
+    // node's indices after swapRemove below.
+    const links = self.nodes.items(.parameter_link);
+    if (links[node.idx].source) |source| {
+        if (source.idx < self.nodes.len)
+            links[source.idx].target = null;
+    }
+    if (links[node.idx].target) |target| {
+        if (target.idx < self.nodes.len)
+            links[target.idx].source = null;
+    }
 
     // Unplug every input owned by the removed node.
     const removed_inputs = self.nodes.items(.inputs)[node.idx];
@@ -256,6 +340,17 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
             for (node_inputs) |*connection| {
                 if (!connection.isNoop() and connection.node.idx == last_index)
                     connection.node = .{ .idx = node.idx };
+            }
+        }
+
+        for (self.nodes.items(.parameter_link)) |*link| {
+            if (link.source) |source| {
+                if (source.idx == last_index)
+                    link.source = .{ .idx = node.idx };
+            }
+            if (link.target) |target| {
+                if (target.idx == last_index)
+                    link.target = .{ .idx = node.idx };
             }
         }
     }
@@ -368,6 +463,27 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     var outputs: [max_outlets]*Buffer = undefined;
     for (&cache.outputs, 0..) |*output, i| {
         outputs[i] = output;
+    }
+
+    // If has parameter link, copy parameters from source
+    if (self.nodes.items(.parameter_link)[node.idx].source) |source| {
+        if (source.idx < self.nodes.len) {
+            const destination = &self.nodes.items(.state)[node.idx];
+            const source_state = &self.nodes.items(.state)[source.idx];
+            switch (destination.*) {
+                inline else => |*destination_state| {
+                    if (@hasField(@TypeOf(destination_state.*), "parameters")) {
+                        switch (source_state.*) {
+                            inline else => |source_value| {
+                                if (@TypeOf(destination_state.*) == @TypeOf(source_value) and
+                                    @hasField(@TypeOf(source_value), "parameters"))
+                                    destination_state.parameters = source_value.parameters;
+                            },
+                        }
+                    }
+                },
+            }
+        }
     }
 
     // The node recursively requests any connected inputs during processing.
@@ -681,6 +797,14 @@ pub const Note = struct {
 
 /// A processable node in the audio graph.
 pub const Node = struct {
+    /// Reciprocal one-to-one parameter relationships for a node.
+    pub const ParameterLink = struct {
+        /// Node whose parameters this node copies, if any.
+        source: ?Node.Index = null,
+        /// Node that copies this node's parameters, if any.
+        target: ?Node.Index = null,
+    };
+
     /// Concrete node parameters and mutable runtime state.
     state: State,
     /// Display name assigned by the graph owner.
@@ -695,6 +819,8 @@ pub const Node = struct {
     sample_tap: SampleTap = .{},
     /// Function used to render this node's outputs.
     process: Process,
+    /// Reciprocal parameter source and target links.
+    parameter_link: ParameterLink = .{},
 
     /// Static metadata for one node input or output.
     pub const OutletMetadata = struct {
@@ -709,6 +835,10 @@ pub const Node = struct {
         name: []const u8,
         short_name: []const u8,
         color: Display.Color,
+        /// Whether this node exposes a parameter payload that can be linked.
+        has_parameters: bool = false,
+        /// Whether the editor exposes parameter-link outlets for this node.
+        can_link_parameters: bool = true,
         /// Whether the node's outputs are meaningful to inspect as audio levels.
         meterable: bool = true,
         inputs: [max_outlets]OutletMetadata = @splat(.{}),
@@ -853,6 +983,7 @@ pub const Node = struct {
             .name = "Output",
             .short_name = "out",
             .color = .persimmon,
+            .can_link_parameters = false,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .persimmon },
                 .{},
@@ -914,6 +1045,7 @@ pub const Node = struct {
             .name = "Add",
             .short_name = "add",
             .color = .amber,
+            .can_link_parameters = false,
             .inputs = .{
                 .{ .name = "input 1", .short_name = "in1", .color = .amber },
                 .{ .name = "input 2", .short_name = "in2", .color = .amber },
@@ -1004,6 +1136,7 @@ pub const Node = struct {
             .name = "Multiply",
             .short_name = "mul",
             .color = .cinnabar,
+            .can_link_parameters = false,
             .inputs = .{
                 .{ .name = "input 1", .short_name = "in1", .color = .cinnabar },
                 .{ .name = "input 2", .short_name = "in2", .color = .cinnabar },
@@ -1095,6 +1228,7 @@ pub const Node = struct {
             .short_name = "cst",
             .meterable = false,
             .color = .golden_rod,
+            .has_parameters = true,
             .outputs = .{
                 .{ .name = "value", .short_name = "val", .color = .golden_rod },
                 .{},
@@ -1153,6 +1287,8 @@ pub const Node = struct {
             .short_name = "kbd",
             .meterable = false,
             .color = .feijoa,
+            .has_parameters = true,
+            .can_link_parameters = false,
             .outputs = .{
                 .{ .name = "frequency 1", .short_name = "freq1", .unit = "Hz", .color = .feijoa },
                 .{ .name = "gate 1", .short_name = "gate1", .color = .feijoa },
@@ -1311,6 +1447,7 @@ pub const Node = struct {
             .name = "Oscillator",
             .short_name = "osc",
             .color = .curious_blue,
+            .has_parameters = true,
             .inputs = .{
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .curious_blue },
                 .{ .name = "amplitude", .short_name = "amp", .color = .curious_blue },
@@ -1460,6 +1597,8 @@ pub const Node = struct {
             .name = "Mixer",
             .short_name = "mix",
             .color = .cerulean,
+            .has_parameters = true,
+            .can_link_parameters = false,
             .inputs = .{
                 .{ .name = "input 1", .short_name = "in1", .color = .cerulean },
                 .{ .name = "input 2", .short_name = "in2", .color = .cerulean },
@@ -1596,6 +1735,8 @@ pub const Node = struct {
             .short_name = "seq",
             .color = .feijoa,
             .meterable = false,
+            .has_parameters = true,
+            .can_link_parameters = false,
             .outputs = .{
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
                 .{ .name = "gate", .short_name = "gate", .color = .feijoa },
@@ -1752,6 +1893,7 @@ pub const Node = struct {
             .name = "ADSR",
             .short_name = "adsr",
             .color = .fuschia_pink,
+            .has_parameters = true,
             .inputs = .{
                 .{ .name = "gate", .short_name = "gate", .color = .fuschia_pink },
                 .{ .name = "velocity", .short_name = "vel", .color = .fuschia_pink },
@@ -2027,6 +2169,7 @@ pub const Node = struct {
             .name = "Multimode Filter",
             .short_name = "mmf",
             .color = .havelock_blue,
+            .has_parameters = true,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .havelock_blue },
                 .{ .name = "cutoff", .short_name = "cut", .unit = "Hz", .color = .havelock_blue },
@@ -2174,6 +2317,7 @@ pub const Node = struct {
             .name = "Bit Crusher",
             .short_name = "bcr",
             .color = .desert,
+            .has_parameters = true,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .desert },
                 .{},
@@ -2277,6 +2421,7 @@ pub const Node = struct {
             .name = "Noise",
             .short_name = "noi",
             .color = .logan,
+            .has_parameters = true,
             .inputs = .{
                 .{ .name = "amplitude", .short_name = "amp", .color = .logan },
                 .{},

@@ -63,6 +63,9 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             .y = self.space.nodePosition(.{ .idx = index }).y,
         };
 
+        if (self.dsp.nodes.items(.parameter_link)[index].source) |source|
+            node.parameter_source = @intCast(source.idx);
+
         for (self.dsp.nodes.items(.inputs)[index], 0..) |connection, input_port| {
             if (connection.isNoop()) continue;
             try node.inputs.append(arena_gpa, .{
@@ -136,6 +139,14 @@ pub fn load(self: *Serializer, path: []const u8) !void {
                 @intCast(connection.input_port),
             );
         }
+    }
+
+    for (document.nodes.items, 0..) |serialized, target_index| {
+        if (serialized.parameter_source == 0) continue;
+        if (!self.dsp.linkParameters(
+            .{ .idx = @intCast(serialized.parameter_source) },
+            .{ .idx = target_index },
+        )) return error.InvalidGraphReference;
     }
 
     if (!try self.space.rebuildOccupancy(self.allocator))
@@ -420,6 +431,33 @@ fn validateDocument(document: P.SynthDocument) !void {
                         other.source_port == connection.source_port)
                         return error.InvalidGraphReference;
                 }
+            }
+        }
+
+        if (node.parameter_source != 0) {
+            if (node.parameter_source >= document.nodes.items.len or
+                node.parameter_source == index)
+                return error.InvalidGraphReference;
+
+            const source_tag = std.meta.stringToEnum(
+                DSP.Node.Tag,
+                document.nodes.items[node.parameter_source].kind,
+            ) orelse return error.UnknownNodeKind;
+            if (source_tag != tag or
+                !DSP.node_metadata.get(tag).has_parameters or
+                !DSP.node_metadata.get(tag).can_link_parameters)
+                return error.InvalidGraphReference;
+
+            for (document.nodes.items, 0..) |other, other_index| {
+                if (other_index != index and other.parameter_source == node.parameter_source)
+                    return error.InvalidGraphReference;
+            }
+
+            var ancestor = node.parameter_source;
+            while (document.nodes.items[ancestor].parameter_source != 0) {
+                ancestor = document.nodes.items[ancestor].parameter_source;
+                if (ancestor == index)
+                    return error.InvalidGraphReference;
             }
         }
     }
