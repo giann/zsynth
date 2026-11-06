@@ -183,6 +183,8 @@ pub fn plug(
 
     if (std.meta.activeTag(self.nodes.items(.state)[destination.idx]) == .group)
         self.syncGroupInputLocked(destination, destination_port);
+    self.refreshMemberGroupHashLocked(source);
+    self.refreshMemberGroupHashLocked(destination);
 }
 
 /// Disconnects the edge feeding one input port.
@@ -202,6 +204,7 @@ pub fn disconnectInput(self: *DSP, destination: Node.Index, destination_port: u8
 
     if (std.meta.activeTag(self.nodes.items(.state)[destination.idx]) == .group)
         self.syncGroupInputLocked(destination, destination_port);
+    self.refreshMemberGroupHashLocked(destination);
 }
 
 /// Disconnects every edge leaving one output port.
@@ -222,10 +225,12 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
                 connection.* = .{};
                 if (std.meta.activeTag(self.nodes.items(.state)[destination_idx]) == .group)
                     self.syncGroupInputLocked(.{ .idx = destination_idx }, @intCast(destination_port));
+                self.refreshMemberGroupHashLocked(.{ .idx = destination_idx });
             }
         }
     }
     self.nodes.items(.output_connected)[source.idx][source_output_port] = false;
+    self.refreshMemberGroupHashLocked(source);
 }
 
 /// Returns whether an index identifies a valid group with the requested port.
@@ -260,6 +265,128 @@ fn validGroupMemberPortLocked(
         return false;
     const metadata = node_metadata.get(std.meta.activeTag(self.nodes.items(.state)[member.idx]));
     return port < if (input) metadata.input_count else metadata.output_count;
+}
+
+/// Returns the ordered slot occupied by a member of a group.
+fn groupMemberSlotLocked(self: *const DSP, group: Node.Index, member: Node.Index) ?u8 {
+    assert(group.idx < self.nodes.len);
+    const state = self.nodes.items(.state)[group.idx];
+    if (state != .group) return null;
+    for (state.group.members[0..state.group.member_count], 0..) |candidate, slot|
+        if (candidate.idx == member.idx) return @intCast(slot);
+    return null;
+}
+
+/// Rebuilds one cached group identity after a structural graph mutation.
+fn rebuildGroupSubgraphHashLocked(self: *DSP, group: Node.Index) void {
+    assert(group.idx < self.nodes.len);
+    assert(std.meta.activeTag(self.nodes.items(.state)[group.idx]) == .group);
+
+    const old_hash = self.nodes.items(.group_subgraph_hash)[group.idx];
+    var key = Node.GroupSubgraphKey{};
+    const group_state = self.nodes.items(.state)[group.idx].group;
+    key.member_count = group_state.member_count;
+
+    for (group_state.members[0..group_state.member_count], 0..) |member, slot| {
+        assert(member.idx < self.nodes.len);
+        key.member_tags[slot] = @backingInt(std.meta.activeTag(self.nodes.items(.state)[member.idx]));
+
+        for (self.nodes.items(.inputs)[member.idx], 0..) |connection, input_port| {
+            if (connection.isNoop()) continue;
+            const descriptor = &key.inputs[slot][input_port];
+            if (self.groupMemberSlotLocked(group, connection.node)) |source_slot| {
+                descriptor.* = .{
+                    .kind = 1,
+                    .index = source_slot,
+                    .port = connection.output_port,
+                };
+                continue;
+            }
+
+            switch (self.nodes.items(.state)[connection.node.idx]) {
+                .group_input => |endpoint| if (endpoint.group.idx == group.idx) {
+                    descriptor.* = .{ .kind = 2, .index = endpoint.port };
+                } else {
+                    assert(false);
+                    unreachable;
+                },
+                else => {
+                    assert(false);
+                    unreachable;
+                },
+            }
+        }
+
+        if (self.nodes.items(.parameter_link)[member.idx].source) |source| {
+            if (self.groupMemberSlotLocked(group, source)) |source_slot| {
+                key.parameter_sources[slot] = source_slot;
+            } else {
+                assert(false);
+                unreachable;
+            }
+        }
+    }
+
+    for (group_state.input_bindings, 0..) |binding, port| {
+        if (binding) |value| {
+            const slot = self.groupMemberSlotLocked(group, value.node) orelse {
+                assert(false);
+                unreachable;
+            };
+            key.input_bindings[port] = .{ .node = .{ .idx = slot }, .port = value.port };
+        }
+    }
+    for (group_state.output_bindings, 0..) |binding, port| {
+        if (binding) |value| {
+            const slot = self.groupMemberSlotLocked(group, value.node) orelse {
+                assert(false);
+                unreachable;
+            };
+            key.output_bindings[port] = .{ .node = .{ .idx = slot }, .port = value.port };
+        }
+    }
+
+    const hash = key.hash();
+    self.nodes.items(.group_subgraph_hash)[group.idx] = hash;
+    if (old_hash == hash) return;
+
+    const links = self.nodes.items(.parameter_link);
+    if (links[group.idx].source) |source| {
+        if (std.meta.activeTag(self.nodes.items(.state)[source.idx]) == .group and
+            self.nodes.items(.group_subgraph_hash)[source.idx] != hash)
+        {
+            links[source.idx].target = null;
+            links[group.idx].source = null;
+        }
+    }
+    if (links[group.idx].target) |target| {
+        if (std.meta.activeTag(self.nodes.items(.state)[target.idx]) == .group and
+            hash != self.nodes.items(.group_subgraph_hash)[target.idx])
+        {
+            links[target.idx].source = null;
+            links[group.idx].target = null;
+        }
+    }
+}
+
+/// Rebuilds the cached identity for every group after index repair.
+fn rebuildAllGroupSubgraphHashesLocked(self: *DSP) void {
+    var index: usize = 0;
+    while (index < self.nodes.len) : (index += 1) {
+        if (std.meta.activeTag(self.nodes.items(.state)[index]) == .group)
+            self.rebuildGroupSubgraphHashLocked(.{ .idx = index });
+    }
+}
+
+/// Refreshes the cached identity of the group containing a member node.
+fn refreshMemberGroupHashLocked(self: *DSP, member: Node.Index) void {
+    for (self.nodes.items(.state), 0..) |state, index| {
+        if (state != .group) continue;
+        if (self.groupMemberSlotLocked(.{ .idx = index }, member) != null) {
+            self.rebuildGroupSubgraphHashLocked(.{ .idx = index });
+            return;
+        }
+    }
 }
 
 /// Clears a group input binding and disconnects its child proxy connection.
@@ -316,6 +443,7 @@ pub fn bindGroupInput(
         .port = member_port,
     };
     self.syncGroupInputLocked(group, group_port);
+    self.rebuildGroupSubgraphHashLocked(group);
     return true;
 }
 
@@ -353,6 +481,7 @@ pub fn bindGroupOutput(
         };
         self.nodes.items(.output_connected)[member.idx][member_port] = true;
     }
+    self.rebuildGroupSubgraphHashLocked(group);
     return true;
 }
 
@@ -362,6 +491,7 @@ pub fn unbindGroupInput(self: *DSP, group: Node.Index, group_port: u8) void {
     defer self.unlockGraph();
     if (!self.validGroupPortLocked(group, group_port, false)) return;
     self.clearGroupInputBindingLocked(group, group_port);
+    self.rebuildGroupSubgraphHashLocked(group);
 }
 
 /// Removes a group output binding while leaving its external group connection intact.
@@ -378,6 +508,7 @@ pub fn unbindGroupOutput(self: *DSP, group: Node.Index, group_port: u8) void {
         self.nodes.items(.inputs)[endpoint.idx][0] = .{};
     }
     group_state.output_bindings[group_port] = null;
+    self.rebuildGroupSubgraphHashLocked(group);
 }
 
 /// Returns the child port metadata currently exposed by a group port.
@@ -423,9 +554,16 @@ pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
     const states = self.nodes.items(.state);
     const source_state = states[source.idx];
     const target_state = states[target.idx];
-    if (std.meta.activeTag(source_state) != std.meta.activeTag(target_state) or
-        !node_metadata.get(std.meta.activeTag(source_state)).has_parameters or
-        !node_metadata.get(std.meta.activeTag(source_state)).can_link_parameters)
+    const source_tag = std.meta.activeTag(source_state);
+    const target_tag = std.meta.activeTag(target_state);
+    if (source_tag == .group or target_tag == .group) {
+        if (source_tag != .group or target_tag != .group or
+            self.nodes.items(.group_subgraph_hash)[source.idx] !=
+                self.nodes.items(.group_subgraph_hash)[target.idx])
+            return false;
+    } else if (source_tag != target_tag or
+        !node_metadata.get(source_tag).has_parameters or
+        !node_metadata.get(source_tag).can_link_parameters)
         return false;
 
     // Walking toward the root source detects whether this link would close a cycle.
@@ -440,10 +578,12 @@ pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
     if (links[target.idx].source) |previous_source| {
         assert(previous_source.idx < self.nodes.len);
         links[previous_source.idx].target = null;
+        self.refreshMemberGroupHashLocked(previous_source);
     }
     if (links[source.idx].target) |previous_target| {
         assert(previous_target.idx < self.nodes.len);
         links[previous_target.idx].source = null;
+        self.refreshMemberGroupHashLocked(previous_target);
     }
 
     links[source.idx].target = target;
@@ -462,6 +602,8 @@ pub fn disconnectParameterSource(self: *DSP, target: Node.Index) void {
         assert(source.idx < self.nodes.len);
         links[source.idx].target = null;
         links[target.idx].source = null;
+        self.refreshMemberGroupHashLocked(source);
+        self.refreshMemberGroupHashLocked(target);
     }
 }
 
@@ -476,6 +618,8 @@ pub fn disconnectParameterTarget(self: *DSP, source: Node.Index) void {
         assert(target.idx < self.nodes.len);
         links[target.idx].source = null;
         links[source.idx].target = null;
+        self.refreshMemberGroupHashLocked(source);
+        self.refreshMemberGroupHashLocked(target);
     }
 }
 
@@ -602,6 +746,7 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
                 endpoint.* = .{ .idx = node.idx };
         }
     }
+    self.rebuildAllGroupSubgraphHashesLocked();
 }
 
 /// Appends the sixteen fixed boundary endpoint nodes owned by a group.
@@ -652,6 +797,7 @@ pub fn addGroupMember(self: *DSP, group: Node.Index, member: Node.Index) bool {
         if (existing.idx == member.idx) return true;
     state.members[state.member_count] = member;
     state.member_count += 1;
+    self.rebuildGroupSubgraphHashLocked(group);
     return true;
 }
 
@@ -666,6 +812,8 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     const new_index = self.nodes.len - 1;
     self.nodes.items(.sample_tap)[new_index].queue =
         try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
+    if (std.meta.activeTag(self.nodes.items(.state)[new_index]) == .group)
+        self.rebuildGroupSubgraphHashLocked(.{ .idx = new_index });
 
     return .{ .idx = new_index };
 }
@@ -745,6 +893,8 @@ pub fn withGraphLock(self: *DSP, context: anytype, callback: anytype) void {
 fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     assert(node.idx < self.nodes.len);
     const cache = &self.nodes.items(.cache)[node.idx];
+    const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    const output_count = node_metadata.get(source_tag).output_count;
 
     // Reuse a result already rendered during this generation and block size.
     if (cache.generation == self.render_generation and
@@ -769,7 +919,9 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
         assert(source.idx < self.nodes.len);
         const destination = &self.nodes.items(.state)[node.idx];
         const source_state = &self.nodes.items(.state)[source.idx];
-        switch (destination.*) {
+        if (destination.* == .group and source_state.* == .group) {
+            self.copyGroupParameters(source, node);
+        } else switch (destination.*) {
             inline else => |*destination_state| {
                 if (@hasField(@TypeOf(destination_state.*), "parameters")) {
                     switch (source_state.*) {
@@ -797,8 +949,6 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
 
     // Publish a bounded, non-blocking copy after processing completes. The
     // SampleTap copies every declared output port for independent UI readers.
-    const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
-    const output_count = node_metadata.get(source_tag).output_count;
     const sample_tap = &self.nodes.items(.sample_tap)[node.idx];
     var block: SampleTap.Block = .{
         .samples = undefined,
@@ -814,6 +964,30 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     _ = sample_tap.queue.tryPush(block);
 }
 
+/// Copies parameter payloads between corresponding members of linked groups.
+fn copyGroupParameters(self: *DSP, source: Node.Index, destination: Node.Index) void {
+    const source_group = self.nodes.items(.state)[source.idx].group;
+    const destination_group = &self.nodes.items(.state)[destination.idx].group;
+    assert(source_group.member_count == destination_group.member_count);
+    for (0..source_group.member_count) |slot| {
+        const source_state = &self.nodes.items(.state)[source_group.members[slot].idx];
+        const destination_state = &self.nodes.items(.state)[destination_group.members[slot].idx];
+        switch (destination_state.*) {
+            inline else => |*destination_value| {
+                if (@hasField(@TypeOf(destination_value.*), "parameters")) {
+                    switch (source_state.*) {
+                        inline else => |source_value| {
+                            if (@TypeOf(destination_value.*) == @TypeOf(source_value) and
+                                @hasField(@TypeOf(source_value), "parameters"))
+                                destination_value.parameters = source_value.parameters;
+                        },
+                    }
+                }
+            },
+        }
+    }
+}
+
 /// Resolves a connection by rendering its source and returning the requested port.
 fn getOutput(
     self: *DSP,
@@ -822,6 +996,7 @@ fn getOutput(
 ) !*Buffer {
     // Invalid connections indicate a graph-construction bug.
     assert(!connection.isNoop());
+    assert(connection.node.idx < self.nodes.len);
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[connection.node.idx]);
     assert(connection.output_port < node_metadata.get(source_tag).output_count);
 
@@ -1105,6 +1280,8 @@ pub const Node = struct {
 
     /// Concrete node parameters and mutable runtime state.
     state: State,
+    /// Cached hash of the group's structural identity.
+    group_subgraph_hash: u64 = 0,
     /// Display name assigned by the graph owner.
     name: []const u8,
     /// Connections feeding each input port.
@@ -1143,6 +1320,61 @@ pub const Node = struct {
         outputs: [max_outlets]OutletMetadata = @splat(.{}),
         output_count: u8 = 1,
         input_count: u8 = 1,
+    };
+
+    /// One cached source descriptor used by a group's structural identity.
+    pub const GroupSubgraphConnection = struct {
+        /// Zero is unconnected, one is a member slot, and two is a group input.
+        kind: u8 = 0,
+        /// Member slot or group-input port, depending on `kind`.
+        index: u8 = 0,
+        /// Source output port, or zero for a group-input boundary.
+        port: u8 = 0,
+    };
+
+    /// Exact bounded identity for a group's ordered subgraph.
+    pub const GroupSubgraphKey = struct {
+        /// Number of ordered member slots represented by the key.
+        member_count: u8 = 0,
+        /// Node kind for every member slot.
+        member_tags: [max_group_members]u8 = @splat(0),
+        /// Source descriptors for each member input port.
+        inputs: [max_group_members][max_outlets]GroupSubgraphConnection = @splat(@splat(.{})),
+        /// Internal parameter source slot for each member, if present.
+        parameter_sources: [max_group_members]?u8 = @splat(null),
+        /// Member binding for each exposed group input port.
+        input_bindings: [max_outlets]?Node.PortBinding = @splat(null),
+        /// Member binding for each exposed group output port.
+        output_bindings: [max_outlets]?Node.PortBinding = @splat(null),
+
+        /// Hashes the canonical structural representation without hashing padding.
+        pub fn hash(self: GroupSubgraphKey) u64 {
+            var hasher = std.hash.Fnv1a_64.init();
+            hasher.update(&[_]u8{self.member_count});
+            hasher.update(&self.member_tags);
+            for (self.inputs) |member_inputs| {
+                for (member_inputs) |connection| {
+                    hasher.update(&[_]u8{ connection.kind, connection.index, connection.port });
+                }
+            }
+            for (self.parameter_sources) |source| {
+                hasher.update(&[_]u8{@intFromBool(source != null)});
+                if (source) |slot| hasher.update(&[_]u8{slot});
+            }
+            for (self.input_bindings) |binding| {
+                hasher.update(&[_]u8{@intFromBool(binding != null)});
+                if (binding) |value| {
+                    hasher.update(&[_]u8{ @intCast(value.node.idx), value.port });
+                }
+            }
+            for (self.output_bindings) |binding| {
+                hasher.update(&[_]u8{@intFromBool(binding != null)});
+                if (binding) |value| {
+                    hasher.update(&[_]u8{ @intCast(value.node.idx), value.port });
+                }
+            }
+            return hasher.final();
+        }
     };
 
     /// One child port exposed through a group boundary.
@@ -1360,7 +1592,8 @@ pub const Node = struct {
             .name = "Group",
             .short_name = "grp",
             .color = .astral,
-            .can_link_parameters = false,
+            .has_parameters = true,
+            .can_link_parameters = true,
             .meterable = false,
             .inputs = @splat(.{ .name = "group input", .short_name = "in", .color = .gray }),
             .outputs = @splat(.{ .name = "group output", .short_name = "out", .color = .gray }),
@@ -1424,6 +1657,8 @@ pub const Node = struct {
             for (state.output_bindings, 0..) |binding, port| {
                 const selected = binding orelse continue;
                 assert(selected.node.idx < dsp.nodes.len);
+                const selected_tag = std.meta.activeTag(dsp.nodes.items(.state)[selected.node.idx]);
+                assert(selected.port < node_metadata.get(selected_tag).output_count);
                 try dsp.renderNode(selected.node, into[0].sample_count);
                 const source = &dsp.nodes.items(.cache)[selected.node.idx].outputs[selected.port];
                 @memcpy(

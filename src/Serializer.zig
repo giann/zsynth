@@ -7,6 +7,80 @@ const P = @import("zsynth.pb.zig");
 /// Current on-disk protobuf schema version.
 const schema_version: u32 = 1;
 
+/// Returns the ordered member slot for a serialized group member.
+fn serializedGroupMemberSlot(group: P.Node, member: u32) ?u8 {
+    for (group.group_members.items, 0..) |candidate, slot|
+        if (candidate == member) return @intCast(slot);
+    return null;
+}
+
+/// Builds and hashes the exact bounded identity used to validate a serialized group link.
+fn serializedGroupSubgraphHash(nodes: []const P.Node, group_index: usize) ?u64 {
+    if (group_index >= nodes.len or !std.mem.eql(u8, nodes[group_index].kind, "group")) return null;
+    const group = nodes[group_index];
+    if (group.group_members.items.len > DSP.max_group_members) return null;
+    var key = DSP.Node.GroupSubgraphKey{};
+    key.member_count = @intCast(group.group_members.items.len);
+
+    for (group.group_members.items, 0..) |member, slot| {
+        if (member >= nodes.len) return null;
+        const tag = std.meta.stringToEnum(DSP.Node.Tag, nodes[member].kind) orelse return null;
+        key.member_tags[slot] = @backingInt(tag);
+        for (nodes[member].inputs.items) |connection| {
+            if (connection.input_port >= DSP.max_outlets) return null;
+            const descriptor = &key.inputs[slot][connection.input_port];
+            if (connection.source_port >= DSP.max_outlets) return null;
+            if (serializedGroupMemberSlot(group, connection.source_node)) |source_slot| {
+                descriptor.* = .{
+                    .kind = 1,
+                    .index = source_slot,
+                    .port = @intCast(connection.source_port),
+                };
+            } else if (connection.source_node < nodes.len and
+                std.mem.eql(u8, nodes[connection.source_node].kind, "group_input") and
+                (nodes[connection.source_node].group_owner orelse std.math.maxInt(u32)) == group_index)
+            {
+                const group_port = nodes[connection.source_node].group_port orelse return null;
+                if (group_port >= DSP.max_outlets) return null;
+                descriptor.* = .{
+                    .kind = 2,
+                    .index = @intCast(group_port),
+                };
+            } else {
+                return null;
+            }
+        }
+        if (nodes[member].parameter_source != 0) {
+            if (serializedGroupMemberSlot(group, nodes[member].parameter_source)) |source_slot|
+                key.parameter_sources[slot] = source_slot
+            else
+                return null;
+        }
+    }
+
+    for (group.group_inputs.items) |binding| {
+        if (binding.group_port >= DSP.max_outlets or binding.member_port >= DSP.max_outlets) return null;
+        const slot = serializedGroupMemberSlot(group, binding.member_node) orelse {
+            return null;
+        };
+        key.input_bindings[binding.group_port] = .{
+            .node = .{ .idx = slot },
+            .port = @intCast(binding.member_port),
+        };
+    }
+    for (group.group_outputs.items) |binding| {
+        if (binding.group_port >= DSP.max_outlets or binding.member_port >= DSP.max_outlets) return null;
+        const slot = serializedGroupMemberSlot(group, binding.member_node) orelse {
+            return null;
+        };
+        key.output_bindings[binding.group_port] = .{
+            .node = .{ .idx = slot },
+            .port = @intCast(binding.member_port),
+        };
+    }
+    return key.hash();
+}
+
 /// Saves and loads one live DSP graph without serializing runtime audio state.
 pub const Serializer = @This();
 
@@ -212,29 +286,39 @@ pub fn load(self: *Serializer, path: []const u8) !void {
     for (document.nodes.items, 0..) |serialized, group_index| {
         if (!std.mem.eql(u8, serialized.kind, "group")) continue;
         for (serialized.group_inputs.items) |binding| {
-            std.debug.assert(self.dsp.bindGroupInput(
+            const bound = self.dsp.bindGroupInput(
                 .{ .idx = group_index },
                 @intCast(binding.group_port),
                 .{ .idx = @intCast(binding.member_node) },
                 @intCast(binding.member_port),
-            ));
+            );
+            std.debug.assert(bound);
         }
         for (serialized.group_outputs.items) |binding| {
-            std.debug.assert(self.dsp.bindGroupOutput(
+            const bound = self.dsp.bindGroupOutput(
                 .{ .idx = group_index },
                 @intCast(binding.group_port),
                 .{ .idx = @intCast(binding.member_node) },
                 @intCast(binding.member_port),
-            ));
+            );
+            std.debug.assert(bound);
         }
     }
 
-    for (document.nodes.items, 0..) |serialized, target_index| {
-        if (serialized.parameter_source == 0) continue;
-        std.debug.assert(self.dsp.linkParameters(
-            .{ .idx = @intCast(serialized.parameter_source) },
-            .{ .idx = target_index },
-        ));
+    // Restore member links before group links so every cached group identity
+    // already includes the complete internal parameter-link topology.
+    for (0..2) |pass| {
+        const restoring_group_links = pass == 1;
+        for (document.nodes.items, 0..) |serialized, target_index| {
+            if (serialized.parameter_source == 0 or
+                (std.mem.eql(u8, serialized.kind, "group") != restoring_group_links))
+                continue;
+            const linked = self.dsp.linkParameters(
+                .{ .idx = @intCast(serialized.parameter_source) },
+                .{ .idx = target_index },
+            );
+            std.debug.assert(linked);
+        }
     }
 
     if (!try self.space.rebuildOccupancy(self.allocator))
@@ -545,7 +629,13 @@ fn validateDocument(document: P.SynthDocument) !void {
                 DSP.Node.Tag,
                 document.nodes.items[node.parameter_source].kind,
             ) orelse return error.UnknownNodeKind;
-            if (source_tag != tag or
+            if (source_tag == .group and tag == .group) {
+                const source_hash = serializedGroupSubgraphHash(document.nodes.items, node.parameter_source) orelse
+                    return error.InvalidGraphReference;
+                const target_hash = serializedGroupSubgraphHash(document.nodes.items, index) orelse
+                    return error.InvalidGraphReference;
+                if (source_hash != target_hash) return error.InvalidGraphReference;
+            } else if (source_tag != tag or
                 !DSP.node_metadata.get(tag).has_parameters or
                 !DSP.node_metadata.get(tag).can_link_parameters)
                 return error.InvalidGraphReference;

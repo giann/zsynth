@@ -1220,6 +1220,129 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
     };
 }
 
+/// Deep-copies a group, including its members, internal wiring, and bindings.
+fn duplicateGroup(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    source: VisualNode.Index,
+    link_parameters: bool,
+) !VisualNode.Index {
+    const source_state = self.dsp.nodes.items(.state)[source.idx].group;
+    const source_hash = self.dsp.nodes.items(.group_subgraph_hash)[source.idx];
+    const source_position = self.space.nodePosition(source);
+    const source_footprint = self.space.nodeFootprint(source);
+    const duplicate_position = self.space.findFreePosition(
+        source,
+        .{
+            .x = source_position.x + @as(i32, @intCast(source_footprint.width)) + 3,
+            .y = source_position.y,
+        },
+    ) orelse return error.InvalidVisualNodeLayout;
+    const offset = Space.Position{
+        .x = duplicate_position.x - source_position.x,
+        .y = duplicate_position.y - source_position.y,
+    };
+
+    const first_index = self.dsp.nodes.len;
+    var new_members: [DSP.max_group_members]DSP.Node.Index = @splat(.noop);
+    var member_count: usize = 0;
+    errdefer {
+        while (self.space.nodes.len > first_index)
+            self.space.remove(gpa, .{ .idx = self.space.nodes.len - 1 }) catch {};
+        while (self.dsp.nodes.len > first_index)
+            self.dsp.remove(gpa, .{ .idx = self.dsp.nodes.len - 1 });
+    }
+
+    for (source_state.members[0..source_state.member_count]) |member| {
+        new_members[member_count] = try self.dsp.addNode(gpa, self.duplicateNodeState(.{ .idx = member.idx }));
+        member_count += 1;
+    }
+    const duplicate_group = try self.dsp.addNode(gpa, DSP.Node.Group.create(
+        self.dsp.nodes.items(.name)[source.idx],
+        new_members[0..member_count],
+    ));
+    try self.dsp.addGroupEndpoints(gpa, duplicate_group);
+
+    for (new_members[0..member_count], 0..) |member, slot| {
+        const source_member = source_state.members[slot];
+        try self.space.addNode(gpa, member, .{
+            .x = self.space.nodePosition(source_member).x + offset.x,
+            .y = self.space.nodePosition(source_member).y + offset.y,
+        });
+    }
+    try self.space.addNode(gpa, duplicate_group, duplicate_position);
+    const duplicate_state = self.dsp.nodes.items(.state)[duplicate_group.idx].group;
+    for (0..DSP.max_outlets) |port| {
+        try self.space.addNode(gpa, duplicate_state.input_nodes[port], duplicate_position);
+        try self.space.addNode(gpa, duplicate_state.output_nodes[port], duplicate_position);
+    }
+
+    for (source_state.members[0..source_state.member_count], 0..) |source_member, slot| {
+        for (self.dsp.nodes.items(.inputs)[source_member.idx], 0..) |connection, input_port| {
+            if (connection.isNoop()) continue;
+            var source_node: ?DSP.Node.Index = null;
+            for (source_state.members[0..source_state.member_count], 0..) |candidate, source_slot| {
+                if (candidate.idx == connection.node.idx) {
+                    source_node = new_members[source_slot];
+                    break;
+                }
+            }
+            if (source_node == null) {
+                switch (self.dsp.nodes.items(.state)[connection.node.idx]) {
+                    .group_input => |endpoint| {
+                        if (endpoint.group.idx == source.idx)
+                            source_node = duplicate_state.input_nodes[endpoint.port];
+                    },
+                    else => {},
+                }
+            }
+            const mapped_source = source_node orelse return error.InvalidGraphReference;
+            self.dsp.plug(mapped_source, connection.output_port, new_members[slot], @intCast(input_port));
+        }
+
+        if (self.dsp.nodes.items(.parameter_link)[source_member.idx].source) |source_parameter| {
+            for (source_state.members[0..source_state.member_count], 0..) |candidate, source_slot| {
+                if (candidate.idx == source_parameter.idx) {
+                    const linked = self.dsp.linkParameters(new_members[source_slot], new_members[slot]);
+                    assert(linked);
+                    break;
+                }
+            }
+        }
+    }
+
+    for (source_state.input_bindings, 0..) |binding, port| {
+        if (binding) |value| {
+            for (source_state.members[0..source_state.member_count], 0..) |candidate, slot| {
+                if (candidate.idx == value.node.idx) {
+                    const bound = self.dsp.bindGroupInput(duplicate_group, @intCast(port), new_members[slot], value.port);
+                    assert(bound);
+                    break;
+                }
+            }
+        }
+    }
+    for (source_state.output_bindings, 0..) |binding, port| {
+        if (binding) |value| {
+            for (source_state.members[0..source_state.member_count], 0..) |candidate, slot| {
+                if (candidate.idx == value.node.idx) {
+                    const bound = self.dsp.bindGroupOutput(duplicate_group, @intCast(port), new_members[slot], value.port);
+                    assert(bound);
+                    break;
+                }
+            }
+        }
+    }
+
+    assert(self.dsp.nodes.items(.group_subgraph_hash)[duplicate_group.idx] == source_hash);
+
+    if (link_parameters) {
+        const linked = self.dsp.linkParameters(source, duplicate_group);
+        assert(linked);
+    }
+    return duplicate_group;
+}
+
 /// Adds a duplicate at an explicit visual position and optionally links its parameters.
 fn duplicateNodeAt(
     self: *Self,
@@ -1257,6 +1380,17 @@ fn duplicateSelectedNode(
     selected: VisualNode.Index,
     link_parameters: bool,
 ) !void {
+    if (self.editorSpace().isGroup(selected)) {
+        const duplicate_group = try self.duplicateGroup(gpa, selected, link_parameters);
+        if (!try self.space.rebuildOccupancy(gpa))
+            return error.InvalidVisualNodeLayout;
+        try self.space.computePaths(gpa);
+        self.setNodeSelection(duplicate_group);
+        _ = self.space.revealNode(duplicate_group);
+        self.zsynth.cursor.dirty = true;
+        try self.write(gpa);
+        return;
+    }
     if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .output or
         self.editorSpace().isGroup(selected))
         return;
@@ -1842,8 +1976,8 @@ fn connectOutlets(
             first.direction == second.direction)
             return;
 
-        const source = if (first.direction == .parameter_target) first else second;
-        const target = if (first.direction == .parameter_source) first else second;
+        const source = if (first.direction == .parameter_source) first else second;
+        const target = if (first.direction == .parameter_target) first else second;
         if (!self.dsp.linkParameters(source.node, target.node)) return;
         try self.editorSpace().computePaths(gpa);
         try self.write(gpa);

@@ -104,11 +104,20 @@ pub fn outletMetadata(self: *Self, outlet: Outlet) DSP.Node.OutletMetadata {
     const state = self.dsp.nodes.items(.state)[outlet.node.idx];
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
     if (std.meta.activeTag(state) == .group) {
-        return self.dsp.groupOutletMetadata(outlet.node, switch (outlet.direction) {
-            .input => .input,
-            .output => .output,
-            else => unreachable,
-        }, outlet.port);
+        return switch (outlet.direction) {
+            .input => self.dsp.groupOutletMetadata(outlet.node, .input, outlet.port),
+            .output => self.dsp.groupOutletMetadata(outlet.node, .output, outlet.port),
+            .parameter_source => .{
+                .name = "parameter source",
+                .short_name = "src",
+                .color = .curious_blue,
+            },
+            .parameter_target => .{
+                .name = "parameter target",
+                .short_name = "dst",
+                .color = .curious_blue,
+            },
+        };
     }
     return switch (outlet.direction) {
         .input => metadata.inputs[outlet.port],
