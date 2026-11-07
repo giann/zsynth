@@ -11,6 +11,7 @@ const Renderer = @import("Renderer.zig");
 const StateStack = @import("StateStack.zig");
 const SynthEditor = @import("SynthEditor.zig");
 const DSP = @import("DSP.zig");
+const pm = @import("portmidi.zig");
 
 const Self = @This();
 
@@ -75,7 +76,11 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
     var audio_engine_config = audio.Engine.Config.init();
     audio_engine_config.channels = 2;
     audio_engine_config.sample_rate = DSP.sample_rate;
+    audio_engine_config.period_size_in_frames = DSP.block_size;
     const audio_engine = try audio.Engine.create(audio_engine_config);
+
+    // Initialize portmidi
+    try pm.init();
 
     // Initialize image loading before any display assets are requested.
     stbi.init(process.io, allocator);
@@ -316,6 +321,7 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     sdl.quit();
     // Shut down image loading and audio after their users are gone.
     stbi.deinit();
+    pm.deinit() catch {};
     self.audio_engine.destroy();
     audio.deinit();
 }

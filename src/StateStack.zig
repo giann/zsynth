@@ -4,6 +4,7 @@ const std = @import("std");
 const Renderer = @import("Renderer.zig");
 const sdl = @import("zsdl3");
 const SynthEditor = @import("SynthEditor.zig");
+const pm = @import("portmidi.zig");
 
 const Self = @This();
 
@@ -206,7 +207,7 @@ pub const State = struct {
         InvalidGraphReference,
         InvalidGroup,
         IoError,
-    };
+    } || pm.Error;
 
     /// State-owned data, selected by `ContextTag`.
     context: Context,

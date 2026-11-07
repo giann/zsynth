@@ -6,6 +6,8 @@ const sdl = @import("zsdl3");
 const Display = @import("Display.zig");
 const utils = @import("utils.zig");
 const SpmcQueue = utils.SpmcQueue;
+const pm = @import("portmidi.zig");
+const midi = @import("MIDI.zig");
 
 /// Module type containing the DSP graph, node definitions, and audio bridge.
 const DSP = @This();
@@ -13,7 +15,7 @@ const DSP = @This();
 pub const sample_rate = 48_000;
 
 /// Maximum number of interleaved stereo samples rendered in one graph block.
-pub const block_size = 256;
+pub const block_size = 64;
 /// Maximum number of input or output ports exposed by a node.
 pub const max_outlets = 8;
 /// Maximum number of ordinary nodes that one non-nested group may contain.
@@ -630,6 +632,9 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     assert(!node.isNoop());
     assert(node.idx < self.nodes.len);
 
+    if (self.nodes.items(.deinitialize)[node.idx]) |deinitialize|
+        deinitialize(self, node);
+
     const last_index = self.nodes.len - 1;
     const removing_output = self.output.idx == node.idx;
 
@@ -814,7 +819,12 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     if (std.meta.activeTag(self.nodes.items(.state)[new_index]) == .group)
         self.rebuildGroupSubgraphHashLocked(.{ .idx = new_index });
 
-    return .{ .idx = new_index };
+    const index = Node.Index{ .idx = new_index };
+
+    if (node.initialize) |initialize|
+        try initialize(self, index);
+
+    return index;
 }
 
 /// Presses a key on a keyboard node using its atomic voice state.
@@ -1285,6 +1295,8 @@ pub const Node = struct {
     sample_tap: SampleTap = .{},
     /// Function used to render this node's outputs.
     process: Process,
+    initialize: ?Initialize = null,
+    deinitialize: ?Deinitialize = null,
     /// Reciprocal parameter source and target links.
     parameter_link: ParameterLink = .{},
 
@@ -1305,6 +1317,7 @@ pub const Node = struct {
         group,
         group_input,
         group_output,
+        midi,
     };
 
     /// Tagged union containing the concrete state for each node kind.
@@ -1339,6 +1352,7 @@ pub const Node = struct {
         group: Group,
         group_input: GroupInput,
         group_output: GroupOutput,
+        midi: MIDI,
     };
 
     /// Reciprocal one-to-one parameter relationships for a node.
@@ -1372,6 +1386,7 @@ pub const Node = struct {
         outputs: [max_outlets]OutletMetadata = @splat(.{}),
         output_count: u8 = 1,
         input_count: u8 = 1,
+        duplicatable: bool = true,
     };
 
     /// One child port exposed through a group boundary.
@@ -1422,13 +1437,17 @@ pub const Node = struct {
     };
 
     /// Error set reserved for node processing failures.
-    pub const ProcessError = error{};
+    pub const ProcessError = error{} || pm.Error;
     /// Signature implemented by every node's audio-processing function.
     pub const Process = *const fn (
         dsp: *DSP,
         node: Index,
         outputs: []const *Buffer,
     ) ProcessError!void;
+    pub const InitializeError = error{} || pm.Error;
+    /// Called once when node is added to the graph
+    pub const Initialize = *const fn (dsp: *DSP, node: Index) InitializeError!void;
+    pub const Deinitialize = *const fn (dsp: *DSP, node: Index) void;
 
     /// A node that produces silence and represents an unplugged connection.
     pub const Noop = struct {
@@ -1475,6 +1494,7 @@ pub const Node = struct {
             .short_name = "out",
             .color = .persimmon,
             .can_link_parameters = false,
+            .duplicatable = false,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .persimmon },
                 .{},
@@ -2156,11 +2176,7 @@ pub const Node = struct {
         }
 
         /// Renders one stereo block, applying optional per-sample modulation.
-        fn process(
-            dsp: *DSP,
-            node: Index,
-            into: []const *Buffer,
-        ) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             // Load graph connections and persistent oscillator state.
             const state = &dsp.nodes.items(.state)[node.idx].oscillator;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
@@ -3194,6 +3210,132 @@ pub const Node = struct {
             }
         }
     };
+
+    pub const MIDI = struct {
+        pub const metadata = Node.Metadata{
+            .name = "MIDI",
+            .short_name = "midi",
+            .color = .carnation,
+            .has_parameters = true,
+            .can_link_parameters = false,
+            .meterable = false,
+            .duplicatable = false,
+            .output_count = 3,
+            .input_count = 0,
+            .outputs = .{
+                .{ .name = "Frequency", .short_name = "freq", .color = .carnation },
+                .{ .name = "Gate", .short_name = "gate", .color = .carnation },
+                .{ .name = "Velocity", .short_name = "vel", .color = .carnation },
+                .{}, // TODO: CC
+                .{}, // TODO: After touch
+                .{}, // TODO: Pitch bend (frequency offset)
+                .{},
+                .{},
+            },
+        };
+
+        pub const Parameters = struct {
+            source: pm.DeviceId,
+        };
+
+        parameters: Parameters,
+        stream: *pm.MidiStream = undefined,
+        held_freq: f32 = 0,
+        held_gate: f32 = 0,
+        held_velocity: f32 = 0,
+
+        pub fn create(name: []const u8, parameters: Parameters) Node {
+            return .{
+                .state = .{
+                    .midi = .{ .parameters = parameters },
+                },
+                .name = name,
+                .process = process,
+                .initialize = initialize,
+                .deinitialize = deinitialize,
+            };
+        }
+
+        fn initialize(dsp: *DSP, node: Index) InitializeError!void {
+            const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
+            try pm.openInput(
+                &state.stream,
+                state.parameters.source,
+                block_size,
+                null,
+                null,
+            );
+        }
+
+        fn deinitialize(dsp: *DSP, node: Index) void {
+            const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
+            state.stream.close() catch {};
+        }
+
+        fn noteFrequency(note: u7) f32 {
+            const concert_a_freq: f32 = 440.0;
+            const concert_a_note: f32 = 69.0;
+            const semitones_per_octave: f32 = 12.0;
+
+            const note_f: f32 = @floatFromInt(note);
+            const semitone_offset = (note_f - concert_a_note) / semitones_per_octave;
+
+            return concert_a_freq * std.math.pow(f32, 2.0, semitone_offset);
+        }
+
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+            const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
+
+            // If device == -1, do nothing
+            if (state.parameters.source < 0) return;
+
+            if (try state.stream.poll()) {
+                var read = [1]pm.Event{undefined};
+                const read_count = state.stream.read(read[0..]);
+                if (read_count > 0) {
+                    const msg = midi.Message.init(read[0].message);
+
+                    if (msg == .data) {
+                        switch (msg.data.command) {
+                            .note_on => |on| {
+                                // freq
+                                const freq = noteFrequency(on.note);
+                                state.held_freq = freq;
+                                into[0].samples = @splat(freq);
+                                // vel
+                                const velocity = @as(f32, @floatFromInt(on.attack_velocity)) / 127;
+                                state.held_velocity = velocity;
+                                into[2].samples = @splat(velocity);
+                                // gate
+                                state.held_gate = if (freq > 0 and velocity > 0) 1 else 0;
+                                into[1].samples = @splat(1);
+                            },
+                            .note_off => |off| {
+                                // freq
+                                const freq = noteFrequency(off.note);
+                                state.held_freq = freq;
+                                into[0].samples = @splat(freq);
+                                // vel
+                                const velocity = @as(f32, @floatFromInt(off.release_velocity)) / 127;
+                                state.held_velocity = velocity;
+                                into[2].samples = @splat(velocity);
+                                // gate
+                                state.held_gate = 0;
+                                into[1].samples = @splat(0);
+                            },
+                            else => {
+                                // TODO
+                            },
+                        }
+                    }
+                }
+            } else {
+                into[0].samples = @splat(state.held_freq);
+                into[2].samples = @splat(state.held_velocity);
+                into[1].samples = @splat(state.held_gate);
+            }
+        }
+    };
 };
 
 /// Static port metadata for every node kind.
@@ -3216,5 +3358,6 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .group = Node.Group.metadata,
         .group_input = Node.GroupInput.metadata,
         .group_output = Node.GroupOutput.metadata,
+        .midi = Node.MIDI.metadata,
     },
 );

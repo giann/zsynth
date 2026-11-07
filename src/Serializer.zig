@@ -365,6 +365,11 @@ fn parametersToProto(
 ) !?P.Node.parameters_union {
     return switch (state) {
         .noop, .add, .multiply, .output, .group, .group_input, .group_output => null,
+        .midi => |value| .{
+            .midi = .{
+                .source = @intCast(value.parameters.source),
+            },
+        },
         .keyboard => |value| .{ .keyboard = .{
             .octave = value.parameters.octave,
         } },
@@ -550,6 +555,13 @@ fn nodeFromProto(
             .octave = @intCast(octave),
         });
     }
+    if (std.mem.eql(u8, serialized.kind, "midi")) {
+        const value = try requiredParameters(serialized, .midi);
+        return DSP.Node.MIDI.create(
+            name,
+            .{ .source = @intCast(value.source) },
+        );
+    }
     return error.UnknownNodeKind;
 }
 
@@ -592,7 +604,20 @@ fn validateDocument(document: P.SynthDocument) !void {
         if (index != 0) {
             switch (tag) {
                 .noop => unreachable,
-                .add, .multiply, .output, .constant, .keyboard, .oscillator, .mixer, .monophonic_sequencer, .adsr, .multimode_filter, .bit_crusher, .noise => try validateNodeParameters(node, tag),
+                .add,
+                .multiply,
+                .output,
+                .constant,
+                .keyboard,
+                .oscillator,
+                .mixer,
+                .monophonic_sequencer,
+                .adsr,
+                .multimode_filter,
+                .bit_crusher,
+                .noise,
+                .midi,
+                => try validateNodeParameters(node, tag),
                 .group => try validateGroup(node, index, document.nodes.items),
                 .group_input, .group_output => try validateGroupEndpoint(node, index, document.nodes.items),
             }
@@ -713,6 +738,7 @@ fn validateGroupBinding(
 fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
     switch (tag) {
         .constant => _ = try requiredParameters(node, .constant),
+        .midi => _ = try requiredParameters(node, .midi),
         .oscillator => {
             const value = try requiredParameters(node, .oscillator);
             _ = try enumFromString(DSP.Node.Oscillator.Waveform, value.waveform orelse "");

@@ -1,5 +1,6 @@
 //! The synth editor state and its demonstration DSP graph.
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const sdl = @import("zsdl3");
 const DSP = @import("DSP.zig");
@@ -10,6 +11,7 @@ const Space = @import("Space.zig");
 const Serializer = @import("Serializer.zig");
 const Display = @import("Display.zig");
 const VisualNode = Space.VisualNode;
+const pm = @import("portmidi.zig");
 
 const Self = @This();
 
@@ -65,7 +67,7 @@ const ParameterEditor = struct {
 /// Number of parameter rows available after applying the pane padding.
 const parameters_pane_padding: u32 = 1;
 /// Minimum selected-pane height, including its border and horizontal meter.
-const parameters_pane_min_height: u32 = 5;
+const parameters_pane_min_height: u32 = 7;
 /// Maximum number of parameter rows packed into one selected-pane column.
 const parameters_pane_max_rows: u32 = 5;
 /// Label prefix used by the fixed playback status HUD.
@@ -948,7 +950,10 @@ fn keyUpDown(
     const shift = (modifiers & sdl.Keymod.shift) != 0;
     const delta: i32 = if (shift) 5 else 1;
 
-    const command = (modifiers & (sdl.Keymod.lgui | sdl.Keymod.rgui)) != 0;
+    const command = if (builtin.os.tag == .windows)
+        (modifiers & sdl.Keymod.ctrl) != 0
+    else
+        (modifiers & (sdl.Keymod.lgui | sdl.Keymod.rgui)) != 0;
 
     if (event.key == .escape and self.active_group != null) {
         self.leaveGroupView(gpa);
@@ -1255,6 +1260,7 @@ fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
 fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
     const source_name = self.dsp.nodes.items(.name)[source.idx];
     return switch (self.dsp.nodes.items(.state)[source.idx]) {
+        .midi => unreachable,
         .add => DSP.Node.Add.create(source_name),
         .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
         .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
@@ -1403,7 +1409,8 @@ fn duplicateNodeAt(
     position: Space.Position,
     link_parameters: bool,
 ) !VisualNode.Index {
-    if (std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]) == .output)
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]));
+    if (!metadata.duplicatable)
         return error.InvalidVisualNodeLayout;
     const duplicate_index = try self.dsp.addNode(gpa, self.duplicateNodeState(source));
     errdefer self.dsp.remove(gpa, duplicate_index);
@@ -2941,6 +2948,15 @@ pub const CommandPalette = struct {
             .noise => DSP.Node.Noise.create(name, .{
                 .seed = 0,
             }),
+            .midi => DSP.Node.MIDI.create(
+                name,
+                .{
+                    .source = if (pm.countDevices() > 0)
+                        0
+                    else
+                        -1,
+                },
+            ),
             .noop, .output, .group, .group_input, .group_output => unreachable,
         };
     }

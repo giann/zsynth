@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "debug", debug);
 
     const mimalloc = buildMimalloc(b, target, optimize);
+    const portmidi = buildPortMidi(b, target, optimize);
 
     const exe = b.addExecutable(.{
         .name = "zsynth",
@@ -52,6 +53,18 @@ pub fn build(b: *std.Build) void {
     addProtobuf(exe, protobuf_dep);
     exe.step.dependOn(gen_proto);
     exe.root_module.linkLibrary(mimalloc);
+
+    exe.root_module.linkLibrary(portmidi);
+    switch (target.result.os.tag) {
+        .macos => {
+            exe.root_module.linkFramework("CoreFoundation", .{});
+            exe.root_module.linkFramework("CoreMidi", .{});
+        },
+        .windows => {
+            exe.root_module.linkSystemLibrary("winmm", .{});
+        },
+        else => {},
+    }
 
     const check = b.step("check", "Compile zsynth without installing it");
     check.dependOn(&exe.step);
@@ -189,22 +202,20 @@ fn addSdl3(
     }
 }
 
-fn buildMimalloc(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.lang.Optimize,
-) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{
-        .name = "mimalloc",
-        .linkage = .static,
-        .use_llvm = true,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .pic = true,
-        }),
-    });
+fn buildMimalloc(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(
+        .{
+            .name = "mimalloc",
+            .linkage = .static,
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .pic = true,
+            }),
+        },
+    );
 
     lib.root_module.addIncludePath(b.path("vendors/mimalloc/include"));
     lib.root_module.addCSourceFiles(.{
@@ -258,4 +269,64 @@ fn addProtobuf(
     protobuf_dep: *std.Build.Dependency,
 ) void {
     compile_step.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
+}
+
+fn buildPortMidi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(
+        .{
+            .name = "portmidi",
+            .linkage = .static,
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .pic = true,
+            }),
+        },
+    );
+
+    lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_common"));
+    lib.root_module.addIncludePath(b.path("vendors/portmidi/porttime"));
+    switch (target.result.os.tag) {
+        .linux => lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_linux")),
+        .windows => lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_win")),
+        .macos => lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_mac")),
+        else => {},
+    }
+    lib.root_module.addCSourceFiles(
+        .{
+            .files = switch (target.result.os.tag) {
+                .linux => &.{
+                    "vendors/portmidi/pm_common/portmidi.c",
+                    "vendors/portmidi/pm_common/pmutil.c",
+                    "vendors/portmidi/porttime/porttime.c",
+                    "vendors/portmidi/porttime/ptlinux.c",
+                    "vendors/portmidi/pm_linux/pmlinux.c",
+                    "vendors/portmidi/pm_linux/pmlinuxalsa.c",
+                    "vendors/portmidi/pm_linux/pmlinuxnull.c",
+                },
+                .macos => &.{
+                    "vendors/portmidi/pm_common/portmidi.c",
+                    "vendors/portmidi/pm_common/pmutil.c",
+                    "vendors/portmidi/porttime/porttime.c",
+                    "vendors/portmidi/porttime/ptmacosx_cf.c",
+                    "vendors/portmidi/porttime/ptmacosx_mach.c",
+                    "vendors/portmidi/pm_mac/pmmac.c",
+                    "vendors/portmidi/pm_mac/pmmacosxcm.c",
+                },
+                .windows => &.{
+                    "vendors/portmidi/pm_common/portmidi.c",
+                    "vendors/portmidi/pm_common/pmutil.c",
+                    "vendors/portmidi/porttime/porttime.c",
+                    "vendors/portmidi/porttime/ptwinmm.c",
+                    "vendors/portmidi/pm_win/pmwin.c",
+                    "vendors/portmidi/pm_win/pmwinmm.c",
+                },
+                else => &.{},
+            },
+        },
+    );
+
+    return lib;
 }
