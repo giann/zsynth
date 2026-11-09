@@ -322,6 +322,56 @@ fn buildPortMidi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     return lib;
 }
 
+/// Builds the Steinberg ASIO SDK host helpers for a Windows target.
+fn buildASIO(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .name = "asio",
+        .linkage = .static,
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+            .pic = true,
+        }),
+    });
+
+    lib.root_module.addIncludePath(b.path("vendors/asio/common"));
+    lib.root_module.addIncludePath(b.path("vendors/asio/host"));
+    lib.root_module.addIncludePath(b.path("vendors/asio/host/pc"));
+
+    // PortAudio's ASIO finder applies this SDK fix before compiling asiolist.cpp.
+    const asio_list_path = b.root.joinString(b.allocator, "vendors/asio/host/pc/asiolist.cpp") catch
+        @panic("failed to resolve the ASIO SDK driver list source path");
+    const asio_list_source = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        asio_list_path,
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch @panic("failed to read the ASIO SDK driver list source");
+    std.debug.assert(std.mem.indexOf(u8, asio_list_source, "delete lpdrv") != null);
+    const patched_asio_list_source = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        asio_list_source,
+        "delete lpdrv",
+        "delete[] lpdrv",
+    ) catch @panic("failed to patch the ASIO SDK driver list source");
+    const generated_files = b.addWriteFiles();
+    const patched_asio_list = generated_files.add("patched_asiolist.cpp", patched_asio_list_source);
+
+    lib.root_module.addCSourceFiles(.{ .files = &.{
+        "vendors/asio/common/asio.cpp",
+        "vendors/asio/host/asiodrivers.cpp",
+    } });
+    lib.root_module.addCSourceFile(.{ .file = patched_asio_list });
+    lib.root_module.linkSystemLibrary("ole32", .{});
+    lib.root_module.linkSystemLibrary("uuid", .{});
+
+    return lib;
+}
+
 /// Builds PortAudio with the native host API used on the target platform.
 fn buildPortAudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
@@ -332,6 +382,7 @@ fn buildPortAudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .link_libcpp = target.result.os.tag == .windows,
             .pic = true,
         }),
     });
@@ -392,7 +443,12 @@ fn buildPortAudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             lib.root_module.linkFramework("CoreServices", .{});
         },
         .windows => {
+            const asio = buildASIO(b, target, optimize);
             lib.root_module.addIncludePath(b.path("vendors/portaudio/src/os/win"));
+            lib.root_module.addIncludePath(b.path("vendors/portaudio/src/hostapi/asio"));
+            lib.root_module.addIncludePath(b.path("vendors/asio/common"));
+            lib.root_module.addIncludePath(b.path("vendors/asio/host"));
+            lib.root_module.addIncludePath(b.path("vendors/asio/host/pc"));
             lib.root_module.addCSourceFiles(.{
                 .files = &.{
                     "vendors/portaudio/src/os/win/pa_win_coinitialize.c",
@@ -403,11 +459,20 @@ fn buildPortAudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
                     "vendors/portaudio/src/hostapi/wasapi/pa_win_wasapi.c",
                 },
                 .flags = &.{
+                    "-DPA_USE_ASIO=1",
                     "-DPA_USE_WASAPI=1",
                     "-D_WIN32_WINNT=0x0600",
                     "-DWINVER=0x0600",
                 },
             });
+            lib.root_module.addCSourceFiles(.{
+                .files = &.{
+                    "vendors/portaudio/src/hostapi/asio/pa_asio.cpp",
+                    "vendors/portaudio/src/hostapi/asio/iasiothiscallresolver.cpp",
+                },
+                .flags = &.{"-DPA_USE_ASIO=1"},
+            });
+            lib.root_module.linkLibrary(asio);
             lib.root_module.linkSystemLibrary("winmm", .{});
             lib.root_module.linkSystemLibrary("ole32", .{});
             lib.root_module.linkSystemLibrary("uuid", .{});

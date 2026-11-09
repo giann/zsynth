@@ -28,15 +28,15 @@ pub const GroupEndpointError = error{ OutOfMemory, InvalidGroup };
 /// Number of rendered blocks retained by each node's SampleTap.
 pub const sample_tap_capacity = 64;
 
-/// Per-node, audio-thread-safe history of rendered output blocks.
+/// Per-node, audio-thread-safe history of rendered signal blocks.
 pub const SampleTap = struct {
-    /// One rendered block containing every declared output port.
+    /// One rendered block containing every tapped output signal.
     pub const Block = struct {
-        /// Interleaved stereo samples indexed by output port.
+        /// Interleaved stereo samples indexed by tapped signal.
         samples: [max_outlets][block_size * 2]f32,
-        /// Number of valid interleaved samples in each port.
+        /// Number of valid interleaved samples in each tapped signal.
         sample_count: usize,
-        /// Number of declared output ports represented by this block.
+        /// Number of tapped output signals represented by this block.
         output_count: u8,
     };
 
@@ -985,7 +985,8 @@ pub fn keyboardReleaseAll(self: *DSP, node: Node.Index) void {
     }
 }
 
-/// Returns a node's SampleTap for immediate main-thread reads.
+/// Returns a node's SampleTap for immediate main-thread reads. The graph output
+/// sink publishes its final rendered signal as one tap despite having no outlet.
 ///
 /// The returned pointer must not be retained across graph mutation. The UI
 /// stores only the node index and resolves the tap again for each update.
@@ -1040,7 +1041,10 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     assert(node.idx < self.nodes.len);
     const cache = &self.nodes.items(.cache)[node.idx];
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
-    const output_count = node_metadata.get(source_tag).output_count;
+    const output_count = if (node.idx == self.output.idx)
+        1
+    else
+        node_metadata.get(source_tag).output_count;
 
     // Reuse a result already rendered during this generation and block size.
     if (cache.generation == self.render_generation and
@@ -1093,8 +1097,8 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     cache.sample_count = sample_count;
     cache.generation = self.render_generation;
 
-    // Publish a bounded, non-blocking copy after processing completes. The
-    // SampleTap copies every declared output port for independent UI readers.
+    // Publish a bounded, non-blocking copy after processing completes. For the
+    // graph output sink, output zero is the final signal copied to PortAudio.
     const sample_tap = &self.nodes.items(.sample_tap)[node.idx];
     var block: SampleTap.Block = .{
         .samples = undefined,

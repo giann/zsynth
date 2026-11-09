@@ -19,6 +19,7 @@ and effects to be composed into a real-time sound pipeline.
 - Noise: white, pink and brown
 - Utility nodes: Add, Multiply, Constant
 - Keyboard
+- MIDI input
 
 ## TODO
 
@@ -28,7 +29,6 @@ and effects to be composed into a real-time sound pipeline.
   audio)
 - pitch shifter
 - resampler
-- MIDI input
 
 ## Controls and UI elements
 

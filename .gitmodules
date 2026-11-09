@@ -7,3 +7,6 @@
 [submodule "vendors/portaudio"]
 	path = vendors/portaudio
 	url = https://github.com/PortAudio/portaudio.git
+[submodule "vendors/asio"]
+	path = vendors/asio
+	url = https://github.com/audiosdk/asio.git

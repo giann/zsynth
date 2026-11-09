@@ -3255,7 +3255,7 @@ pub const OutputMeter = struct {
     pub const Parameters = struct {
         /// Direction in which each meter fills.
         direction: Direction = .right,
-        /// Node whose rendered outputs are analyzed; valid only when selected.
+        /// Node whose rendered signals are analyzed; valid only when selected.
         node: DSP.Node.Index = undefined,
         /// Number of cells used by each meter itself.
         meter_cell_count: u32 = 10,
@@ -3304,8 +3304,9 @@ pub const OutputMeter = struct {
         const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
         if (!metadata.meterable) return;
 
+        const graph_output = node.idx == dsp.output.idx;
         self.parameters.node = node;
-        self.output_count = metadata.output_count;
+        self.output_count = if (graph_output) 1 else metadata.output_count;
         assert(self.parameters.meter_cell_count > 0);
 
         const horizontal = switch (self.parameters.direction) {
@@ -3314,17 +3315,21 @@ pub const OutputMeter = struct {
         };
         self.height = if (horizontal) 3 else self.parameters.meter_cell_count + 2;
 
-        for (metadata.outputs[0..metadata.output_count], 0..) |output, output_port| {
-            self.output_short_names[output_port] = output.short_name;
+        for (0..@as(usize, self.output_count)) |output_port| {
+            const short_name = if (graph_output)
+                "out"
+            else
+                metadata.outputs[output_port].short_name;
+            self.output_short_names[output_port] = short_name;
             const group_width = if (horizontal)
                 @max(
                     self.parameters.meter_cell_count + 1,
-                    @as(u32, @intCast(output.short_name.len)),
+                    @as(u32, @intCast(short_name.len)),
                 )
             else
-                @max(2, @as(u32, @intCast(output.short_name.len)));
-            self.width += @max(group_width, @as(u32, @intCast(output.short_name.len)));
-            if (output_port + 1 < metadata.output_count)
+                @max(2, @as(u32, @intCast(short_name.len)));
+            self.width += @max(group_width, @as(u32, @intCast(short_name.len)));
+            if (output_port + 1 < @as(usize, self.output_count))
                 self.width += 1;
         }
     }
