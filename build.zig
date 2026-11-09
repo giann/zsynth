@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
 
     const mimalloc = buildMimalloc(b, target, optimize);
     const portmidi = buildPortMidi(b, target, optimize);
+    const portaudio = buildPortAudio(b, target, optimize);
 
     const exe = b.addExecutable(.{
         .name = "zsynth",
@@ -48,23 +49,13 @@ pub fn build(b: *std.Build) void {
     addSdl3(b, target, exe);
     addZstbi(b, exe);
     addZpool(b, exe);
-    addZaudio(b, exe);
     addImGUI(b, exe);
     addProtobuf(exe, protobuf_dep);
     exe.step.dependOn(gen_proto);
     exe.root_module.linkLibrary(mimalloc);
 
     exe.root_module.linkLibrary(portmidi);
-    switch (target.result.os.tag) {
-        .macos => {
-            exe.root_module.linkFramework("CoreFoundation", .{});
-            exe.root_module.linkFramework("CoreMidi", .{});
-        },
-        .windows => {
-            exe.root_module.linkSystemLibrary("winmm", .{});
-        },
-        else => {},
-    }
+    exe.root_module.linkLibrary(portaudio);
 
     const check = b.step("check", "Compile zsynth without installing it");
     check.dependOn(&exe.step);
@@ -258,12 +249,6 @@ fn buildMimalloc(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     return lib;
 }
 
-fn addZaudio(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
-    const zaudio = b.dependency("zaudio", .{});
-    compile_step.root_module.addImport("zaudio", zaudio.module("root"));
-    compile_step.root_module.linkLibrary(zaudio.artifact("miniaudio"));
-}
-
 fn addProtobuf(
     compile_step: *std.Build.Step.Compile,
     protobuf_dep: *std.Build.Dependency,
@@ -288,45 +273,147 @@ fn buildPortMidi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
     lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_common"));
     lib.root_module.addIncludePath(b.path("vendors/portmidi/porttime"));
+    const common_sources = [_][]const u8{
+        "vendors/portmidi/pm_common/portmidi.c",
+        "vendors/portmidi/pm_common/pmutil.c",
+        "vendors/portmidi/porttime/porttime.c",
+    };
+    lib.root_module.addCSourceFiles(.{ .files = &common_sources });
+
     switch (target.result.os.tag) {
-        .linux => lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_linux")),
-        .windows => lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_win")),
-        .macos => lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_mac")),
-        else => {},
-    }
-    lib.root_module.addCSourceFiles(
-        .{
-            .files = switch (target.result.os.tag) {
-                .linux => &.{
-                    "vendors/portmidi/pm_common/portmidi.c",
-                    "vendors/portmidi/pm_common/pmutil.c",
-                    "vendors/portmidi/porttime/porttime.c",
+        .linux => {
+            lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_linux"));
+            lib.root_module.addCSourceFiles(.{
+                .files = &.{
                     "vendors/portmidi/porttime/ptlinux.c",
                     "vendors/portmidi/pm_linux/pmlinux.c",
                     "vendors/portmidi/pm_linux/pmlinuxalsa.c",
-                    "vendors/portmidi/pm_linux/pmlinuxnull.c",
                 },
-                .macos => &.{
-                    "vendors/portmidi/pm_common/portmidi.c",
-                    "vendors/portmidi/pm_common/pmutil.c",
-                    "vendors/portmidi/porttime/porttime.c",
-                    "vendors/portmidi/porttime/ptmacosx_cf.c",
-                    "vendors/portmidi/porttime/ptmacosx_mach.c",
-                    "vendors/portmidi/pm_mac/pmmac.c",
-                    "vendors/portmidi/pm_mac/pmmacosxcm.c",
-                },
-                .windows => &.{
-                    "vendors/portmidi/pm_common/portmidi.c",
-                    "vendors/portmidi/pm_common/pmutil.c",
-                    "vendors/portmidi/porttime/porttime.c",
-                    "vendors/portmidi/porttime/ptwinmm.c",
-                    "vendors/portmidi/pm_win/pmwin.c",
-                    "vendors/portmidi/pm_win/pmwinmm.c",
-                },
-                else => &.{},
-            },
+                .flags = &.{ "-DPMALSA", "-pthread" },
+            });
+            lib.root_module.linkSystemLibrary("asound", .{});
+            lib.root_module.linkSystemLibrary("pthread", .{});
         },
-    );
+        .macos => {
+            lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_mac"));
+            lib.root_module.addCSourceFiles(.{ .files = &.{
+                "vendors/portmidi/porttime/ptmacosx_cf.c",
+                "vendors/portmidi/porttime/ptmacosx_mach.c",
+                "vendors/portmidi/pm_mac/pmmac.c",
+                "vendors/portmidi/pm_mac/pmmacosxcm.c",
+            } });
+            lib.root_module.linkFramework("CoreAudio", .{});
+            lib.root_module.linkFramework("CoreFoundation", .{});
+            lib.root_module.linkFramework("CoreMidi", .{});
+            lib.root_module.linkFramework("CoreServices", .{});
+        },
+        .windows => {
+            lib.root_module.addIncludePath(b.path("vendors/portmidi/pm_win"));
+            lib.root_module.addCSourceFiles(.{ .files = &.{
+                "vendors/portmidi/porttime/ptwinmm.c",
+                "vendors/portmidi/pm_win/pmwin.c",
+                "vendors/portmidi/pm_win/pmwinmm.c",
+            } });
+            lib.root_module.linkSystemLibrary("winmm", .{});
+        },
+        else => @panic("PortMidi is not configured for this target OS"),
+    }
+
+    return lib;
+}
+
+/// Builds PortAudio with the native host API used on the target platform.
+fn buildPortAudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .name = "portaudio",
+        .linkage = .static,
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+        }),
+    });
+
+    lib.root_module.addIncludePath(b.path("vendors/portaudio/include"));
+    lib.root_module.addIncludePath(b.path("vendors/portaudio/src/common"));
+
+    const common_sources = [_][]const u8{
+        "vendors/portaudio/src/common/pa_allocation.c",
+        "vendors/portaudio/src/common/pa_converters.c",
+        "vendors/portaudio/src/common/pa_cpuload.c",
+        "vendors/portaudio/src/common/pa_debugprint.c",
+        "vendors/portaudio/src/common/pa_dither.c",
+        "vendors/portaudio/src/common/pa_front.c",
+        "vendors/portaudio/src/common/pa_process.c",
+        "vendors/portaudio/src/common/pa_ringbuffer.c",
+        "vendors/portaudio/src/common/pa_stream.c",
+        "vendors/portaudio/src/common/pa_trace.c",
+    };
+    lib.root_module.addCSourceFiles(.{ .files = &common_sources });
+
+    switch (target.result.os.tag) {
+        .linux => {
+            lib.root_module.addIncludePath(b.path("vendors/portaudio/src/os/unix"));
+            lib.root_module.addCSourceFiles(.{
+                .files = &.{
+                    "vendors/portaudio/src/os/unix/pa_unix_hostapis.c",
+                    "vendors/portaudio/src/os/unix/pa_unix_util.c",
+                    "vendors/portaudio/src/os/unix/pa_pthread_util.c",
+                    "vendors/portaudio/src/hostapi/alsa/pa_linux_alsa.c",
+                },
+                .flags = &.{ "-DPA_USE_ALSA=1", "-pthread" },
+            });
+            lib.root_module.linkSystemLibrary("asound", .{});
+            lib.root_module.linkSystemLibrary("pthread", .{});
+            lib.root_module.linkSystemLibrary("m", .{});
+        },
+        .macos => {
+            lib.root_module.addIncludePath(b.path("vendors/portaudio/src/os/unix"));
+            lib.root_module.addIncludePath(b.path("vendors/portaudio/src/hostapi/coreaudio"));
+            lib.root_module.addCSourceFiles(.{
+                .files = &.{
+                    "vendors/portaudio/src/os/unix/pa_unix_hostapis.c",
+                    "vendors/portaudio/src/os/unix/pa_unix_util.c",
+                    "vendors/portaudio/src/os/unix/pa_pthread_util.c",
+                    "vendors/portaudio/src/hostapi/coreaudio/pa_mac_core.c",
+                    "vendors/portaudio/src/hostapi/coreaudio/pa_mac_core_blocking.c",
+                    "vendors/portaudio/src/hostapi/coreaudio/pa_mac_core_utilities.c",
+                },
+                .flags = &.{ "-DPA_USE_COREAUDIO=1", "-pthread" },
+            });
+            lib.root_module.linkSystemLibrary("pthread", .{});
+            lib.root_module.linkSystemLibrary("m", .{});
+            lib.root_module.linkFramework("CoreAudio", .{});
+            lib.root_module.linkFramework("AudioToolbox", .{});
+            lib.root_module.linkFramework("AudioUnit", .{});
+            lib.root_module.linkFramework("CoreFoundation", .{});
+            lib.root_module.linkFramework("CoreServices", .{});
+        },
+        .windows => {
+            lib.root_module.addIncludePath(b.path("vendors/portaudio/src/os/win"));
+            lib.root_module.addCSourceFiles(.{
+                .files = &.{
+                    "vendors/portaudio/src/os/win/pa_win_coinitialize.c",
+                    "vendors/portaudio/src/os/win/pa_win_hostapis.c",
+                    "vendors/portaudio/src/os/win/pa_win_util.c",
+                    "vendors/portaudio/src/os/win/pa_win_version.c",
+                    "vendors/portaudio/src/os/win/pa_win_waveformat.c",
+                    "vendors/portaudio/src/hostapi/wasapi/pa_win_wasapi.c",
+                },
+                .flags = &.{
+                    "-DPA_USE_WASAPI=1",
+                    "-D_WIN32_WINNT=0x0600",
+                    "-DWINVER=0x0600",
+                },
+            });
+            lib.root_module.linkSystemLibrary("winmm", .{});
+            lib.root_module.linkSystemLibrary("ole32", .{});
+            lib.root_module.linkSystemLibrary("uuid", .{});
+        },
+        else => @panic("PortAudio is not configured for this target OS"),
+    }
 
     return lib;
 }

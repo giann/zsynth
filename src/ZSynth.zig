@@ -1,7 +1,7 @@
 //! Owns the ZSynth application runtime and its top-level graphics resources.
 
 const std = @import("std");
-const audio = @import("zaudio");
+const pa = @import("portaudio.zig");
 const sdl = @import("zsdl3");
 const stbi = @import("zstbi");
 const zgui = @import("zgui");
@@ -52,8 +52,12 @@ pub const CursorState = struct {
 
 /// The I/O context shared with the renderer and asset loader.
 io: std.Io,
-/// The process-wide audio engine used by the active editor state.
-audio_engine: *audio.Engine,
+/// Devices that passed the graph's stereo 48 kHz output-format check.
+audio_devices: []pa.Device,
+/// Available MIDI input devices collected after PortMidi initialization.
+midi_devices: []pm.Device,
+/// Device used when a new graph is created or a saved device is unavailable.
+default_audio_device: pa.DeviceId,
 /// GPU renderer and its window.
 renderer: Renderer,
 /// Character-grid display written by application states.
@@ -69,18 +73,19 @@ cursor: CursorState = .{},
 
 /// Initializes audio, SDL, the renderer, the display, and post-processing.
 pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
-    // Start the audio library before creating the engine that depends on it.
-    audio.init(allocator);
+    // Initialize PortAudio and retain supported output names for UI and documents.
+    try pa.init();
+    errdefer pa.deinit() catch {};
+    const audio_devices = try pa.enumerateOutputDevices(allocator, DSP.sample_rate);
+    errdefer pa.deinitDevices(allocator, audio_devices);
+    if (audio_devices.len == 0) return error.NoUsableAudioOutput;
+    const default_audio_device = pa.defaultDevice(audio_devices) orelse audio_devices[0].id;
 
-    // Configure a stereo, 48 kHz engine for the synth DSP graph.
-    var audio_engine_config = audio.Engine.Config.init();
-    audio_engine_config.channels = 2;
-    audio_engine_config.sample_rate = DSP.sample_rate;
-    audio_engine_config.period_size_in_frames = DSP.block_size;
-    const audio_engine = try audio.Engine.create(audio_engine_config);
-
-    // Initialize portmidi
+    // Retain valid MIDI input identities for the editor and synth documents.
     try pm.init();
+    errdefer pm.deinit() catch {};
+    const midi_devices = try pm.enumerateInputDevices(allocator);
+    errdefer pm.deinitDevices(allocator, midi_devices);
 
     // Initialize image loading before any display assets are requested.
     stbi.init(process.io, allocator);
@@ -141,7 +146,9 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
 
     var self = Self{
         .io = process.io,
-        .audio_engine = audio_engine,
+        .audio_devices = audio_devices,
+        .midi_devices = midi_devices,
+        .default_audio_device = default_audio_device,
         .renderer = renderer,
         .display = display,
         .ui_display = ui_display,
@@ -321,9 +328,10 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     sdl.quit();
     // Shut down image loading and audio after their users are gone.
     stbi.deinit();
+    pm.deinitDevices(allocator, self.midi_devices);
     pm.deinit() catch {};
-    self.audio_engine.destroy();
-    audio.deinit();
+    pa.deinitDevices(allocator, self.audio_devices);
+    pa.deinit() catch {};
 }
 
 /// Initializes the software cursor at the center of the current window.

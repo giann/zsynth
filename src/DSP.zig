@@ -1,7 +1,7 @@
 //! Graph-based small DSP
 const std = @import("std");
 const assert = std.debug.assert;
-const a = @import("zaudio");
+const pa = @import("portaudio.zig");
 const sdl = @import("zsdl3");
 const Display = @import("Display.zig");
 const utils = @import("utils.zig");
@@ -9,10 +9,13 @@ const SpmcQueue = utils.SpmcQueue;
 const pm = @import("portmidi.zig");
 const midi = @import("MIDI.zig");
 
-/// Module type containing the DSP graph, node definitions, and audio bridge.
+/// Module type containing the DSP graph, node definitions, and PortAudio bridge.
 const DSP = @This();
 
 pub const sample_rate = 48_000;
+
+/// Errors returned while opening, starting, or switching the audio stream.
+pub const AudioError = pa.Error || error{InvalidDevice};
 
 /// Maximum number of interleaved stereo samples rendered in one graph block.
 pub const block_size = 64;
@@ -44,9 +47,10 @@ pub const SampleTap = struct {
     queue: Queue = undefined,
 };
 
-/// Audio engine used to create and control the graph's live sound source.
-/// The engine is owned by the application and must outlive this DSP.
-engine: *a.Engine,
+/// Output devices cached by the application for this DSP's lifetime.
+devices: []const pa.Device,
+/// MIDI input devices cached by the application for this DSP's lifetime.
+midi_devices: []const pm.Device,
 
 /// Node whose first output is copied to the audio device.
 output: Node.Index = .{ .idx = 1 },
@@ -58,50 +62,47 @@ graph_mutex: std.atomic.Mutex = .unlocked,
 /// Generation of the currently rendered audio block.
 render_generation: u64 = 0,
 
-/// Audio-library data source that requests rendered graph blocks.
-graph_data_source: GraphDataSource,
+/// PortAudio output stream, opened when playback starts.
+audio_stream: ?*pa.Stream = null,
+/// Device ID currently bound to `audio_stream`, if one is open.
+stream_device: pa.DeviceId = pa.no_device,
+/// Whether the PortAudio stream is currently running.
+playing: bool = false,
 
-/// Audio-library sound backed by `graph_data_source`.
-sound: *a.Sound,
-
-/// Initializes the graph, its live data source, and the audio sound.
-pub fn init(self: *DSP, engine: *a.Engine, gpa: std.mem.Allocator) !void {
-    // Capture the engine's format so every node renders at the device rate.
-    assert(engine.getSampleRate() == sample_rate);
-
+/// Initializes graph storage and retains the application's supported devices.
+pub fn init(
+    self: *DSP,
+    devices: []const pa.Device,
+    midi_devices: []const pm.Device,
+    gpa: std.mem.Allocator,
+) !void {
+    assert(devices.len != 0);
     // Initialize graph-owned fields before creating dependent resources.
     self.* = DSP{
-        .engine = engine,
-        .graph_data_source = undefined,
-        .sound = undefined,
+        .devices = devices,
+        .midi_devices = midi_devices,
     };
-
-    // Create the stereo pull source consumed by the audio library.
-    try self.graph_data_source.init(2);
 
     // Install the sentinel node first so every default connection is valid.
     _ = try self.addNode(
         gpa,
         Node.Noop.create("noop"),
     );
-
-    // Bind the graph source to a sound, leaving playback stopped for the caller.
-    self.sound = try self.engine.createSoundFromDataSource(
-        self.graph_data_source.data_source,
-        .{},
-        null,
-    );
 }
 
 /// Stops and releases every audio resource owned by the graph.
 pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
-    // Stop playback before releasing the sound and its callback source.
-    self.sound.stop() catch {};
+    self.stop() catch {};
+    if (self.audio_stream) |pa_stream| {
+        pa.closeStream(pa_stream) catch {};
+        self.audio_stream = null;
+    }
     self.lockGraph();
     defer self.unlockGraph();
-    self.sound.destroy();
-    // Tear down the callback source before freeing graph storage.
-    self.graph_data_source.deinit();
+    // Release node-owned device streams before freeing their node state.
+    for (self.nodes.items(.deinitialize), 0..) |deinitialize, index|
+        if (deinitialize) |callback|
+            callback(self, .{ .idx = index });
     for (self.nodes.items(.sample_tap)) |*sample_tap|
         sample_tap.queue.deinit(gpa);
     // Release all node storage using the allocator supplied at init time.
@@ -115,6 +116,9 @@ pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
 
     while (self.nodes.len > 1) {
         const index = self.nodes.len - 1;
+        // Graph replacement must close external resources before dropping nodes.
+        if (self.nodes.items(.deinitialize)[index]) |deinitialize|
+            deinitialize(self, .{ .idx = index });
         self.nodes.items(.sample_tap)[index].queue.deinit(gpa);
         _ = self.nodes.pop();
     }
@@ -122,26 +126,153 @@ pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
     self.render_generation = 0;
 }
 
-/// Starts streaming rendered graph audio to the sound device.
-pub fn start(self: *DSP) !void {
-    try self.sound.start();
+/// Opens and starts the selected output device.
+pub fn start(self: *DSP) AudioError!void {
+    if (self.playing) return;
+    try self.ensureOutputStream();
+    try pa.startStream(self.audio_stream.?);
+    self.playing = true;
 }
 
-/// Stops streaming graph audio without destroying the graph.
-pub fn stop(self: *DSP) !void {
-    try self.sound.stop();
+/// Stops streaming while keeping the selected device open.
+pub fn stop(self: *DSP) AudioError!void {
+    if (!self.playing) return;
+    try pa.stopStream(self.audio_stream.?);
+    self.playing = false;
 }
 
-/// Reports whether the audio sound is currently playing.
+/// Reports whether the PortAudio output stream is currently playing.
 pub fn isPlaying(self: *const DSP) bool {
-    return self.sound.isPlaying();
+    return self.playing;
 }
 
-pub fn toggle(self: *DSP) !void {
-    if (self.sound.isPlaying())
-        try self.sound.stop()
+/// Changes the root output device and resumes playback if it was active.
+pub fn setOutputDevice(self: *DSP, node: Node.Index, device_id: pa.DeviceId) AudioError!void {
+    assert(node.idx < self.nodes.len);
+    assert(node.idx == self.output.idx);
+    assert(self.nodes.items(.state)[node.idx] == .output);
+    assert(pa.deviceById(self.devices, device_id) != null);
+
+    const output_parameters = &self.nodes.items(.state)[node.idx].output.parameters;
+    const previous_device = output_parameters.device;
+    if (previous_device == device_id and
+        (self.audio_stream == null or self.stream_device == device_id))
+        return;
+
+    const was_playing = self.playing;
+    try self.stop();
+    if (self.audio_stream) |pa_stream| {
+        try pa.closeStream(pa_stream);
+        self.audio_stream = null;
+        self.stream_device = pa.no_device;
+    }
+
+    self.lockGraph();
+    output_parameters.device = device_id;
+    self.unlockGraph();
+
+    if (!was_playing) return;
+
+    self.start() catch |switch_error| {
+        self.lockGraph();
+        output_parameters.device = previous_device;
+        self.unlockGraph();
+        self.start() catch {};
+        return switch_error;
+    };
+}
+
+/// Replaces a MIDI node's input stream with the selected cached device.
+pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) pm.Error!void {
+    assert(node.idx < self.nodes.len);
+    assert(self.nodes.items(.state)[node.idx] == .midi);
+    assert(device_id == pm.NoDevice or pm.deviceById(self.midi_devices, device_id) != null);
+
+    self.lockGraph();
+    const current = &self.nodes.items(.state)[node.idx].midi;
+    const already_open = current.parameters.device == device_id and
+        (device_id == pm.NoDevice or current.stream != null);
+    self.unlockGraph();
+    if (already_open) return;
+
+    // Opening a PortMidi stream can block, so do it before taking the graph
+    // lock; the current stream remains usable if the replacement fails.
+    var next_stream: ?*pm.MidiStream = null;
+    if (device_id != pm.NoDevice) {
+        var opened: *pm.MidiStream = undefined;
+        try pm.openInput(&opened, device_id, block_size, null, null);
+        next_stream = opened;
+    }
+
+    self.lockGraph();
+    const state = &self.nodes.items(.state)[node.idx].midi;
+    const previous_stream = state.stream;
+    state.stream = next_stream;
+    state.parameters.device = device_id;
+    self.unlockGraph();
+
+    // The callback can only have held the old pointer before the locked swap.
+    if (previous_stream) |old_stream|
+        old_stream.close() catch {};
+}
+
+/// Opens or replaces the stream when the output node's device has changed.
+fn ensureOutputStream(self: *DSP) AudioError!void {
+    assert(self.output.idx < self.nodes.len);
+    assert(self.nodes.items(.state)[self.output.idx] == .output);
+    const device_id = self.nodes.items(.state)[self.output.idx].output.parameters.device;
+    if (self.audio_stream) |pa_stream| {
+        if (self.stream_device == device_id) return;
+        try pa.closeStream(pa_stream);
+        self.audio_stream = null;
+        self.stream_device = pa.no_device;
+    }
+
+    const device = pa.deviceById(self.devices, device_id) orelse return error.InvalidDevice;
+    self.audio_stream = try pa.openOutputStream(
+        device,
+        sample_rate,
+        onAudioCallback,
+        self,
+    );
+    self.stream_device = device_id;
+}
+
+/// Feeds PortAudio requests into the graph in bounded, fixed-size chunks.
+fn onAudioCallback(
+    _: ?*const anyopaque,
+    output: ?*anyopaque,
+    frame_count: c_ulong,
+    _: ?*const pa.StreamCallbackTimeInfo,
+    _: c_ulong,
+    user_data: ?*anyopaque,
+) callconv(.c) c_int {
+    const destination = output orelse return 2;
+    const self: *DSP = @ptrCast(@alignCast(user_data.?));
+    const samples: [*]f32 = @ptrCast(@alignCast(destination));
+    var remaining_frames: usize = @intCast(frame_count);
+    var offset_samples: usize = 0;
+
+    while (remaining_frames > 0) {
+        const chunk_frames: u32 = if (remaining_frames > block_size)
+            block_size
+        else
+            @intCast(remaining_frames);
+        assert(chunk_frames <= block_size);
+        const chunk_samples: usize = @as(usize, chunk_frames) * 2;
+        self.stream(samples[offset_samples .. offset_samples + chunk_samples]);
+        remaining_frames -= chunk_frames;
+        offset_samples += chunk_samples;
+    }
+
+    return 0;
+}
+
+pub fn toggle(self: *DSP) AudioError!void {
+    if (self.playing)
+        try self.stop()
     else
-        try self.sound.start();
+        try self.start();
 }
 
 pub fn plug(
@@ -864,8 +995,11 @@ pub fn sampleTap(self: *DSP, node: Node.Index) *SampleTap {
 }
 
 /// Renders one interleaved stereo block into the audio callback buffer.
-fn stream(self: *DSP, into: []f32) !void {
-    self.lockGraph();
+fn stream(self: *DSP, into: []f32) void {
+    if (!self.graph_mutex.tryLock()) {
+        @memset(into, 0);
+        return;
+    }
     defer self.unlockGraph();
 
     // The callback may request a short block, but never more than one block.
@@ -875,9 +1009,12 @@ fn stream(self: *DSP, into: []f32) !void {
     // A new generation invalidates all node caches from the previous block.
     self.render_generation += 1;
     // Render only the configured output; dependencies are evaluated lazily.
-    try self.renderNode(self.output, @intCast(into.len));
+    self.renderNode(self.output, @intCast(into.len)) catch {
+        @memset(into, 0);
+        return;
+    };
 
-    // Copy the completed graph output to the audio library's destination.
+    // Copy the completed graph output to PortAudio's destination buffer.
     const output_buffer = &self.nodes.items(.cache)[self.output.idx].outputs[0];
     @memcpy(into, output_buffer.samples[0..into.len]);
 }
@@ -1016,175 +1153,6 @@ fn getOutput(
         @intCast(connection.output_port)
     ];
 }
-
-/// Releases the data-source wrapper without freeing the application-owned base.
-// Needed because zaudio.DataSource.destroy() assumes zaudio-owned allocation but base is owned on our side
-extern fn ma_data_source_uninit(source: *a.DataSource) void;
-
-/// Bridges the pull-based audio callback to the pull-based DSP graph renderer.
-const GraphDataSource = struct {
-    /// Embedded base required by the audio-library data-source ABI.
-    base: a.DataSourceBase,
-    /// Opaque data-source handle passed to the audio library.
-    data_source: *a.DataSource,
-    /// Number of channels exposed to the audio library.
-    channels: u32,
-    /// Number of frames successfully delivered so far.
-    cursor: u64 = 0,
-
-    /// Callback table installed on the audio-library data source.
-    const vtable = a.DataSource.VTable{
-        .onRead = onRead,
-        .onSeek = onSeek,
-        .onGetDataFormat = onGetDataFormat,
-        .onGetCursor = onGetCursor,
-        .onGetLength = onGetLength,
-        .onSetLooping = onSetLooping,
-        .flags = .{},
-    };
-
-    /// Creates the audio-library data source around this wrapper.
-    pub fn init(
-        self: *GraphDataSource,
-        channels: u32,
-    ) !void {
-        // Reset callback-visible state before handing the wrapper to the library.
-        self.* = .{
-            .base = undefined,
-            .data_source = undefined,
-            .channels = channels,
-        };
-
-        // Register the static callback table and allocate the opaque handle.
-        var config = a.DataSource.Config.init();
-        config.vtable = &vtable;
-
-        self.data_source = try a.DataSource.create(config, &self.base);
-    }
-
-    /// Uninitializes the audio-library data source.
-    pub fn deinit(self: *GraphDataSource) void {
-        ma_data_source_uninit(self.data_source);
-    }
-
-    /// Recovers the containing wrapper from an audio-library callback handle.
-    fn fromDataSource(data_source: *a.DataSource) *GraphDataSource {
-        return @fieldParentPtr(
-            "base",
-            @as(
-                *a.DataSourceBase,
-                @ptrCast(@alignCast(data_source)),
-            ),
-        );
-    }
-
-    /// Fills the callback buffer by rendering one or more bounded graph blocks.
-    fn onRead(
-        ds: *a.DataSource,
-        frames_out: ?*anyopaque,
-        frame_count: u64,
-        frames_read: *u64,
-    ) callconv(.c) a.Result {
-        const self = fromDataSource(ds);
-        const dsp: *DSP = @fieldParentPtr("graph_data_source", self);
-
-        // A null destination is a size/query request unsupported by this live source.
-        if (frames_out == null)
-            return .not_implemented;
-
-        const output: [*]f32 = @ptrCast(@alignCast(frames_out.?));
-
-        // This source is stereo and must fill exactly the requested frame count.
-        if (self.channels != 2)
-            return .invalid_args;
-
-        // Split large audio-library requests into graph-sized chunks.
-        var remaining_frames: usize = @intCast(frame_count);
-        var offset_samples: usize = 0;
-        while (remaining_frames > 0) {
-            // Convert the selected frame count to interleaved sample count.
-            const chunk_frames: usize = if (remaining_frames < block_size)
-                remaining_frames
-            else
-                block_size;
-            const chunk_samples = chunk_frames * 2;
-
-            // Render directly into the corresponding callback-buffer slice.
-            dsp.stream(
-                output[offset_samples .. offset_samples + chunk_samples],
-            ) catch |err| {
-                std.debug.print("dsp.stream error {s}\n", .{@errorName(err)});
-
-                return .generic_error;
-            };
-
-            // Advance both counters after a successful chunk.
-            remaining_frames -= chunk_frames;
-            offset_samples += chunk_samples;
-        }
-
-        // Report the complete request only after every chunk succeeded.
-        self.cursor += frame_count;
-        frames_read.* = frame_count;
-
-        return .success;
-    }
-
-    /// Rejects seeking because this data source represents a live graph.
-    fn onSeek(
-        _: *a.DataSource,
-        _: u64,
-    ) callconv(.c) a.Result {
-        return .not_implemented;
-    }
-
-    /// Reports the fixed float32 stereo format and sample rate.
-    fn onGetDataFormat(
-        ds: *a.DataSource,
-        format: ?*a.Format,
-        channels: ?*u32,
-        data_sample_rate: ?*u32,
-        _: ?[*]a.Channel,
-        _: usize,
-    ) callconv(.c) a.Result {
-        const self = fromDataSource(ds);
-
-        // Each optional output is independently supported by the callback ABI.
-        if (format) |value| value.* = .float32;
-        if (channels) |value| value.* = self.channels;
-        if (data_sample_rate) |value| value.* = sample_rate;
-
-        return .success;
-    }
-
-    /// Reports the number of frames already produced.
-    fn onGetCursor(
-        ds: *a.DataSource,
-        cursor: ?*u64,
-    ) callconv(.c) a.Result {
-        const self = fromDataSource(ds);
-
-        if (cursor) |value| value.* = self.cursor;
-        return .success;
-    }
-
-    /// Reports no finite length because the graph is a live source.
-    fn onGetLength(
-        _: *a.DataSource,
-        _: ?*u64,
-    ) callconv(.c) a.Result {
-        // Infinite/live source.
-        return .not_implemented;
-    }
-
-    /// Accepts the looping setting because the live source has no finite loop.
-    fn onSetLooping(
-        _: *a.DataSource,
-        _: a.Bool32,
-    ) callconv(.c) a.Result {
-        return .success;
-    }
-};
 
 /// Fixed-size interleaved audio storage used for node outputs.
 const Buffer = struct {
@@ -1486,8 +1454,17 @@ pub const Node = struct {
         ) ProcessError!void {}
     };
 
-    /// Root node of the graph; forwards its input into the audio engine.
+    /// Root node of the graph; forwards its input into PortAudio's stream.
     pub const Output = struct {
+        /// User-selectable PortAudio output device.
+        parameters: Parameters,
+
+        /// Settings persisted and edited for a graph output node.
+        pub const Parameters = struct {
+            /// Runtime PortAudio index selected for this output node.
+            device: pa.DeviceId,
+        };
+
         /// Port metadata for the graph output node.
         pub const metadata = Node.Metadata{
             .name = "Output",
@@ -1495,6 +1472,7 @@ pub const Node = struct {
             .color = .persimmon,
             .can_link_parameters = false,
             .duplicatable = false,
+            .output_count = 0,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .persimmon },
                 .{},
@@ -1505,23 +1483,13 @@ pub const Node = struct {
                 .{},
                 .{},
             },
-            .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .persimmon },
-                .{},
-                .{},
-                .{},
-                .{},
-                .{},
-                .{},
-                .{},
-            },
         };
 
-        /// Creates a graph output node with one input and one output.
-        pub fn create(name: []const u8) Node {
+        /// Creates a graph output node bound to the supplied runtime device.
+        pub fn create(name: []const u8, device: pa.DeviceId) Node {
             return .{
                 .state = .{
-                    .output = .{},
+                    .output = .{ .parameters = .{ .device = device } },
                 },
                 .name = name,
                 .process = process,
@@ -3235,11 +3203,13 @@ pub const Node = struct {
         };
 
         pub const Parameters = struct {
-            source: pm.DeviceId,
+            /// Runtime PortMidi index selected for this MIDI input node.
+            device: pm.DeviceId,
         };
 
         parameters: Parameters,
-        stream: *pm.MidiStream = undefined,
+        /// Opened input stream, absent when the saved device is unavailable.
+        stream: ?*pm.MidiStream = null,
         held_freq: f32 = 0,
         held_gate: f32 = 0,
         held_velocity: f32 = 0,
@@ -3258,18 +3228,37 @@ pub const Node = struct {
 
         fn initialize(dsp: *DSP, node: Index) InitializeError!void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
-            try pm.openInput(
-                &state.stream,
-                state.parameters.source,
+            if (state.parameters.device < 0) return;
+
+            // Device indices can become stale between saving and loading a graph.
+            if (pm.deviceById(dsp.midi_devices, state.parameters.device) == null) {
+                state.parameters.device = pm.NoDevice;
+                return;
+            }
+
+            var midi_stream: *pm.MidiStream = undefined;
+            pm.openInput(
+                &midi_stream,
+                state.parameters.device,
                 block_size,
                 null,
                 null,
-            );
+            ) catch |err| {
+                if (err == error.InvalidDeviceId) {
+                    state.parameters.device = pm.NoDevice;
+                    return;
+                }
+                return err;
+            };
+            state.stream = midi_stream;
         }
 
         fn deinitialize(dsp: *DSP, node: Index) void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
-            state.stream.close() catch {};
+            if (state.stream) |midi_stream| {
+                midi_stream.close() catch {};
+                state.stream = null;
+            }
         }
 
         fn noteFrequency(note: u7) f32 {
@@ -3287,11 +3276,12 @@ pub const Node = struct {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
 
             // If device == -1, do nothing
-            if (state.parameters.source < 0) return;
+            if (state.parameters.device < 0) return;
+            const midi_stream = state.stream orelse return;
 
-            if (try state.stream.poll()) {
+            if (try midi_stream.poll()) {
                 var read = [1]pm.Event{undefined};
-                const read_count = state.stream.read(read[0..]);
+                const read_count = midi_stream.read(read[0..]);
                 if (read_count > 0) {
                     const msg = midi.Message.init(read[0].message);
 

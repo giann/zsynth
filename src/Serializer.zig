@@ -1,6 +1,8 @@
 //! Protobuf persistence for the DSP graph and SynthEditor layout.
 const std = @import("std");
 const DSP = @import("DSP.zig");
+const pa = @import("portaudio.zig");
+const pm = @import("portmidi.zig");
 const Space = @import("Space.zig");
 const P = @import("zsynth.pb.zig");
 
@@ -187,7 +189,12 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             });
         }
 
-        node.parameters = try parametersToProto(state, arena_gpa);
+        node.parameters = try parametersToProto(
+            state,
+            arena_gpa,
+            self.dsp.devices,
+            self.dsp.midi_devices,
+        );
         try document.nodes.append(arena_gpa, node);
     }
 
@@ -362,13 +369,32 @@ fn ownNotes(self: *Serializer, notes: []DSP.Note) ![]const DSP.Note {
 fn parametersToProto(
     state: DSP.Node.State,
     gpa: std.mem.Allocator,
+    devices: []const pa.Device,
+    midi_devices: []const pm.Device,
 ) !?P.Node.parameters_union {
     return switch (state) {
-        .noop, .add, .multiply, .output, .group, .group_input, .group_output => null,
-        .midi => |value| .{
-            .midi = .{
-                .source = @intCast(value.parameters.source),
-            },
+        .noop, .add, .multiply, .group, .group_input, .group_output => null,
+        .output => |value| blk: {
+            const device = pa.deviceById(devices, value.parameters.device) orelse
+                return error.InvalidOutputDevice;
+            break :blk .{ .output = .{
+                .host_api_name = device.host_api_name,
+                .device_name = device.name,
+            } };
+        },
+        .midi => |value| blk: {
+            const device = pm.deviceById(midi_devices, value.parameters.device);
+            break :blk .{
+                .midi = .{
+                    // Preserve PortMidi's -1 no-device sentinel in the uint32 field.
+                    .source = if (value.parameters.device < 0)
+                        std.math.maxInt(u32)
+                    else
+                        @intCast(value.parameters.device),
+                    .interface_name = if (device) |current| current.interface_name else null,
+                    .device_name = if (device) |current| current.name else null,
+                },
+            };
         },
         .keyboard => |value| .{ .keyboard = .{
             .octave = value.parameters.octave,
@@ -438,7 +464,18 @@ fn nodeFromProto(
 ) !DSP.Node {
     if (std.mem.eql(u8, serialized.kind, "add")) return DSP.Node.Add.create(name);
     if (std.mem.eql(u8, serialized.kind, "multiply")) return DSP.Node.Multiply.create(name);
-    if (std.mem.eql(u8, serialized.kind, "output")) return DSP.Node.Output.create(name);
+    if (std.mem.eql(u8, serialized.kind, "output")) {
+        const default_device = pa.defaultDevice(self.dsp.devices) orelse self.dsp.devices[0].id;
+        const device_id = if (serialized.parameters) |parameters| switch (parameters) {
+            .output => |value| pa.findDevice(
+                self.dsp.devices,
+                value.host_api_name orelse "",
+                value.device_name orelse "",
+            ) orelse default_device,
+            else => default_device,
+        } else default_device;
+        return DSP.Node.Output.create(name, device_id);
+    }
     if (std.mem.eql(u8, serialized.kind, "noop")) return DSP.Node.Noop.create(name);
     if (std.mem.eql(u8, serialized.kind, "group")) {
         var members: [DSP.max_group_members]DSP.Node.Index = undefined;
@@ -557,9 +594,25 @@ fn nodeFromProto(
     }
     if (std.mem.eql(u8, serialized.kind, "midi")) {
         const value = try requiredParameters(serialized, .midi);
+        const default_device = pm.defaultInputDevice(self.dsp.midi_devices) orelse pm.NoDevice;
+        const source = if (value.interface_name != null or value.device_name != null)
+            pm.findDevice(
+                self.dsp.midi_devices,
+                value.interface_name orelse "",
+                value.device_name orelse "",
+            ) orelse default_device
+        else if (value.source == std.math.maxInt(u32))
+            pm.NoDevice
+        else if (value.source <= @as(u32, std.math.maxInt(pm.DeviceId))) blk: {
+            const legacy_device: pm.DeviceId = @intCast(value.source);
+            break :blk if (pm.deviceById(self.dsp.midi_devices, legacy_device) != null)
+                legacy_device
+            else
+                default_device;
+        } else default_device;
         return DSP.Node.MIDI.create(
             name,
-            .{ .source = @intCast(value.source) },
+            .{ .device = source },
         );
     }
     return error.UnknownNodeKind;
@@ -784,6 +837,10 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
             if (octave < std.math.minInt(i8) or octave > std.math.maxInt(i8))
                 return error.InvalidNodeParameters;
         },
-        .add, .multiply, .noop, .output, .group, .group_input, .group_output => {},
+        .output => if (node.parameters) |parameters| switch (parameters) {
+            .output => {},
+            else => return error.InvalidNodeParameters,
+        },
+        .add, .multiply, .noop, .group, .group_input, .group_output => {},
     }
 }

@@ -34,6 +34,7 @@ message Node {
     NoiseParameters noise = 17;
     KeyboardParameters keyboard = 18;
     MIDIParameterse midi = 19;
+    OutputParameters output = 22;
   }
 }
 
@@ -54,7 +55,11 @@ message ConstantParameters {
 }
 
 message MIDIParameterse {
+  // Legacy runtime index retained so older synth files still load.
   uint32 source = 1;
+  // Stable identity used by current synth files across device enumeration changes.
+  optional string interface_name = 2;
+  optional string device_name = 3;
 }
 
 message OscillatorParameters {
@@ -113,4 +118,10 @@ message NoiseParameters {
 
 message KeyboardParameters {
   optional sint32 octave = 1;
+}
+
+// Stable device identity avoids persisting PortAudio's process-local index.
+message OutputParameters {
+  optional string host_api_name = 1;
+  optional string device_name = 2;
 }

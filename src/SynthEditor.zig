@@ -12,6 +12,7 @@ const Serializer = @import("Serializer.zig");
 const Display = @import("Display.zig");
 const VisualNode = Space.VisualNode;
 const pm = @import("portmidi.zig");
+const pa = @import("portaudio.zig");
 
 const Self = @This();
 
@@ -199,8 +200,9 @@ fn enter(
     // Resolve this state index to the concrete editor context.
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     try sdl.startTextInput(self.zsynth.renderer.window);
-    // Initialize the DSP against the runtime-owned audio engine.
-    self.dsp.init(self.zsynth.audio_engine, gpa) catch return error.AudioError;
+    // Initialize the DSP with the application's cached audio and MIDI devices.
+    self.dsp.init(self.zsynth.audio_devices, self.zsynth.midi_devices, gpa) catch
+        return error.AudioError;
     self.serializer = .{
         .dsp = &self.dsp,
         .space = &self.space,
@@ -242,10 +244,12 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
     const output = try addNode(
         self,
         gpa,
-        DSP.Node.Output.create("output"),
+        DSP.Node.Output.create("output", self.zsynth.default_audio_device),
         self.editorSpace().viewportCenter(),
     );
     self.dsp.output = output;
+    self.dsp.setOutputDevice(output, self.zsynth.default_audio_device) catch
+        return error.AudioError;
     self.output_meter.configure(&self.dsp, self.dsp.output);
     if (!try self.editorSpace().rebuildOccupancy(gpa))
         return error.InvalidVisualNodeLayout;
@@ -530,7 +534,9 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
         return;
 
     const parameter_node = self.dsp.nodes.items(.parameter_link)[selected.idx].source orelse selected;
-    const parameters_editable = self.dsp.nodes.items(.parameter_link)[selected.idx].source == null;
+    const selected_tag = std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]);
+    const parameters_editable = self.dsp.nodes.items(.parameter_link)[selected.idx].source == null and
+        (selected_tag != .output or selected.idx == self.dsp.output.idx);
     const state = self.dsp.nodes.items(.state)[parameter_node.idx];
     switch (state) {
         inline else => |node_state| {
@@ -637,7 +643,7 @@ fn writeReflectedParameters(
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
     const item_count = comptime reflectedParameterItemCount(@TypeOf(parameters));
     var items: [item_count]Display.LabelValue = undefined;
-    var value_buffers: [item_count][64]u8 = undefined;
+    var value_buffers: [item_count][256]u8 = undefined;
     var value_widths: [item_count]u32 = undefined;
     var editable: [item_count]bool = undefined;
     var cell_names: [item_count][]const u8 = undefined;
@@ -692,11 +698,18 @@ fn writeReflectedParameters(
                 }
             },
             else => {
-                const formatted_value = formatParameterValue(
-                    &value_buffers[reflected_item_index],
-                    value,
-                );
-                const value_color: Display.Color = switch (@typeInfo(@TypeOf(value))) {
+                const is_audio_device = comptime @TypeOf(parameters) == DSP.Node.Output.Parameters and
+                    std.mem.eql(u8, field_name, "device");
+                const is_midi_device = comptime @TypeOf(parameters) == DSP.Node.MIDI.Parameters and
+                    std.mem.eql(u8, field_name, "device");
+                const is_device = is_audio_device or is_midi_device;
+                const formatted_value = if (is_audio_device)
+                    self.outputDeviceLabel(value)
+                else if (is_midi_device)
+                    self.midiDeviceLabel(value)
+                else
+                    formatParameterValue(&value_buffers[reflected_item_index], value);
+                const value_color: Display.Color = if (is_device) .science_blue else switch (@typeInfo(@TypeOf(value))) {
                     .int, .float => .golden_rod,
                     .@"enum" => .science_blue,
                     else => .white,
@@ -706,12 +719,14 @@ fn writeReflectedParameters(
                     .value = formatted_value,
                     .value_color = value_color,
                 };
-                value_widths[reflected_item_index] = parameterValueWidth(
-                    @TypeOf(value),
-                    formatted_value.len,
-                );
+                value_widths[reflected_item_index] = if (is_audio_device)
+                    self.outputDeviceLabelWidth()
+                else if (is_midi_device)
+                    self.midiDeviceLabelWidth()
+                else
+                    parameterValueWidth(@TypeOf(value), formatted_value.len);
                 editable[reflected_item_index] = parameters_editable and
-                    isEditableParameterType(@TypeOf(value));
+                    (is_device or isEditableParameterType(@TypeOf(value)));
                 cell_names[reflected_item_index] = field_name;
                 cell_array_indices[reflected_item_index] = null;
                 reflected_item_index += 1;
@@ -1273,7 +1288,7 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .noise => |value| DSP.Node.Noise.create(source_name, value.parameters),
         .noop => unreachable,
         .oscillator => |value| DSP.Node.Oscillator.create(source_name, value.parameters),
-        .output => DSP.Node.Output.create(source_name),
+        .output => |value| DSP.Node.Output.create(source_name, value.parameters.device),
         .group, .group_input, .group_output => unreachable,
     };
 }
@@ -1594,16 +1609,28 @@ fn cancelParameterEdit(self: *Self) void {
 fn commitParameterEdit(self: *Self) void {
     if (self.parameter_editor.active == null) return;
 
-    var context = ParameterEditor.CommitContext{ .editor = self };
-    self.dsp.withGraphLock(&context, commitParameterLocked);
+    const active = self.parameter_editor.active.?;
+    if (std.mem.eql(u8, active.field_name, "device")) {
+        const label = self.parameter_editor.text_field.inputSlice();
+        switch (self.dsp.nodes.items(.state)[active.node.idx]) {
+            .output => if (self.deviceIdForLabel(label)) |device_id|
+                self.dsp.setOutputDevice(active.node, device_id) catch {},
+            .midi => if (self.midiDeviceIdForLabel(label)) |device_id|
+                self.dsp.setMidiDevice(active.node, device_id) catch {},
+            else => {},
+        }
+    } else {
+        var context = ParameterEditor.CommitContext{ .editor = self };
+        self.dsp.withGraphLock(&context, commitParameterLocked);
+    }
     var buffer: [64]u8 = undefined;
-    const active = self.parameter_editor.active orelse return;
+    const committed = self.parameter_editor.active orelse return;
     const node = self.editorSpace().singleSelectedNode() orelse return;
     self.parameter_editor.text_field.setInput(
         self.formatNodeParameter(
             node.idx,
-            active.field_name,
-            active.array_index,
+            committed.field_name,
+            committed.array_index,
             &buffer,
         ),
     );
@@ -1655,6 +1682,12 @@ fn formatNodeParameter(
     if (std.mem.eql(u8, field_name, node_name_field_name))
         return self.dsp.nodes.items(.name)[node];
     const state = self.dsp.nodes.items(.state)[node];
+    if (std.mem.eql(u8, field_name, "device")) {
+        if (state == .output)
+            return self.outputDeviceLabel(state.output.parameters.device);
+        if (state == .midi)
+            return self.midiDeviceLabel(state.midi.parameters.device);
+    }
     return switch (state) {
         inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
             formatReflectedParameter(node_state.parameters, field_name, array_index, buffer)
@@ -1697,6 +1730,11 @@ fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
     assert(active.node.idx < self.dsp.nodes.len);
 
     const state = self.dsp.nodes.items(.state)[active.node.idx];
+    if (std.mem.eql(u8, active.field_name, "device")) return switch (state) {
+        .output => self.outputDeviceCompletion(field.inputSlice()),
+        .midi => self.midiDeviceCompletion(field.inputSlice()),
+        else => "",
+    };
     return switch (state) {
         inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
             reflectedEnumCompletion(
@@ -1708,6 +1746,70 @@ fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
         else
             "",
     };
+}
+
+/// Returns the cached display label for a PortAudio device index.
+fn outputDeviceLabel(self: *const Self, device_id: pa.DeviceId) []const u8 {
+    const device = pa.deviceById(self.zsynth.audio_devices, device_id) orelse return "unavailable";
+    return device.label;
+}
+
+/// Returns the longest cached output-device label for the selected-pane field.
+fn outputDeviceLabelWidth(self: *const Self) u32 {
+    var width: usize = "unavailable".len;
+    for (self.zsynth.audio_devices) |device|
+        width = @max(width, device.label.len);
+    return @intCast(width);
+}
+
+/// Finds the first output-device label matching the current input prefix.
+fn outputDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
+    for (self.zsynth.audio_devices) |device| {
+        if (parameterStartsWithIgnoreCase(device.label, input))
+            return device.label;
+    }
+    return "";
+}
+
+/// Resolves an exact completed output-device label to its runtime ID.
+fn deviceIdForLabel(self: *const Self, label: []const u8) ?pa.DeviceId {
+    for (self.zsynth.audio_devices) |device| {
+        if (std.ascii.eqlIgnoreCase(device.label, label))
+            return device.id;
+    }
+    return null;
+}
+
+/// Returns the cached display label for a PortMidi input device index.
+fn midiDeviceLabel(self: *const Self, device_id: pm.DeviceId) []const u8 {
+    const device = pm.deviceById(self.zsynth.midi_devices, device_id) orelse return "unavailable";
+    return device.label;
+}
+
+/// Returns the longest cached MIDI-device label for the selected-pane field.
+fn midiDeviceLabelWidth(self: *const Self) u32 {
+    var width: usize = "unavailable".len;
+    for (self.zsynth.midi_devices) |device|
+        width = @max(width, device.label.len);
+    return @intCast(width);
+}
+
+/// Finds a MIDI-device label matching the current input prefix.
+fn midiDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
+    for (self.zsynth.midi_devices) |device| {
+        if (parameterStartsWithIgnoreCase(device.label, input))
+            return device.label;
+    }
+    return "";
+}
+
+/// Resolves an exact completed MIDI-device label to its runtime ID.
+fn midiDeviceIdForLabel(self: *const Self, label: []const u8) ?pm.DeviceId {
+    for (self.zsynth.midi_devices) |device| {
+        if (std.ascii.eqlIgnoreCase(device.label, label))
+            return device.id;
+    }
+    return null;
 }
 
 /// Finds a matching enum tag for a reflected scalar or fixed-array element prefix.
@@ -2526,10 +2628,12 @@ fn simpleDSP(self: *Self, allocator: std.mem.Allocator) !void {
     const output = try addNode(
         self,
         allocator,
-        DSP.Node.Output.create("output"),
+        DSP.Node.Output.create("output", self.zsynth.default_audio_device),
         .{ .x = 96, .y = 5 },
     );
     dsp.output = output;
+    dsp.setOutputDevice(output, self.zsynth.default_audio_device) catch
+        return error.AudioError;
 
     // Connect modulation, sequencing, voices, effects, and output.
     // Plug everything together
@@ -2792,7 +2896,7 @@ pub const CommandPalette = struct {
             gpa.free(owned_name);
             return err;
         };
-        const node = createNode(tag, owned_name);
+        const node = createNode(tag, owned_name, self.editor.zsynth.midi_devices);
         const index = self.editor.dsp.addNode(gpa, node) catch |err| {
             _ = self.editor.owned_node_names.pop();
             gpa.free(owned_name);
@@ -2923,7 +3027,11 @@ pub const CommandPalette = struct {
     }
 
     /// Constructs a processing node with safe default parameters.
-    fn createNode(tag: DSP.Node.Tag, name: []const u8) DSP.Node {
+    fn createNode(
+        tag: DSP.Node.Tag,
+        name: []const u8,
+        midi_devices: []const pm.Device,
+    ) DSP.Node {
         return switch (tag) {
             .add => DSP.Node.Add.create(name),
             .multiply => DSP.Node.Multiply.create(name),
@@ -2951,10 +3059,7 @@ pub const CommandPalette = struct {
             .midi => DSP.Node.MIDI.create(
                 name,
                 .{
-                    .source = if (pm.countDevices() > 0)
-                        0
-                    else
-                        -1,
+                    .device = pm.defaultInputDevice(midi_devices) orelse pm.NoDevice,
                 },
             ),
             .noop, .output, .group, .group_input, .group_output => unreachable,
