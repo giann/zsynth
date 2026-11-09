@@ -198,9 +198,9 @@ pub fn save(self: *Serializer, path: []const u8) !void {
         try document.nodes.append(arena_gpa, node);
     }
 
-    // Do not persist a graph whose swap-remove references have already
-    // diverged.  Loading validates before mutating the live graph, so saving
-    // must apply the same invariant before creating or truncating the file.
+    // Do not persist a graph whose references have diverged. Loading validates
+    // before mutating the live graph, so saving applies the same checks before
+    // creating or truncating the file.
     try validateDocument(document);
 
     var file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
@@ -251,15 +251,23 @@ pub fn load(self: *Serializer, path: []const u8) !void {
             .x = serialized.x,
             .y = serialized.y,
         });
-        switch (node.state) {
-            .group_input => |endpoint| {
-                std.debug.assert(endpoint.port < DSP.max_outlets);
-                self.dsp.nodes.items(.state)[endpoint.group.idx].group.input_nodes[endpoint.port] = actual;
-            },
-            .group_output => |endpoint| {
-                self.dsp.nodes.items(.state)[endpoint.group.idx].group.output_nodes[endpoint.port] = actual;
-            },
-            else => {},
+    }
+
+    // Endpoint nodes may precede their owner after swap removal. Register them
+    // after every node has been created so forward owner references are safe.
+    for (document.nodes.items, 0..) |serialized, index| {
+        const tag = std.meta.stringToEnum(DSP.Node.Tag, serialized.kind) orelse unreachable;
+        if (tag != .group_input and tag != .group_output) continue;
+
+        const owner: usize = @intCast(serialized.group_owner orelse unreachable);
+        const port: usize = @intCast(serialized.group_port orelse unreachable);
+        std.debug.assert(owner < self.dsp.nodes.len);
+        std.debug.assert(port < DSP.max_outlets);
+        const actual = DSP.Node.Index{ .idx = index };
+        switch (tag) {
+            .group_input => self.dsp.nodes.items(.state)[owner].group.input_nodes[port] = actual,
+            .group_output => self.dsp.nodes.items(.state)[owner].group.output_nodes[port] = actual,
+            else => unreachable,
         }
     }
 
@@ -690,7 +698,7 @@ fn validateDocument(document: P.SynthDocument) !void {
                 .midi,
                 => try validateNodeParameters(node, tag),
                 .group => try validateGroup(node, index, document.nodes.items),
-                .group_input, .group_output => try validateGroupEndpoint(node, index, document.nodes.items),
+                .group_input, .group_output => try validateGroupEndpoint(node, document.nodes.items),
             }
         }
         for (node.inputs.items, 0..) |connection, connection_index| {
@@ -772,10 +780,10 @@ fn validateGroup(node: P.Node, group_index: usize, nodes: []const P.Node) !void 
 }
 
 /// Validates the owner and port carried by an explicit group endpoint node.
-fn validateGroupEndpoint(node: P.Node, endpoint_index: usize, nodes: []const P.Node) !void {
+fn validateGroupEndpoint(node: P.Node, nodes: []const P.Node) !void {
     const owner = node.group_owner orelse return error.InvalidGraphReference;
     const port = node.group_port orelse return error.InvalidGraphReference;
-    if (owner == 0 or owner >= nodes.len or owner >= endpoint_index or port >= DSP.max_outlets)
+    if (owner == 0 or owner >= nodes.len or port >= DSP.max_outlets)
         return error.InvalidGraphReference;
     if (!std.mem.eql(u8, nodes[owner].kind, "group"))
         return error.InvalidGraphReference;

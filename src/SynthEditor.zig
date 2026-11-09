@@ -25,6 +25,8 @@ const SelectedObserver = union(enum) {
     meter: Self.OutputMeter,
     /// Line graph for an output marked as a line plot observer.
     line_plot: Self.OutputGraph,
+    /// Waveform graph for an output marked as a waveform observer.
+    waveform: Self.OutputWaveform,
 };
 
 /// Converts a logical pixel extent to the number of display cells it occupies.
@@ -129,6 +131,8 @@ owned_node_names: std.ArrayList([]u8) = .empty,
 output_meter: OutputMeter = .{
     .parameters = .{ .meter_cell_count = output_meter_cell_count },
 },
+/// Persistent waveform displayed beside the fixed playback meter.
+output_waveform: OutputWaveform = .{},
 /// One observer slot per output on the currently selected DSP node.
 selected_observers: [DSP.max_outlets]SelectedObserver = @splat(.none),
 /// Number of selected output ports with an active observer.
@@ -266,6 +270,7 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
     self.output_meter = .{
         .parameters = .{ .meter_cell_count = output_meter_cell_count },
     };
+    self.output_waveform = .{};
     self.clearSelectedObservers();
 
     self.dsp.reset(gpa);
@@ -291,6 +296,12 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
     self.dsp.setOutputDevice(output, self.zsynth.default_audio_device) catch
         return error.AudioError;
     self.output_meter.configure(&self.dsp, self.dsp.output, 0);
+    self.output_waveform.configure(
+        self.dsp.output,
+        0,
+        outputMetadata(&self.dsp, self.dsp.output, 0),
+        null,
+    );
     if (!try self.editorSpace().rebuildOccupancy(gpa))
         return error.InvalidVisualNodeLayout;
     try self.editorSpace().computePaths(gpa);
@@ -348,6 +359,7 @@ fn update(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     if (self.output_meter.output_count != 0)
         self.output_meter.update(&self.dsp, dt);
+    self.output_waveform.update(&self.dsp);
 
     const selected_node = self.editorSpace().singleSelectedNode() orelse return;
     for (&self.selected_observers) |*observer| switch (observer.*) {
@@ -359,6 +371,10 @@ fn update(
         .line_plot => |*graph| {
             assert(graph.parameters.node.idx == selected_node.idx);
             graph.update(&self.dsp);
+        },
+        .waveform => |*waveform| {
+            assert(waveform.parameters.node.idx == selected_node.idx);
+            waveform.update(&self.dsp);
         },
     };
 }
@@ -409,6 +425,22 @@ fn refreshSelectionUi(self: *Self) void {
                     self.selected_observer_height,
                     pixelsToCells(
                         graph.parameters.height,
+                        graphic.cell_height * graphic.scale,
+                    ),
+                );
+            },
+            .waveform => {
+                var waveform: OutputWaveform = .{};
+                waveform.configure(selected_node, port, outlet, graphic);
+                self.selected_observers[output_port] = .{ .waveform = waveform };
+                self.selected_observer_width += pixelsToCells(
+                    waveform.parameters.width,
+                    graphic.cell_width * graphic.scale,
+                );
+                self.selected_observer_height = @max(
+                    self.selected_observer_height,
+                    pixelsToCells(
+                        waveform.parameters.height,
                         graphic.cell_height * graphic.scale,
                     ),
                 );
@@ -489,6 +521,13 @@ fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
         self.leaveGroupView(gpa);
     try self.serializer.load(path);
     self.output_meter.configure(&self.dsp, self.dsp.output, 0);
+    self.output_waveform = .{};
+    self.output_waveform.configure(
+        self.dsp.output,
+        0,
+        outputMetadata(&self.dsp, self.dsp.output, 0),
+        null,
+    );
     try self.rememberDocumentPath(gpa, path);
 }
 
@@ -574,16 +613,21 @@ fn writeOutputStatus(self: *Self, gpa: std.mem.Allocator) !void {
         @intCast(output_status_label.len + output_status_playing.len),
     ));
     const hud_width = @max(status_width, self.output_meter.width);
-    const box_width = hud_width + 2;
+    const waveform_width = self.output_meter.width;
+    const meter_panel_width = hud_width + 2;
+    const combined_width = meter_panel_width + waveform_width + 1;
+    const show_waveform = display.width >= combined_width;
+    const box_width = if (show_waveform) combined_width else meter_panel_width;
     const box_height = self.output_meter.height + 3;
     if (display.width < box_width or display.height < box_height)
         return;
 
     const box_x = display.width - box_width;
     const box_y = display.height - box_height;
-    const status_x = box_x + 1;
+    const waveform_panel_width = if (show_waveform) waveform_width + 1 else 0;
+    const status_x = box_x + waveform_panel_width + 1;
     const status_y = box_y + 1;
-    const meter_x = box_x + 1;
+    const meter_x = status_x;
     const meter_y = box_y + 2;
 
     // Paint the panel before drawing its contents so the HUD remains readable
@@ -618,6 +662,23 @@ fn writeOutputStatus(self: *Self, gpa: std.mem.Allocator) !void {
         if (playing) .amber else .logan,
     );
     try self.output_meter.write(gpa, &self.zsynth.ui_display, .{ meter_x, meter_y });
+    if (show_waveform) {
+        const cell_width = display.cell_width * display.scale;
+        const cell_height = display.cell_height * display.scale;
+        const waveform_position = .{
+            @as(f32, @floatFromInt(display.content_origin_x)) +
+                @as(f32, @floatFromInt(box_x + 1)) * @as(f32, @floatFromInt(cell_width)),
+            @as(f32, @floatFromInt(display.content_origin_y)) +
+                @as(f32, @floatFromInt(box_y + 1)) * @as(f32, @floatFromInt(cell_height)),
+        };
+        self.output_waveform.write(
+            0,
+            waveform_position,
+            @as(f32, @floatFromInt(waveform_width * cell_width)),
+            @as(f32, @floatFromInt((box_height - 2) * cell_height)),
+            true,
+        );
+    }
 }
 
 /// Draws the selected node's reflected parameters in the bottom UI pane.
@@ -932,6 +993,27 @@ fn writeReflectedParameters(
                         graphic.cell_width * graphic.scale,
                     );
                 },
+                .waveform => |*waveform| {
+                    const position = .{
+                        @as(f32, @floatFromInt(graphic.content_origin_x)) +
+                            @as(f32, @floatFromInt(observer_x)) *
+                                @as(f32, @floatFromInt(graphic.cell_width * graphic.scale)),
+                        @as(f32, @floatFromInt(graphic.content_origin_y)) +
+                            @as(f32, @floatFromInt(pane_top + parameters_pane_padding)) *
+                                @as(f32, @floatFromInt(graphic.cell_height * graphic.scale)),
+                    };
+                    waveform.write(
+                        output_port,
+                        position,
+                        waveform.parameters.width,
+                        waveform.parameters.height,
+                        false,
+                    );
+                    observer_x += pixelsToCells(
+                        waveform.parameters.width,
+                        graphic.cell_width * graphic.scale,
+                    );
+                },
             }
             observers_drawn += 1;
             if (observers_drawn < observer_count)
@@ -1140,7 +1222,9 @@ fn keyUpDown(
                     .none => {},
                     .meter => |*meter| meter.reset(),
                     .line_plot => |*graph| graph.reset(),
+                    .waveform => |*waveform| waveform.reset(),
                 };
+                self.output_waveform.reset();
                 try self.writeSelectedParametersPane(gpa);
             }
         },
@@ -3451,7 +3535,7 @@ pub const OutputMeter = struct {
 
         const graph_output = node.idx == dsp.output.idx;
         const outlet = outputMetadata(dsp, node, output_port);
-        if (outlet.observer != .meter) return;
+        if (outlet.observer != .meter and !graph_output) return;
 
         self.parameters.node = node;
         self.output_count = 1;
@@ -3956,6 +4040,273 @@ pub const OutputGraph = struct {
                 }
             },
         }
+    }
+};
+
+/// Filled, two-channel waveform observer with a one-second rolling history.
+pub const OutputWaveform = struct {
+    /// User-selected source and optional selected-pane dimensions.
+    parameters: Parameters = .{},
+    /// Independent reader into the source node's published SampleTap queue.
+    reader: ?DSP.SampleTap.Queue.Reader = null,
+    /// Per-time-bucket peak bounds for both stereo channels.
+    buckets: [plot_bucket_capacity]Bucket = @splat(.{}),
+    /// Chronological x coordinates passed to ImPlot.
+    plot_times: [plot_bucket_capacity]f32 = @splat(0),
+    /// Negative peak bounds passed to ImPlot, indexed by channel.
+    plot_minimum: [2][plot_bucket_capacity]f32 = @splat(@splat(0)),
+    /// Positive peak bounds passed to ImPlot, indexed by channel.
+    plot_maximum: [2][plot_bucket_capacity]f32 = @splat(@splat(0)),
+    /// Number of source frames observed since the last reset.
+    frame_cursor: u64 = 0,
+    /// Most recent rolling time bucket, if any audio has arrived.
+    latest_bucket: ?u64 = null,
+
+    /// Fixed number of time buckets used to render the waveform envelope.
+    pub const plot_bucket_capacity = 512;
+    /// Source and logical-pixel appearance for one waveform observer.
+    pub const Parameters = struct {
+        /// Node whose rendered output supplies the samples.
+        node: DSP.Node.Index = undefined,
+        /// Output port whose stereo-interleaved samples are observed.
+        output_port: u8 = 0,
+        /// Window width in logical canvas pixels for selected-pane use.
+        width: f32 = 0,
+        /// Window height in logical canvas pixels for selected-pane use.
+        height: f32 = 0,
+        /// Window and plot background color.
+        bg_color: Display.Color = .ebony,
+        /// Waveform fill color, normally copied from outlet metadata.
+        fg_color: Display.Color = .white,
+    };
+
+    /// Peak bounds retained for one time bucket in the rolling history.
+    const Bucket = struct {
+        /// Sequence number that currently owns this ring slot.
+        serial: ?u64 = null,
+        /// Most negative sample observed per channel in this bucket.
+        minimum: [2]f32 = @splat(0),
+        /// Most positive sample observed per channel in this bucket.
+        maximum: [2]f32 = @splat(0),
+    };
+
+    /// Binds the waveform to an outlet and optionally sizes it for the selected pane.
+    pub fn configure(
+        self: *OutputWaveform,
+        node: DSP.Node.Index,
+        output_port: u8,
+        outlet: DSP.Node.OutletMetadata,
+        graphic: ?*const Display.GraphicDisplay,
+    ) void {
+        self.* = .{
+            .parameters = .{
+                .node = node,
+                .output_port = output_port,
+                .fg_color = outlet.color,
+            },
+        };
+        if (graphic) |display| {
+            assert(display.height > parameters_pane_padding * 2);
+            const pane_height = @min(display.height, parameters_pane_min_height);
+            const content_height = pane_height - parameters_pane_padding * 2;
+            const side = @as(f32, @floatFromInt(
+                content_height * display.cell_height * display.scale,
+            ));
+            self.parameters.width = side;
+            self.parameters.height = side;
+        }
+    }
+
+    /// Drops waveform history so the next update starts at the queue tail.
+    pub fn reset(self: *OutputWaveform) void {
+        self.reader = null;
+        self.buckets = @splat(.{});
+        self.frame_cursor = 0;
+        self.latest_bucket = null;
+    }
+
+    /// Drains published stereo audio blocks into one second of peak history.
+    pub fn update(self: *OutputWaveform, dsp: *DSP) void {
+        const sample_tap = dsp.sampleTap(self.parameters.node);
+        if (self.reader == null)
+            self.reader = sample_tap.queue.reader();
+        const reader = &self.reader.?;
+
+        while (sample_tap.queue.front(reader)) |block| {
+            defer sample_tap.queue.pop(reader);
+            assert(block.sample_count <= DSP.block_size * 2);
+            assert(block.sample_count % 2 == 0);
+            assert(self.parameters.output_port < block.output_count);
+            const frame_count = block.sample_count / 2;
+            for (0..frame_count) |frame| {
+                const sample_rate: u64 = DSP.sample_rate;
+                const bucket_count: u64 = plot_bucket_capacity;
+                const frame_in_second = self.frame_cursor % sample_rate;
+                const serial = (self.frame_cursor / sample_rate) * bucket_count +
+                    frame_in_second * bucket_count / sample_rate;
+                const bucket_index: usize = @intCast(serial % bucket_count);
+                const bucket = &self.buckets[bucket_index];
+                if (bucket.serial == null or bucket.serial.? != serial) {
+                    bucket.* = .{ .serial = serial };
+                }
+
+                for (0..2) |channel| {
+                    const value = block.samples[self.parameters.output_port][frame * 2 + channel];
+                    bucket.minimum[channel] = @min(bucket.minimum[channel], value);
+                    bucket.maximum[channel] = @max(bucket.maximum[channel], value);
+                }
+                self.latest_bucket = serial;
+                self.frame_cursor += 1;
+            }
+        }
+    }
+
+    /// Draws two filled channel lanes in a passive, frameless ImPlot window.
+    pub fn write(
+        self: *OutputWaveform,
+        output_port: usize,
+        position: [2]f32,
+        width: f32,
+        height: f32,
+        hud: bool,
+    ) void {
+        assert(output_port == self.parameters.output_port);
+        assert(width > 0 and height > 0);
+        const sample_count = self.preparePlotSamples();
+
+        var title_buffer: [64]u8 = undefined;
+        const title: [:0]const u8 = if (hud) "##output-waveform" else blk: {
+            const title_text = std.fmt.bufPrint(
+                title_buffer[0 .. title_buffer.len - 1],
+                "##selected-waveform-{d}-{d}",
+                .{ self.parameters.node.idx, output_port },
+            ) catch unreachable;
+            title_buffer[title_text.len] = 0;
+            break :blk title_buffer[0..title_text.len :0];
+        };
+
+        zgui.setNextWindowPos(.{
+            .x = position[0],
+            .y = position[1],
+            .cond = .always,
+        });
+        zgui.setNextWindowSize(.{
+            .w = width,
+            .h = height,
+            .cond = .always,
+        });
+        zgui.pushStyleColor4f(.{
+            .idx = .window_bg,
+            .c = self.parameters.bg_color.colorToF32(),
+        });
+        zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0, 0 } });
+        zgui.pushStyleVar1f(.{ .idx = .window_border_size, .v = 0 });
+        const window_visible = zgui.begin(title, .{
+            .flags = .{
+                .no_title_bar = true,
+                .no_resize = true,
+                .no_move = true,
+                .no_scrollbar = true,
+                .no_collapse = true,
+                .no_saved_settings = true,
+                .no_mouse_inputs = true,
+                .no_nav_inputs = true,
+                .no_nav_focus = true,
+            },
+        });
+        defer {
+            zgui.end();
+            zgui.popStyleVar(.{ .count = 2 });
+            zgui.popStyleColor(.{});
+        }
+        if (!window_visible) return;
+
+        const plot = zgui.plot;
+        const background = self.parameters.bg_color.colorToF32();
+        plot.pushStyleColor4f(.{ .idx = .frame_bg, .c = background });
+        plot.pushStyleColor4f(.{ .idx = .plot_bg, .c = background });
+        plot.pushStyleColor4f(.{ .idx = .plot_border, .c = background });
+        plot.pushStyleVar1f(.{ .idx = .plot_border_size, .v = 0 });
+        plot.pushStyleVar2f(.{ .idx = .plot_padding, .v = .{ 0, 0 } });
+        defer {
+            plot.popStyleVar(.{ .count = 2 });
+            plot.popStyleColor(.{ .count = 3 });
+        }
+
+        const item_spacing = zgui.getStyle().item_spacing;
+        zgui.pushStyleVar2f(.{
+            .idx = .item_spacing,
+            .v = .{ item_spacing[0], 0 },
+        });
+        defer zgui.popStyleVar(.{});
+
+        const lane_height = height / 2;
+        for (0..2) |channel| {
+            const lane_id: [:0]const u8 = if (channel == 0)
+                "##waveform-left"
+            else
+                "##waveform-right";
+            if (!plot.beginPlot(lane_id, .{
+                .w = -1,
+                .h = lane_height,
+                .flags = .{
+                    .no_title = true,
+                    .no_legend = true,
+                    .no_inputs = true,
+                    .no_menus = true,
+                    .no_box_select = true,
+                    .no_mouse_text = true,
+                    .no_frame = true,
+                },
+            })) continue;
+
+            plot.setupAxis(.x1, .{ .flags = .no_decorations });
+            plot.setupAxis(.y1, .{ .flags = .no_decorations });
+            plot.setupAxisLimits(.x1, .{ .min = 0, .max = 1, .cond = .always });
+            plot.setupAxisLimits(.y1, .{ .min = -1, .max = 1, .cond = .always });
+            if (sample_count > 1) {
+                const fill_color = self.parameters.fg_color.colorToF32();
+                plot.setNextFillStyle(.{ .col = fill_color, .alpha_mod = 0.65 });
+                plot.plotShaded("##negative", f32, .{
+                    .xv = self.plot_times[0..sample_count],
+                    .yv = self.plot_minimum[channel][0..sample_count],
+                    .yref = 0,
+                });
+                plot.setNextFillStyle(.{ .col = fill_color, .alpha_mod = 0.65 });
+                plot.plotShaded("##positive", f32, .{
+                    .xv = self.plot_times[0..sample_count],
+                    .yv = self.plot_maximum[channel][0..sample_count],
+                    .yref = 0,
+                });
+            }
+            plot.endPlot();
+        }
+    }
+
+    /// Prepares the chronological one-second envelope passed to ImPlot.
+    fn preparePlotSamples(self: *OutputWaveform) usize {
+        const latest = self.latest_bucket orelse return 0;
+        const capacity: u64 = plot_bucket_capacity;
+        const sample_count: usize = @intCast(@min(latest + 1, capacity));
+        const first_serial = latest + 1 - @as(u64, @intCast(sample_count));
+        for (0..sample_count) |index| {
+            const serial = first_serial + @as(u64, @intCast(index));
+            const bucket_index: usize = @intCast(serial % capacity);
+            self.plot_times[index] = @as(f32, @floatFromInt(index)) /
+                @as(f32, @floatFromInt(capacity));
+            if (self.buckets[bucket_index].serial == serial) {
+                self.plot_minimum[0][index] = self.buckets[bucket_index].minimum[0];
+                self.plot_minimum[1][index] = self.buckets[bucket_index].minimum[1];
+                self.plot_maximum[0][index] = self.buckets[bucket_index].maximum[0];
+                self.plot_maximum[1][index] = self.buckets[bucket_index].maximum[1];
+            } else {
+                self.plot_minimum[0][index] = 0;
+                self.plot_minimum[1][index] = 0;
+                self.plot_maximum[0][index] = 0;
+                self.plot_maximum[1][index] = 0;
+            }
+        }
+        return sample_count;
     }
 };
 

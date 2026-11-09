@@ -621,6 +621,7 @@ pub fn unbindGroupOutput(self: *DSP, group: Node.Index, group_port: u8) void {
 }
 
 /// Returns the child port metadata currently exposed by a group port.
+/// Bound group outputs use a waveform observer for the selected group pane.
 pub fn groupOutletMetadata(
     self: *const DSP,
     group: Node.Index,
@@ -637,10 +638,13 @@ pub fn groupOutletMetadata(
         .output => .{ .name = "group output", .short_name = "out", .color = .gray },
     };
     const metadata = node_metadata.get(std.meta.activeTag(self.nodes.items(.state)[binding.node.idx]));
-    return switch (direction) {
+    var outlet = switch (direction) {
         .input => metadata.inputs[binding.port],
         .output => metadata.outputs[binding.port],
     };
+    if (direction == .output)
+        outlet.observer = .waveform;
+    return outlet;
 }
 
 /// Connects one node's parameter source to another node's parameter target.
@@ -1298,6 +1302,8 @@ pub const Node = struct {
         meter,
         /// Display recent output samples as a line plot.
         line_plot,
+        /// Display recent audio samples as a filled stereo waveform.
+        waveform,
         /// Do not display an output observer.
         none,
     };
@@ -1454,7 +1460,7 @@ pub const Node = struct {
             .duplicatable = false,
             .output_count = 0,
             .outputs = .{
-                .{ .name = "out", .short_name = "out", .color = .persimmon, .observer = .meter },
+                .{ .name = "out", .short_name = "out", .color = .persimmon, .observer = .waveform },
                 .{},
                 .{},
                 .{},
@@ -2216,7 +2222,7 @@ pub const Node = struct {
                 .{ .name = "input 8", .short_name = "in8", .color = .cerulean },
             },
             .outputs = .{
-                .{ .name = "mix", .short_name = "mix", .color = .cerulean, .observer = .meter },
+                .{ .name = "mix", .short_name = "mix", .color = .cerulean, .observer = .waveform },
                 .{},
                 .{},
                 .{},
@@ -2786,7 +2792,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .havelock_blue, .observer = .line_plot },
+                .{ .name = "audio", .short_name = "out", .color = .havelock_blue, .observer = .waveform },
                 .{},
                 .{},
                 .{},
@@ -2949,7 +2955,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "wet signal", .short_name = "wet", .color = .desert, .observer = .line_plot },
+                .{ .name = "output signal", .short_name = "out", .color = .desert, .observer = .meter },
                 .{},
                 .{},
                 .{},
@@ -2965,7 +2971,7 @@ pub const Node = struct {
         pub const Parameters = struct {
             /// Base delay in milliseconds.
             delay: f32 = 250,
-            /// Wet output level, clamped to 0..1 during processing.
+            /// Dry/wet blend: 0 outputs only dry signal, 1 outputs only delayed copies.
             wetness: f32 = 0.5,
             /// Number of delayed copies, from 1 through 16.
             feedback: u8 = 4,
@@ -3059,7 +3065,7 @@ pub const Node = struct {
             self.history_cursor = 0;
         }
 
-        /// Renders wet-only output by summing the requested delayed dry copies.
+        /// Renders a dry/wet blend from the input and its requested delayed copies.
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].delay;
             const parameters = state.parameters;
@@ -3144,7 +3150,11 @@ pub const Node = struct {
                     @as(@Vector(2, f32), @splat(0)),
                     @min(@as(@Vector(2, f32), @splat(1)), finite_wetness),
                 );
-                output.samples[sample_index..][0..2].* = @bitCast(wet_sample * wet_level);
+                const dry_level = @as(@Vector(2, f32), @splat(1)) - wet_level;
+                const dry_sample: @Vector(2, f32) = @bitCast(dry.samples[sample_index..][0..2].*);
+                output.samples[sample_index..][0..2].* = @bitCast(
+                    dry_sample * dry_level + wet_sample * wet_level,
+                );
 
                 state.history_cursor = (state.history_cursor + 1) % frame_capacity;
             }
@@ -3177,7 +3187,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .desert, .observer = .meter },
+                .{ .name = "audio", .short_name = "out", .color = .desert, .observer = .waveform },
                 .{},
                 .{},
                 .{},
@@ -3281,7 +3291,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "noise", .short_name = "out", .color = .logan, .observer = .none },
+                .{ .name = "noise", .short_name = "out", .color = .logan, .observer = .waveform },
                 .{},
                 .{},
                 .{},
