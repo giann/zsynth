@@ -118,6 +118,7 @@ fn addImGUI(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
         .{
             .shared = false,
             .backend = .sdl3_gpu,
+            .with_implot = true,
         },
     );
     compile_step.root_module.addImport("zgui", zgui.module("root"));

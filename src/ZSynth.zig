@@ -143,6 +143,15 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
 
     // Initialize the GUI backend owned by the application runtime.
     zgui.init(allocator);
+    zgui.plot.init();
+    zgui.backend.init(
+        @ptrCast(renderer.window),
+        .{
+            .device = @ptrCast(renderer.device),
+            .color_target_format = @backingInt(sdl.GPUTextureFormat.r8g8b8a8_unorm),
+            .msaa_samples = @backingInt(sdl.GPUSampleCount.samplecount_1),
+        },
+    );
 
     var self = Self{
         .io = process.io,
@@ -233,6 +242,8 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
         var event: sdl.Event = undefined;
         var should_quit = false;
         while (sdl.pollEvent(&event)) {
+            // Keep the SDL backend's input state current; observer windows are passive.
+            _ = zgui.backend.processEvent(@ptrCast(&event));
             // Defer state-stack teardown until the event batch is complete.
             if (event.type == .quit) {
                 should_quit = true;
@@ -278,6 +289,8 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
             self.ui_display.resetTransparent();
             self.cursor.dirty = false;
         }
+        // Build ImGui and ImPlot draw data in the renderer's logical canvas space.
+        zgui.backend.newFrame(screen_width, screen_height, 1.0);
         // Let states write their display and rendering commands.
         try self.state_stack.render(allocator, &self.renderer, frame_delta);
         // Overlay the software cursor after the state has redrawn its display.
@@ -301,6 +314,10 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
                 index + 1 == self.post_processing.len,
             );
 
+        // Upload GUI geometry before the renderer composites its final overlay pass.
+        zgui.backend.render();
+        zgui.backend.prepareDrawData(@ptrCast(cmd_buffer));
+
         // Submit the composed frame and yield briefly to avoid a busy loop.
         try self.renderer.render(allocator, self.io, cmd_buffer);
         try self.renderer.submit(allocator, cmd_buffer);
@@ -321,9 +338,11 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
         self.display.impl.graphic.deinit(allocator, &self.renderer);
     if (self.ui_display.impl == .graphic)
         self.ui_display.impl.graphic.deinit(allocator, &self.renderer);
-    // Release the renderer, GUI backend, and SDL services in dependency order.
-    self.renderer.deinit(allocator);
+    // Release GUI resources while their SDL GPU device is still alive.
+    zgui.plot.deinit();
+    zgui.backend.deinit();
     zgui.deinit();
+    self.renderer.deinit(allocator);
     sdl.showCursor() catch {};
     sdl.quit();
     // Shut down image loading and audio after their users are gone.

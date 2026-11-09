@@ -489,19 +489,16 @@ pub fn worldPositionAtDisplayCell(self: *Self, cell_x: u32, cell_y: u32) Positio
 
 /// Return the top-left position of a visual node.
 pub fn nodePosition(self: *Self, node: VisualNode.Index) Position {
-    assert(node.idx < self.nodes.len);
     return self.nodes.items(.position)[node.idx];
 }
 
 /// Returns whether a DSP node is a group wrapper.
 pub fn isGroup(self: *const Self, node: VisualNode.Index) bool {
-    assert(node.idx < self.dsp.nodes.len);
     return std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx]) == .group;
 }
 
 /// Returns whether a DSP node is an explicit group boundary endpoint.
 pub fn isGroupEndpoint(self: *const Self, node: VisualNode.Index) bool {
-    assert(node.idx < self.dsp.nodes.len);
     const tag = std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx]);
     return tag == .group_input or tag == .group_output;
 }
@@ -619,7 +616,6 @@ fn isHiddenNode(self: *const Self, node: VisualNode.Index) bool {
 /// Returns whether a node belongs to the active visual scope.
 fn isVisibleNode(self: *const Self, node: VisualNode.Index) bool {
     if (node.isNoop()) return false;
-    assert(node.idx < self.dsp.nodes.len);
     switch (self.scope) {
         .root => {
             if (self.isGroupEndpoint(node)) return false;
@@ -657,8 +653,6 @@ pub fn addNode(
     node: DSP.Node.Index,
     position: Position,
 ) !void {
-    assert(node.idx == self.nodes.len);
-
     try self.nodes.append(gpa, .{
         .dsp_node = node,
         .position = position,
@@ -738,7 +732,6 @@ pub fn selectSingle(self: *Self, node: ?VisualNode.Index) void {
     self.clearSelection();
     if (node) |value| {
         if (!value.isNoop()) {
-            assert(value.idx < self.nodes.len);
             self.selected_nodes[0] = value;
             self.selected_count = 1;
         }
@@ -749,7 +742,6 @@ pub fn selectSingle(self: *Self, node: ?VisualNode.Index) void {
 /// out of multi-selections.
 pub fn toggleSelection(self: *Self, node: VisualNode.Index) void {
     if (node.isNoop()) return;
-    assert(node.idx < self.nodes.len);
 
     if (self.isSelected(node)) {
         var index: usize = 0;
@@ -942,9 +934,6 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
 
 /// Removes a visual node and rebuilds the spatial and routing state.
 pub fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
-    assert(!node.isNoop());
-    assert(node.idx < self.nodes.len);
-
     self.clearPaths(gpa);
     self.path_occupied.clearRetainingCapacity();
 
@@ -1032,7 +1021,6 @@ fn writeOutputTail(self: *Self, gpa: std.mem.Allocator, display: *Display) !void
     if (self.scope != .root) return;
     const output = self.dsp.output;
     if (output.isNoop()) return;
-    assert(output.idx < self.nodes.len);
 
     const footprint = self.nodeFootprint(output);
     const state = self.dsp.nodes.items(.state)[output.idx];
@@ -1773,11 +1761,9 @@ pub fn computePaths(self: *Self, gpa: std.mem.Allocator) !void {
 
 /// Rebuilds the reverse-reachability cache for the configured DSP output.
 fn computeOutputReachability(self: *Self) void {
-    const node_count = self.dsp.nodes.len;
     const output_reachable = self.nodes.items(.output_reachable);
     @memset(output_reachable, false);
 
-    assert(self.dsp.output.idx < node_count);
     output_reachable[self.dsp.output.idx] = true;
 
     // Repeatedly propagate reachability from destinations to their sources.
@@ -1791,7 +1777,6 @@ fn computeOutputReachability(self: *Self) void {
             if (destination_state == .group) {
                 for (destination_state.group.output_bindings) |binding| {
                     const child = binding orelse continue;
-                    assert(child.node.idx < node_count);
                     if (!output_reachable[child.node.idx]) {
                         output_reachable[child.node.idx] = true;
                         changed = true;
@@ -1800,7 +1785,6 @@ fn computeOutputReachability(self: *Self) void {
             }
             for (node_inputs) |connection| {
                 if (connection.isNoop()) continue;
-                assert(connection.node.idx < node_count);
                 if (output_reachable[connection.node.idx]) continue;
                 output_reachable[connection.node.idx] = true;
                 changed = true;
@@ -1811,7 +1795,6 @@ fn computeOutputReachability(self: *Self) void {
             if (state != .group or !output_reachable[group_index]) continue;
             for (self.dsp.nodes.items(.inputs)[group_index]) |connection| {
                 if (connection.isNoop()) continue;
-                assert(connection.node.idx < node_count);
                 if (!output_reachable[connection.node.idx]) {
                     output_reachable[connection.node.idx] = true;
                     changed = true;

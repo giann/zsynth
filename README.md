@@ -29,6 +29,7 @@ and effects to be composed into a real-time sound pipeline.
   audio)
 - pitch shifter
 - resampler
+- cleanup command that reorganize graph to optimize paths for better readability
 
 ## Controls and UI elements
 

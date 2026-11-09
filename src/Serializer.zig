@@ -253,13 +253,10 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         });
         switch (node.state) {
             .group_input => |endpoint| {
-                std.debug.assert(endpoint.group.idx < self.dsp.nodes.len);
                 std.debug.assert(endpoint.port < DSP.max_outlets);
                 self.dsp.nodes.items(.state)[endpoint.group.idx].group.input_nodes[endpoint.port] = actual;
             },
             .group_output => |endpoint| {
-                std.debug.assert(endpoint.group.idx < self.dsp.nodes.len);
-                std.debug.assert(endpoint.port < DSP.max_outlets);
                 self.dsp.nodes.items(.state)[endpoint.group.idx].group.output_nodes[endpoint.port] = actual;
             },
             else => {},

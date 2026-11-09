@@ -10,6 +10,7 @@ const g = @import("graphics.zig");
 const a = @import("assets.zig");
 const p = @import("pool.zig");
 const stbi = @import("zstbi");
+const zgui = @import("zgui");
 
 const Self = @This();
 
@@ -593,6 +594,34 @@ pub fn render(self: *Self, gpa: std.mem.Allocator, io: std.Io, cmd_buffer: *sdl.
         try self.pending_acquired.append(gpa, acquired);
     }
     self.commands.clearRetainingCapacity();
+
+    // Draw ImGui on the logical canvas before it is letterboxed to the window.
+    const gui_render_pass = sdl.beginGPURenderPass(
+        cmd_buffer,
+        @ptrCast(
+            &.{
+                std.mem.zeroInit(
+                    sdl.GPUColorTargetInfo,
+                    .{
+                        .texture = self.frame_texture,
+                        .load_op = if (self.frame_texture_initialized)
+                            sdl.GPULoadOp.load
+                        else
+                            sdl.GPULoadOp.clear,
+                        .store_op = .store,
+                    },
+                ),
+            },
+        ),
+        1,
+        null,
+    );
+    zgui.backend.renderDrawData(
+        @ptrCast(cmd_buffer),
+        @ptrCast(gui_render_pass),
+        null,
+    );
+    sdl.endGPURenderPass(gui_render_pass);
 
     // Now draw the frame_texture to the swapchain_texture
     const pipeline = try self.getGraphicsPipeline(

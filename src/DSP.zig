@@ -148,7 +148,6 @@ pub fn isPlaying(self: *const DSP) bool {
 
 /// Changes the root output device and resumes playback if it was active.
 pub fn setOutputDevice(self: *DSP, node: Node.Index, device_id: pa.DeviceId) AudioError!void {
-    assert(node.idx < self.nodes.len);
     assert(node.idx == self.output.idx);
     assert(self.nodes.items(.state)[node.idx] == .output);
     assert(pa.deviceById(self.devices, device_id) != null);
@@ -184,7 +183,6 @@ pub fn setOutputDevice(self: *DSP, node: Node.Index, device_id: pa.DeviceId) Aud
 
 /// Replaces a MIDI node's input stream with the selected cached device.
 pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) pm.Error!void {
-    assert(node.idx < self.nodes.len);
     assert(self.nodes.items(.state)[node.idx] == .midi);
     assert(device_id == pm.NoDevice or pm.deviceById(self.midi_devices, device_id) != null);
 
@@ -218,7 +216,6 @@ pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) pm.Er
 
 /// Opens or replaces the stream when the output node's device has changed.
 fn ensureOutputStream(self: *DSP) AudioError!void {
-    assert(self.output.idx < self.nodes.len);
     assert(self.nodes.items(.state)[self.output.idx] == .output);
     const device_id = self.nodes.items(.state)[self.output.idx].output.parameters.device;
     if (self.audio_stream) |pa_stream| {
@@ -285,15 +282,9 @@ pub fn plug(
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(source.idx < self.nodes.len);
-    assert(destination.idx < self.nodes.len);
-
-    // Validate both ends before replacing the destination connection.
-    const source_tag = std.meta.activeTag(self.nodes.items(.state)[source.idx]);
-    const source_metadata = node_metadata.get(source_tag);
+    // Validate the destination input before replacing the connection.
     const destination_tag = std.meta.activeTag(self.nodes.items(.state)[destination.idx]);
     const destination_metadata = node_metadata.get(destination_tag);
-    assert(source_output_port < source_metadata.output_count);
     assert(destination_port < destination_metadata.input_count);
 
     const inputs = self.nodes.items(.inputs);
@@ -325,7 +316,6 @@ pub fn disconnectInput(self: *DSP, destination: Node.Index, destination_port: u8
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(destination.idx < self.nodes.len);
     assert(destination_port < max_outlets);
 
     const inputs = self.nodes.items(.inputs);
@@ -345,9 +335,6 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(source.idx < self.nodes.len);
-    assert(source_output_port < max_outlets);
-
     const inputs = self.nodes.items(.inputs);
     for (inputs, 0..) |*node_inputs, destination_idx| {
         for (node_inputs, 0..) |*connection, destination_port| {
@@ -366,10 +353,8 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
     self.refreshMemberGroupHashLocked(source);
 }
 
-/// Returns whether an index identifies a valid group with the requested port.
-fn validGroupPortLocked(self: *DSP, group: Node.Index, port: u8, _: bool) bool {
-    assert(group.idx < self.nodes.len);
-    assert(port < max_outlets);
+/// Returns whether an index identifies a group.
+fn isGroupLocked(self: *DSP, group: Node.Index) bool {
     return std.meta.activeTag(self.nodes.items(.state)[group.idx]) == .group;
 }
 
@@ -381,9 +366,6 @@ fn validGroupMemberPortLocked(
     port: u8,
     input: bool,
 ) bool {
-    assert(group.idx < self.nodes.len);
-    assert(member.idx < self.nodes.len);
-    assert(port < max_outlets);
     if (group.idx == member.idx) return false;
     const group_state = self.nodes.items(.state)[group.idx];
     if (group_state != .group) return false;
@@ -402,7 +384,6 @@ fn validGroupMemberPortLocked(
 
 /// Returns the ordered slot occupied by a member of a group.
 fn groupMemberSlotLocked(self: *const DSP, group: Node.Index, member: Node.Index) ?u8 {
-    assert(group.idx < self.nodes.len);
     const state = self.nodes.items(.state)[group.idx];
     if (state != .group) return null;
     for (state.group.members[0..state.group.member_count], 0..) |candidate, slot|
@@ -412,7 +393,6 @@ fn groupMemberSlotLocked(self: *const DSP, group: Node.Index, member: Node.Index
 
 /// Rebuilds one cached group hash after a structural graph mutation.
 fn rebuildGroupSubgraphHashLocked(self: *DSP, group: Node.Index) void {
-    assert(group.idx < self.nodes.len);
     assert(std.meta.activeTag(self.nodes.items(.state)[group.idx]) == .group);
 
     const old_hash = self.nodes.items(.group_subgraph_hash)[group.idx];
@@ -421,7 +401,6 @@ fn rebuildGroupSubgraphHashLocked(self: *DSP, group: Node.Index) void {
     hasher.update(&[_]u8{group_state.member_count});
 
     for (group_state.members[0..group_state.member_count]) |member| {
-        assert(member.idx < self.nodes.len);
         hasher.update(&[_]u8{@backingInt(std.meta.activeTag(self.nodes.items(.state)[member.idx]))});
 
         for (self.nodes.items(.inputs)[member.idx]) |connection| {
@@ -525,7 +504,6 @@ fn refreshMemberGroupHashLocked(self: *DSP, member: Node.Index) void {
 fn clearGroupInputBindingLocked(self: *DSP, group: Node.Index, group_port: u8) void {
     const group_state = &self.nodes.items(.state)[group.idx].group;
     const binding = group_state.input_bindings[group_port] orelse return;
-    assert(binding.node.idx < self.nodes.len);
     const child_input = &self.nodes.items(.inputs)[binding.node.idx][binding.port];
     if (!child_input.isNoop() and
         child_input.node.idx == group_state.input_nodes[group_port].idx and
@@ -542,7 +520,6 @@ fn clearGroupInputBindingLocked(self: *DSP, group: Node.Index, group_port: u8) v
 fn syncGroupInputLocked(self: *DSP, group: Node.Index, group_port: u8) void {
     const group_state = &self.nodes.items(.state)[group.idx].group;
     const binding = group_state.input_bindings[group_port] orelse return;
-    assert(binding.node.idx < self.nodes.len);
 
     const child_input = &self.nodes.items(.inputs)[binding.node.idx][binding.port];
     if (!child_input.isNoop())
@@ -565,7 +542,7 @@ pub fn bindGroupInput(
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (!self.validGroupPortLocked(group, group_port, false) or
+    if (!self.isGroupLocked(group) or
         !self.validGroupMemberPortLocked(group, member, member_port, true))
         return false;
 
@@ -590,7 +567,7 @@ pub fn bindGroupOutput(
     self.lockGraph();
     defer self.unlockGraph();
 
-    if (!self.validGroupPortLocked(group, group_port, true) or
+    if (!self.isGroupLocked(group) or
         !self.validGroupMemberPortLocked(group, member, member_port, false))
         return false;
 
@@ -621,7 +598,7 @@ pub fn bindGroupOutput(
 pub fn unbindGroupInput(self: *DSP, group: Node.Index, group_port: u8) void {
     self.lockGraph();
     defer self.unlockGraph();
-    if (!self.validGroupPortLocked(group, group_port, false)) return;
+    if (!self.isGroupLocked(group)) return;
     self.clearGroupInputBindingLocked(group, group_port);
     self.rebuildGroupSubgraphHashLocked(group);
 }
@@ -630,7 +607,7 @@ pub fn unbindGroupInput(self: *DSP, group: Node.Index, group_port: u8) void {
 pub fn unbindGroupOutput(self: *DSP, group: Node.Index, group_port: u8) void {
     self.lockGraph();
     defer self.unlockGraph();
-    if (!self.validGroupPortLocked(group, group_port, true)) return;
+    if (!self.isGroupLocked(group)) return;
     const group_state = &self.nodes.items(.state)[group.idx].group;
     const endpoint = group_state.output_nodes[group_port];
     if (!endpoint.isNoop()) {
@@ -650,8 +627,6 @@ pub fn groupOutletMetadata(
     direction: enum { input, output },
     port: u8,
 ) Node.OutletMetadata {
-    assert(group.idx < self.nodes.len);
-    assert(port < max_outlets);
     const state = self.nodes.items(.state)[group.idx];
     if (state != .group) return .{};
     const binding = switch (direction) {
@@ -661,7 +636,6 @@ pub fn groupOutletMetadata(
         .input => .{ .name = "group input", .short_name = "in", .color = .gray },
         .output => .{ .name = "group output", .short_name = "out", .color = .gray },
     };
-    assert(binding.node.idx < self.nodes.len);
     const metadata = node_metadata.get(std.meta.activeTag(self.nodes.items(.state)[binding.node.idx]));
     return switch (direction) {
         .input => metadata.inputs[binding.port],
@@ -677,10 +651,6 @@ pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(!source.isNoop());
-    assert(!target.isNoop());
-    assert(source.idx < self.nodes.len);
-    assert(target.idx < self.nodes.len);
     if (source.idx == target.idx) return false;
 
     const states = self.nodes.items(.state);
@@ -701,19 +671,16 @@ pub fn linkParameters(self: *DSP, source: Node.Index, target: Node.Index) bool {
     // Walking toward the root source detects whether this link would close a cycle.
     var ancestor = source;
     while (self.nodes.items(.parameter_link)[ancestor.idx].source) |next| {
-        assert(next.idx < self.nodes.len);
         if (next.idx == target.idx) return false;
         ancestor = next;
     }
 
     const links = self.nodes.items(.parameter_link);
     if (links[target.idx].source) |previous_source| {
-        assert(previous_source.idx < self.nodes.len);
         links[previous_source.idx].target = null;
         self.refreshMemberGroupHashLocked(previous_source);
     }
     if (links[source.idx].target) |previous_target| {
-        assert(previous_target.idx < self.nodes.len);
         links[previous_target.idx].source = null;
         self.refreshMemberGroupHashLocked(previous_target);
     }
@@ -728,10 +695,8 @@ pub fn disconnectParameterSource(self: *DSP, target: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(target.idx < self.nodes.len);
     const links = self.nodes.items(.parameter_link);
     if (links[target.idx].source) |source| {
-        assert(source.idx < self.nodes.len);
         links[source.idx].target = null;
         links[target.idx].source = null;
         self.refreshMemberGroupHashLocked(source);
@@ -744,10 +709,8 @@ pub fn disconnectParameterTarget(self: *DSP, source: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(source.idx < self.nodes.len);
     const links = self.nodes.items(.parameter_link);
     if (links[source.idx].target) |target| {
-        assert(target.idx < self.nodes.len);
         links[target.idx].source = null;
         links[source.idx].target = null;
         self.refreshMemberGroupHashLocked(source);
@@ -760,9 +723,6 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(!node.isNoop());
-    assert(node.idx < self.nodes.len);
-
     if (self.nodes.items(.deinitialize)[node.idx]) |deinitialize|
         deinitialize(self, node);
 
@@ -773,11 +733,9 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     // node's indices after swapRemove below.
     const links = self.nodes.items(.parameter_link);
     if (links[node.idx].source) |source| {
-        assert(source.idx < self.nodes.len);
         links[source.idx].target = null;
     }
     if (links[node.idx].target) |target| {
-        assert(target.idx < self.nodes.len);
         links[target.idx].source = null;
     }
 
@@ -889,7 +847,6 @@ pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) 
     self.lockGraph();
     defer self.unlockGraph();
 
-    assert(group.idx < self.nodes.len);
     if (self.nodes.items(.state)[group.idx] != .group)
         return error.InvalidGroup;
 
@@ -918,8 +875,6 @@ pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) 
 pub fn addGroupMember(self: *DSP, group: Node.Index, member: Node.Index) bool {
     self.lockGraph();
     defer self.unlockGraph();
-    assert(group.idx < self.nodes.len);
-    assert(member.idx < self.nodes.len);
     if (group.idx == member.idx) return false;
     if (std.meta.activeTag(self.nodes.items(.state)[group.idx]) != .group)
         return false;
@@ -960,7 +915,6 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
 
 /// Presses a key on a keyboard node using its atomic voice state.
 pub fn keyboardKeyDown(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
-    assert(node.idx < self.nodes.len);
     switch (self.nodes.items(.state)[node.idx]) {
         .keyboard => |*keyboard| return keyboard.press(key),
         else => return false,
@@ -969,7 +923,6 @@ pub fn keyboardKeyDown(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
 
 /// Releases a key on a keyboard node using its atomic voice state.
 pub fn keyboardKeyUp(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
-    assert(node.idx < self.nodes.len);
     switch (self.nodes.items(.state)[node.idx]) {
         .keyboard => |*keyboard| return keyboard.release(key),
         else => return false,
@@ -978,7 +931,6 @@ pub fn keyboardKeyUp(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
 
 /// Releases all keys held by a keyboard node using atomic stores.
 pub fn keyboardReleaseAll(self: *DSP, node: Node.Index) void {
-    assert(node.idx < self.nodes.len);
     switch (self.nodes.items(.state)[node.idx]) {
         .keyboard => |*keyboard| keyboard.releaseAll(),
         else => {},
@@ -991,7 +943,6 @@ pub fn keyboardReleaseAll(self: *DSP, node: Node.Index) void {
 /// The returned pointer must not be retained across graph mutation. The UI
 /// stores only the node index and resolves the tap again for each update.
 pub fn sampleTap(self: *DSP, node: Node.Index) *SampleTap {
-    assert(node.idx < self.nodes.len);
     return &self.nodes.items(.sample_tap)[node.idx];
 }
 
@@ -1038,7 +989,6 @@ pub fn withGraphLock(self: *DSP, context: anytype, callback: anytype) void {
 
 /// Evaluates one node and all of its dependencies for the requested sample count.
 fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
-    assert(node.idx < self.nodes.len);
     const cache = &self.nodes.items(.cache)[node.idx];
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
     const output_count = if (node.idx == self.output.idx)
@@ -1066,7 +1016,6 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
 
     // If has parameter link, copy parameters from source
     if (self.nodes.items(.parameter_link)[node.idx].source) |source| {
-        assert(source.idx < self.nodes.len);
         const destination = &self.nodes.items(.state)[node.idx];
         const source_state = &self.nodes.items(.state)[source.idx];
         if (destination.* == .group and source_state.* == .group) {
@@ -1144,12 +1093,6 @@ fn getOutput(
     connection: Node.Connection,
     sample_count: u32,
 ) !*Buffer {
-    // Invalid connections indicate a graph-construction bug.
-    assert(!connection.isNoop());
-    assert(connection.node.idx < self.nodes.len);
-    const source_tag = std.meta.activeTag(self.nodes.items(.state)[connection.node.idx]);
-    assert(connection.output_port < node_metadata.get(source_tag).output_count);
-
     // Rendering is cached, so repeated requests for this source are cheap.
     try self.renderNode(connection.node, sample_count);
 
@@ -1335,12 +1278,24 @@ pub const Node = struct {
         target: ?Node.Index = null,
     };
 
+    /// UI observer used to visualize one output port.
+    pub const Observer = enum {
+        /// Display the output level with an audio meter.
+        meter,
+        /// Display recent output samples as a line plot.
+        line_plot,
+        /// Do not display an output observer.
+        none,
+    };
+
     /// Static metadata for one node input or output.
     pub const OutletMetadata = struct {
         name: []const u8 = "",
         short_name: []const u8 = "",
         unit: []const u8 = "",
         color: Display.Color = .transparent,
+        /// Observer shown for this output when its node is selected.
+        observer: Observer = .none,
     };
 
     /// Static port metadata for a node kind.
@@ -1352,8 +1307,6 @@ pub const Node = struct {
         has_parameters: bool = false,
         /// Whether the editor exposes parameter-link outlets for this node.
         can_link_parameters: bool = true,
-        /// Whether the node's outputs are meaningful to inspect as audio levels.
-        meterable: bool = true,
         inputs: [max_outlets]OutletMetadata = @splat(.{}),
         outputs: [max_outlets]OutletMetadata = @splat(.{}),
         output_count: u8 = 1,
@@ -1477,6 +1430,16 @@ pub const Node = struct {
             .can_link_parameters = false,
             .duplicatable = false,
             .output_count = 0,
+            .outputs = .{
+                .{ .name = "out", .short_name = "out", .color = .persimmon, .observer = .meter },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .persimmon },
                 .{},
@@ -1530,7 +1493,6 @@ pub const Node = struct {
             .color = .astral,
             .has_parameters = true,
             .can_link_parameters = true,
-            .meterable = false,
             .inputs = @splat(.{ .name = "group input", .short_name = "in", .color = .gray }),
             .outputs = @splat(.{ .name = "group output", .short_name = "out", .color = .gray }),
             .input_count = max_outlets,
@@ -1592,9 +1554,6 @@ pub const Node = struct {
             const state = dsp.nodes.items(.state)[node.idx].group;
             for (state.output_bindings, 0..) |binding, port| {
                 const selected = binding orelse continue;
-                assert(selected.node.idx < dsp.nodes.len);
-                const selected_tag = std.meta.activeTag(dsp.nodes.items(.state)[selected.node.idx]);
-                assert(selected.port < node_metadata.get(selected_tag).output_count);
                 try dsp.renderNode(selected.node, into[0].sample_count);
                 const source = &dsp.nodes.items(.cache)[selected.node.idx].outputs[selected.port];
                 @memcpy(
@@ -1618,7 +1577,6 @@ pub const Node = struct {
             .short_name = "in",
             .color = .gray,
             .can_link_parameters = false,
-            .meterable = false,
             .inputs = @splat(.{}),
             .outputs = @splat(.{ .name = "group input", .short_name = "out", .color = .gray }),
             .input_count = 0,
@@ -1632,7 +1590,6 @@ pub const Node = struct {
         /// Copies the owning group's materialized input buffer.
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             const state = dsp.nodes.items(.state)[node.idx].group_input;
-            assert(state.group.idx < dsp.nodes.len);
             const source = &dsp.nodes.items(.cache)[state.group.idx].input_buffers[state.port];
             @memcpy(into[0].samples[0..source.sample_count], source.samples[0..source.sample_count]);
         }
@@ -1651,7 +1608,6 @@ pub const Node = struct {
             .short_name = "out",
             .color = .gray,
             .can_link_parameters = false,
-            .meterable = false,
             .inputs = @splat(.{ .name = "group output", .short_name = "in", .color = .gray }),
             .outputs = @splat(.{}),
             .output_count = 0,
@@ -1859,7 +1815,6 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Constant",
             .short_name = "cst",
-            .meterable = false,
             .color = .golden_rod,
             .has_parameters = true,
             .outputs = .{
@@ -1918,7 +1873,6 @@ pub const Node = struct {
         pub const metadata = Node.Metadata{
             .name = "Keyboard",
             .short_name = "kbd",
-            .meterable = false,
             .color = .feijoa,
             .has_parameters = true,
             .can_link_parameters = false,
@@ -2092,7 +2046,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .curious_blue },
+                .{ .name = "audio", .short_name = "out", .color = .curious_blue, .observer = .line_plot },
                 .{},
                 .{},
                 .{},
@@ -2239,7 +2193,7 @@ pub const Node = struct {
                 .{ .name = "input 8", .short_name = "in8", .color = .cerulean },
             },
             .outputs = .{
-                .{ .name = "mix", .short_name = "mix", .color = .cerulean },
+                .{ .name = "mix", .short_name = "mix", .color = .cerulean, .observer = .meter },
                 .{},
                 .{},
                 .{},
@@ -2363,7 +2317,6 @@ pub const Node = struct {
             .name = "Monophonic Sequencer",
             .short_name = "seq",
             .color = .feijoa,
-            .meterable = false,
             .has_parameters = true,
             .can_link_parameters = false,
             .outputs = .{
@@ -2810,7 +2763,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .havelock_blue },
+                .{ .name = "audio", .short_name = "out", .color = .havelock_blue, .observer = .line_plot },
                 .{},
                 .{},
                 .{},
@@ -2958,7 +2911,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .desert },
+                .{ .name = "audio", .short_name = "out", .color = .desert, .observer = .meter },
                 .{},
                 .{},
                 .{},
@@ -3062,7 +3015,7 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "noise", .short_name = "out", .color = .logan },
+                .{ .name = "noise", .short_name = "out", .color = .logan, .observer = .none },
                 .{},
                 .{},
                 .{},
@@ -3190,7 +3143,6 @@ pub const Node = struct {
             .color = .carnation,
             .has_parameters = true,
             .can_link_parameters = false,
-            .meterable = false,
             .duplicatable = false,
             .output_count = 3,
             .input_count = 0,

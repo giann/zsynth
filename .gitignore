@@ -3,3 +3,4 @@ zig-out/
 zig-pkg/
 src/zsynth.pb.zig
 *.zsynth
+imgui.ini
