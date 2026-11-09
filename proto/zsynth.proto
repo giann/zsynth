@@ -35,6 +35,7 @@ message Node {
     KeyboardParameters keyboard = 18;
     MIDIParameterse midi = 19;
     OutputParameters output = 22;
+    DelayParameters delay = 23;
   }
 }
 
@@ -108,6 +109,13 @@ message FilterParameters {
 message BitCrusherParameters {
   optional uint32 target_sample_rate = 1;
   optional uint32 bit_depth = 2;
+}
+
+message DelayParameters {
+  optional float delay_ms = 1;
+  optional float wetness = 2;
+  optional uint32 feedback = 3;
+  optional float decay = 4;
 }
 
 message NoiseParameters {

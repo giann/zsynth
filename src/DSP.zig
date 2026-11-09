@@ -102,7 +102,7 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
     // Release node-owned device streams before freeing their node state.
     for (self.nodes.items(.deinitialize), 0..) |deinitialize, index|
         if (deinitialize) |callback|
-            callback(self, .{ .idx = index });
+            callback(self, .{ .idx = index }, gpa);
     for (self.nodes.items(.sample_tap)) |*sample_tap|
         sample_tap.queue.deinit(gpa);
     // Release all node storage using the allocator supplied at init time.
@@ -118,7 +118,7 @@ pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
         const index = self.nodes.len - 1;
         // Graph replacement must close external resources before dropping nodes.
         if (self.nodes.items(.deinitialize)[index]) |deinitialize|
-            deinitialize(self, .{ .idx = index });
+            deinitialize(self, .{ .idx = index }, gpa);
         self.nodes.items(.sample_tap)[index].queue.deinit(gpa);
         _ = self.nodes.pop();
     }
@@ -724,7 +724,7 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     defer self.unlockGraph();
 
     if (self.nodes.items(.deinitialize)[node.idx]) |deinitialize|
-        deinitialize(self, node);
+        deinitialize(self, node, gpa);
 
     const last_index = self.nodes.len - 1;
     const removing_output = self.output.idx == node.idx;
@@ -897,18 +897,26 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     defer self.unlockGraph();
 
     try self.nodes.append(gpa, node);
-    errdefer _ = self.nodes.pop();
-
     const new_index = self.nodes.len - 1;
+    var sample_tap_initialized = false;
+    errdefer {
+        if (node.deinitialize) |deinitialize|
+            deinitialize(self, .{ .idx = new_index }, gpa);
+        if (sample_tap_initialized)
+            self.nodes.items(.sample_tap)[new_index].queue.deinit(gpa);
+        _ = self.nodes.pop();
+    }
+
     self.nodes.items(.sample_tap)[new_index].queue =
         try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
+    sample_tap_initialized = true;
     if (std.meta.activeTag(self.nodes.items(.state)[new_index]) == .group)
         self.rebuildGroupSubgraphHashLocked(.{ .idx = new_index });
 
     const index = Node.Index{ .idx = new_index };
 
     if (node.initialize) |initialize|
-        try initialize(self, index);
+        try initialize(self, index, gpa);
 
     return index;
 }
@@ -1071,6 +1079,9 @@ fn copyGroupParameters(self: *DSP, source: Node.Index, destination: Node.Index) 
     for (0..source_group.member_count) |slot| {
         const source_state = &self.nodes.items(.state)[source_group.members[slot].idx];
         const destination_state = &self.nodes.items(.state)[destination_group.members[slot].idx];
+        // Delay history capacity is sized outside rendering, so a group link
+        // must not copy live delay settings into a differently sized ring.
+        if (destination_state.* == .delay) continue;
         switch (destination_state.*) {
             inline else => |*destination_value| {
                 if (@hasField(@TypeOf(destination_value.*), "parameters")) {
@@ -1229,6 +1240,7 @@ pub const Node = struct {
         noop,
         oscillator,
         output,
+        delay,
         group,
         group_input,
         group_output,
@@ -1263,6 +1275,8 @@ pub const Node = struct {
         oscillator: Oscillator,
         /// Graph output forwarding state.
         output: Output,
+        /// Multi-tap delay effect state.
+        delay: Delay,
         /// Non-nested proxy around a fixed set of member nodes.
         group: Group,
         group_input: GroupInput,
@@ -1369,10 +1383,19 @@ pub const Node = struct {
         node: Index,
         outputs: []const *Buffer,
     ) ProcessError!void;
-    pub const InitializeError = error{} || pm.Error;
-    /// Called once when node is added to the graph
-    pub const Initialize = *const fn (dsp: *DSP, node: Index) InitializeError!void;
-    pub const Deinitialize = *const fn (dsp: *DSP, node: Index) void;
+    pub const InitializeError = error{OutOfMemory} || pm.Error;
+    /// Called once when a node is added to the graph.
+    pub const Initialize = *const fn (
+        dsp: *DSP,
+        node: Index,
+        allocator: std.mem.Allocator,
+    ) InitializeError!void;
+    /// Releases any node-owned resources before the node is removed.
+    pub const Deinitialize = *const fn (
+        dsp: *DSP,
+        node: Index,
+        allocator: std.mem.Allocator,
+    ) void;
 
     /// A node that produces silence and represents an unplugged connection.
     pub const Noop = struct {
@@ -2892,6 +2915,249 @@ pub const Node = struct {
         }
     };
 
+    /// Mixes a bounded number of delayed copies of a stereo input.
+    pub const Delay = struct {
+        /// User-controlled base delay, wet level, and number of delayed copies.
+        parameters: Parameters,
+        /// Interleaved stereo dry-signal history, allocated during initialization.
+        dry_history: []f32 = &.{},
+        /// Frame slot where the next dry stereo sample is written.
+        history_cursor: usize = 0,
+
+        /// Maximum delay time supported by one tap, in milliseconds.
+        pub const max_delay_ms: f32 = 2_000;
+        /// Lowest allowed feedback count.
+        pub const min_feedback: u8 = 1;
+        /// Highest allowed feedback count.
+        pub const max_feedback: u8 = 16;
+
+        /// Port metadata for the delay node.
+        pub const metadata = Node.Metadata{
+            .name = "Delay",
+            .short_name = "dly",
+            .color = .desert,
+            .has_parameters = true,
+            .can_link_parameters = false,
+            .inputs = .{
+                .{ .name = "dry signal", .short_name = "in", .color = .desert },
+                .{ .name = "wetness", .short_name = "wet", .color = .desert },
+                .{ .name = "delay", .short_name = "dly", .unit = "ms", .color = .desert },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "wet signal", .short_name = "wet", .color = .desert, .observer = .line_plot },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .input_count = 3,
+        };
+
+        /// Base settings used when optional wetness or delay inputs are unplugged.
+        pub const Parameters = struct {
+            /// Base delay in milliseconds.
+            delay: f32 = 250,
+            /// Wet output level, clamped to 0..1 during processing.
+            wetness: f32 = 0.5,
+            /// Number of delayed copies, from 1 through 16.
+            feedback: u8 = 4,
+            /// Multiplier applied to each copy's level to get the next copy's level.
+            decay: f32 = 0.5,
+        };
+
+        /// Creates a delay node with no allocated audio history yet.
+        pub fn create(name: []const u8, parameters: Parameters) Node {
+            assert(parametersAreValid(parameters));
+            return .{
+                .state = .{
+                    .delay = .{ .parameters = parameters },
+                },
+                .name = name,
+                .process = process,
+                .initialize = initialize,
+                .deinitialize = deinitialize,
+            };
+        }
+
+        /// Returns whether parameters can be safely represented and processed.
+        pub fn parametersAreValid(parameters: Parameters) bool {
+            return std.math.isFinite(parameters.delay) and
+                parameters.delay >= 0 and parameters.delay <= max_delay_ms and
+                std.math.isFinite(parameters.wetness) and
+                parameters.wetness >= 0 and parameters.wetness <= 1 and
+                std.math.isFinite(parameters.decay) and
+                parameters.decay >= 0 and parameters.decay <= 1 and
+                parameters.feedback >= min_feedback and parameters.feedback <= max_feedback;
+        }
+
+        /// Allocates enough history for the configured delay range and copy count.
+        fn initialize(
+            dsp: *DSP,
+            node: Index,
+            allocator: std.mem.Allocator,
+        ) InitializeError!void {
+            const state = &dsp.nodes.items(.state)[node.idx].delay;
+            try state.ensureHistoryCapacity(allocator, state.parameters);
+        }
+
+        /// Releases the delay history allocated during initialization or growth.
+        fn deinitialize(dsp: *DSP, node: Index, allocator: std.mem.Allocator) void {
+            const state = &dsp.nodes.items(.state)[node.idx].delay;
+            if (state.dry_history.len != 0)
+                allocator.free(state.dry_history);
+            state.dry_history = &.{};
+            state.history_cursor = 0;
+        }
+
+        /// Grows history when settings require it, preserving the newest samples.
+        pub fn ensureHistoryCapacity(
+            self: *Delay,
+            allocator: std.mem.Allocator,
+            parameters: Parameters,
+        ) std.mem.Allocator.Error!void {
+            assert(parametersAreValid(parameters));
+
+            const sample_rate_f: f32 = @floatFromInt(sample_rate);
+            const minimum_delay_ms = 1_000 / sample_rate_f;
+            const modulation_limit_ms = @max(
+                minimum_delay_ms,
+                @min(parameters.delay * 2, max_delay_ms),
+            );
+            const max_delay_frames: usize = @intFromFloat(@ceil(
+                modulation_limit_ms * sample_rate_f / 1_000,
+            ));
+            const required_frames = max_delay_frames * @as(usize, parameters.feedback) + 1;
+            const current_frames = self.dry_history.len / 2;
+            if (required_frames <= current_frames) return;
+
+            const next_history = try allocator.alloc(f32, required_frames * 2);
+            @memset(next_history, 0);
+
+            // Rebase samples by age so a larger ring preserves the current echo tail.
+            if (current_frames != 0) {
+                for (1..current_frames + 1) |age| {
+                    const previous_frame = (self.history_cursor + current_frames -
+                        (age % current_frames)) % current_frames;
+                    const next_frame = (required_frames - (age % required_frames)) % required_frames;
+                    @memcpy(
+                        next_history[next_frame * 2 ..][0..2],
+                        self.dry_history[previous_frame * 2 ..][0..2],
+                    );
+                }
+                allocator.free(self.dry_history);
+            }
+
+            self.dry_history = next_history;
+            self.history_cursor = 0;
+        }
+
+        /// Renders wet-only output by summing the requested delayed dry copies.
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+            const state = &dsp.nodes.items(.state)[node.idx].delay;
+            const parameters = state.parameters;
+            const input_outlets = dsp.nodes.items(.inputs)[node.idx];
+            if (input_outlets[0].isNoop()) return;
+
+            const output = into[0];
+            const dry = try dsp.getOutput(input_outlets[0], output.sample_count);
+            const wetness = if (!input_outlets[1].isNoop())
+                try dsp.getOutput(input_outlets[1], output.sample_count)
+            else
+                null;
+            const delay = if (!input_outlets[2].isNoop())
+                try dsp.getOutput(input_outlets[2], output.sample_count)
+            else
+                null;
+
+            const frame_capacity = state.dry_history.len / 2;
+            assert(frame_capacity != 0);
+            assert(output.sample_count % 2 == 0);
+            const frame_count: usize = @intCast(output.sample_count / 2);
+            const sample_rate_f: f32 = @floatFromInt(sample_rate);
+            const minimum_delay_ms = 1_000 / sample_rate_f;
+            const modulation_limit_ms = @max(
+                minimum_delay_ms,
+                @min(parameters.delay * 2, max_delay_ms),
+            );
+            const repeat_count: usize = @intCast(parameters.feedback);
+
+            for (0..frame_count) |frame| {
+                const sample_index = frame * 2;
+                const raw_delay_ms = if (delay) |buffer|
+                    buffer.samples[sample_index]
+                else
+                    parameters.delay;
+                const requested_delay_ms = if (std.math.isFinite(raw_delay_ms))
+                    raw_delay_ms
+                else
+                    parameters.delay;
+                const clamped_delay_ms = @max(
+                    minimum_delay_ms,
+                    @min(modulation_limit_ms, requested_delay_ms),
+                );
+                const delay_frames = clamped_delay_ms * sample_rate_f / 1_000;
+
+                // Store the dry frame before reading older frames from the ring.
+                @memcpy(
+                    state.dry_history[state.history_cursor * 2 ..][0..2],
+                    dry.samples[sample_index..][0..2],
+                );
+
+                var wet_sample: @Vector(2, f32) = @splat(0);
+                var copy_level: f32 = 1;
+                for (1..repeat_count + 1) |copy_index| {
+                    const age = delay_frames * @as(f32, @floatFromInt(copy_index));
+                    const older_age: usize = @intFromFloat(@floor(age));
+                    const fraction = age - @as(f32, @floatFromInt(older_age));
+                    const newer = state.readStereoHistory(older_age, frame_capacity);
+                    const delayed = if (fraction == 0)
+                        newer
+                    else blk: {
+                        const older = state.readStereoHistory(older_age + 1, frame_capacity);
+                        break :blk newer + (older - newer) * @as(@Vector(2, f32), @splat(fraction));
+                    };
+                    wet_sample += delayed * @as(@Vector(2, f32), @splat(copy_level));
+                    copy_level *= parameters.decay;
+                }
+
+                const raw_wetness: @Vector(2, f32) = if (wetness) |buffer|
+                    @bitCast(buffer.samples[sample_index..][0..2].*)
+                else
+                    @splat(parameters.wetness);
+                var finite_wetness: @Vector(2, f32) = undefined;
+                inline for (0..2) |channel| {
+                    const channel_wetness = raw_wetness[channel];
+                    finite_wetness[channel] = if (std.math.isFinite(channel_wetness))
+                        channel_wetness
+                    else
+                        parameters.wetness;
+                }
+                const wet_level = @max(
+                    @as(@Vector(2, f32), @splat(0)),
+                    @min(@as(@Vector(2, f32), @splat(1)), finite_wetness),
+                );
+                output.samples[sample_index..][0..2].* = @bitCast(wet_sample * wet_level);
+
+                state.history_cursor = (state.history_cursor + 1) % frame_capacity;
+            }
+        }
+
+        /// Reads both stored channels at an integer frame age from the cursor.
+        fn readStereoHistory(self: *const Delay, age: usize, frame_capacity: usize) @Vector(2, f32) {
+            assert(age < frame_capacity);
+            const frame = (self.history_cursor + frame_capacity - age % frame_capacity) % frame_capacity;
+            return @bitCast(self.dry_history[frame * 2 ..][0..2].*);
+        }
+    };
+
     /// Reduces sample rate and bit depth to create a lo-fi effect.
     pub const BitCrusher = struct {
         /// Port metadata for the bit-crusher node.
@@ -3182,7 +3448,7 @@ pub const Node = struct {
             };
         }
 
-        fn initialize(dsp: *DSP, node: Index) InitializeError!void {
+        fn initialize(dsp: *DSP, node: Index, _: std.mem.Allocator) InitializeError!void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
             if (state.parameters.device < 0) return;
 
@@ -3209,7 +3475,7 @@ pub const Node = struct {
             state.stream = midi_stream;
         }
 
-        fn deinitialize(dsp: *DSP, node: Index) void {
+        fn deinitialize(dsp: *DSP, node: Index, _: std.mem.Allocator) void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
             if (state.stream) |midi_stream| {
                 midi_stream.close() catch {};
@@ -3301,6 +3567,7 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .noop = Node.Noop.metadata,
         .oscillator = Node.Oscillator.metadata,
         .output = Node.Output.metadata,
+        .delay = Node.Delay.metadata,
         .group = Node.Group.metadata,
         .group_input = Node.GroupInput.metadata,
         .group_output = Node.GroupOutput.metadata,

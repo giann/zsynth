@@ -445,6 +445,12 @@ fn parametersToProto(
             .target_sample_rate = value.parameters.target_sample_rate,
             .bit_depth = value.parameters.bit_depth,
         } },
+        .delay => |value| .{ .delay = .{
+            .delay_ms = value.parameters.delay,
+            .wetness = value.parameters.wetness,
+            .feedback = value.parameters.feedback,
+            .decay = value.parameters.decay,
+        } },
         .noise => |value| .{ .noise = .{
             .seed = value.parameters.seed,
             .type = @tagName(value.parameters.type),
@@ -572,6 +578,20 @@ fn nodeFromProto(
             .bit_depth = @intCast(bit_depth),
         });
     }
+    if (std.mem.eql(u8, serialized.kind, "delay")) {
+        const value = try requiredParameters(serialized, .delay);
+        const feedback = value.feedback orelse 4;
+        if (feedback > std.math.maxInt(u8)) return error.InvalidNodeParameters;
+        const parameters = DSP.Node.Delay.Parameters{
+            .delay = value.delay_ms orelse 250,
+            .wetness = value.wetness orelse 0.5,
+            .feedback = @intCast(feedback),
+            .decay = value.decay orelse 0.5,
+        };
+        if (!DSP.Node.Delay.parametersAreValid(parameters))
+            return error.InvalidNodeParameters;
+        return DSP.Node.Delay.create(name, parameters);
+    }
     if (std.mem.eql(u8, serialized.kind, "noise")) {
         const value = try requiredParameters(serialized, .noise);
         return DSP.Node.Noise.create(name, .{
@@ -665,6 +685,7 @@ fn validateDocument(document: P.SynthDocument) !void {
                 .adsr,
                 .multimode_filter,
                 .bit_crusher,
+                .delay,
                 .noise,
                 .midi,
                 => try validateNodeParameters(node, tag),
@@ -822,6 +843,19 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
         .bit_crusher => {
             const value = try requiredParameters(node, .bit_crusher);
             if ((value.bit_depth orelse 8) > std.math.maxInt(u5))
+                return error.InvalidNodeParameters;
+        },
+        .delay => {
+            const value = try requiredParameters(node, .delay);
+            const feedback = value.feedback orelse 4;
+            if (feedback > std.math.maxInt(u8)) return error.InvalidNodeParameters;
+            const parameters = DSP.Node.Delay.Parameters{
+                .delay = value.delay_ms orelse 250,
+                .wetness = value.wetness orelse 0.5,
+                .feedback = @intCast(feedback),
+                .decay = value.decay orelse 0.5,
+            };
+            if (!DSP.Node.Delay.parametersAreValid(parameters))
                 return error.InvalidNodeParameters;
         },
         .noise => {

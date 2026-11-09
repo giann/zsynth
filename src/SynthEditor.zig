@@ -1405,6 +1405,7 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
         .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
         .constant => |value| DSP.Node.Constant.create(source_name, value.parameters),
+        .delay => |value| DSP.Node.Delay.create(source_name, value.parameters),
         .keyboard => |value| DSP.Node.Keyboard.create(source_name, value.parameters),
         .mixer => |value| DSP.Node.Mixer.create(source_name, value.parameters),
         .monophonic_sequencer => |value| DSP.Node.MonophonicSequencer.create(source_name, value.parameters),
@@ -1781,6 +1782,25 @@ fn commitParameterLocked(context: *ParameterEditor.CommitContext) void {
     }
 
     const state = &self.dsp.nodes.items(.state)[active.node.idx];
+    if (state.* == .delay) {
+        const delay = &state.delay;
+        var next_parameters = delay.parameters;
+        if (!assignReflectedParameter(
+            &next_parameters,
+            active.field_name,
+            active.array_index,
+            self.parameter_editor.text_field.inputSlice(),
+        ) or !DSP.Node.Delay.parametersAreValid(next_parameters))
+            return;
+
+        // Parameter commits run under the graph lock on the UI thread, so any
+        // required growth stays outside the real-time audio callback.
+        delay.ensureHistoryCapacity(self.serializer.allocator, next_parameters) catch return;
+        delay.parameters = next_parameters;
+        context.accepted = true;
+        return;
+    }
+
     switch (state.*) {
         inline else => |*node_state| {
             if (@hasField(@TypeOf(node_state.*), "parameters"))
@@ -3174,6 +3194,7 @@ pub const CommandPalette = struct {
                 .default_resonance = 0,
             }),
             .bit_crusher => DSP.Node.BitCrusher.create(name, .{}),
+            .delay => DSP.Node.Delay.create(name, .{}),
             .noise => DSP.Node.Noise.create(name, .{
                 .seed = 0,
             }),

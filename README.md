@@ -20,6 +20,7 @@ and effects to be composed into a real-time sound pipeline.
 - Utility nodes: Add, Multiply, Constant
 - Keyboard
 - MIDI input
+- Delay
 
 ## TODO
 
