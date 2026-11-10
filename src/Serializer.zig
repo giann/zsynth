@@ -142,6 +142,8 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             .x = self.space.nodePosition(.{ .idx = index }).x,
             .y = self.space.nodePosition(.{ .idx = index }).y,
         };
+        const polyphony = self.dsp.nodes.items(.polyphony)[index];
+        if (polyphony > 1) node.polyphony = polyphony;
 
         if (std.meta.activeTag(state) == .group) {
             const group = state.group;
@@ -247,6 +249,8 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         const node = try nodeFromProto(self, serialized, name);
         const actual = try self.dsp.addNode(self.allocator, node);
         std.debug.assert(actual.idx == index);
+        if (serialized.polyphony) |polyphony|
+            try self.dsp.setNodePolyphony(self.allocator, actual, @intCast(polyphony));
         try self.space.addNode(self.allocator, actual, .{
             .x = serialized.x,
             .y = serialized.y,
@@ -285,6 +289,13 @@ pub fn load(self: *Serializer, path: []const u8) !void {
             try self.space.addNode(self.allocator, endpoints.input_nodes[port], position);
             try self.space.addNode(self.allocator, endpoints.output_nodes[port], position);
         }
+    }
+
+    // Saved endpoint nodes are added individually, so prepare their per-voice
+    // caches after the complete group membership and endpoint tables exist.
+    for (self.dsp.nodes.items(.state), 0..) |state, group_index| {
+        if (state == .group)
+            try self.dsp.prepareGroupVoiceStorage(self.allocator, .{ .idx = group_index });
     }
 
     self.dsp.output = .{ .idx = @intCast(document.output_node) };
@@ -678,6 +689,14 @@ fn validateDocument(document: P.SynthDocument) !void {
 
         const tag = std.meta.stringToEnum(DSP.Node.Tag, node.kind) orelse
             return error.UnknownNodeKind;
+        if (node.polyphony) |polyphony| {
+            if (polyphony == 0 or polyphony > DSP.max_polyphony)
+                return error.InvalidNodeParameters;
+            switch (tag) {
+                .group, .group_input, .group_output, .noop, .output => if (polyphony > 1) return error.InvalidNodeParameters,
+                else => {},
+            }
+        }
         const metadata = DSP.node_metadata.get(tag);
         if (index != 0) {
             switch (tag) {

@@ -22,6 +22,7 @@ message Node {
   repeated GroupBinding group_outputs = 9;
   optional uint32 group_owner = 20;
   optional uint32 group_port = 21;
+  optional uint32 polyphony = 24;
 
   oneof parameters {
     ConstantParameters constant = 10;

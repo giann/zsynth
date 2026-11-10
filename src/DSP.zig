@@ -21,6 +21,8 @@ pub const AudioError = pa.Error || error{InvalidDevice};
 pub const block_size = 64;
 /// Maximum number of input or output ports exposed by a node.
 pub const max_outlets = 8;
+/// Maximum number of parallel voices the graph can render.
+pub const max_polyphony = 8;
 /// Maximum number of ordinary nodes that one non-nested group may contain.
 pub const max_group_members = 16;
 /// Errors returned while constructing a group's fixed endpoint nodes.
@@ -61,6 +63,8 @@ graph_mutex: std.atomic.Mutex = .unlocked,
 
 /// Generation of the currently rendered audio block.
 render_generation: u64 = 0,
+/// Voice index currently being evaluated by the recursive graph renderer.
+render_voice: u8 = 0,
 
 /// PortAudio output stream, opened when playback starts.
 audio_stream: ?*pa.Stream = null,
@@ -100,9 +104,12 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
     self.lockGraph();
     defer self.unlockGraph();
     // Release node-owned device streams before freeing their node state.
-    for (self.nodes.items(.deinitialize), 0..) |deinitialize, index|
+    for (self.nodes.items(.deinitialize), 0..) |deinitialize, index| {
+        const node = Node.Index{ .idx = index };
+        self.releaseVoiceStorage(node, gpa);
         if (deinitialize) |callback|
-            callback(self, .{ .idx = index }, gpa);
+            callback(self, node, 0, gpa);
+    }
     for (self.nodes.items(.sample_tap)) |*sample_tap|
         sample_tap.queue.deinit(gpa);
     // Release all node storage using the allocator supplied at init time.
@@ -117,8 +124,9 @@ pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
     while (self.nodes.len > 1) {
         const index = self.nodes.len - 1;
         // Graph replacement must close external resources before dropping nodes.
+        self.releaseVoiceStorage(.{ .idx = index }, gpa);
         if (self.nodes.items(.deinitialize)[index]) |deinitialize|
-            deinitialize(self, .{ .idx = index }, gpa);
+            deinitialize(self, .{ .idx = index }, 0, gpa);
         self.nodes.items(.sample_tap)[index].queue.deinit(gpa);
         _ = self.nodes.pop();
     }
@@ -207,6 +215,7 @@ pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) pm.Er
     const previous_stream = state.stream;
     state.stream = next_stream;
     state.parameters.device = device_id;
+    for (&state.held) |*held| held.gate = 0;
     self.unlockGraph();
 
     // The callback can only have held the old pointer before the locked swap.
@@ -524,6 +533,12 @@ fn syncGroupInputLocked(self: *DSP, group: Node.Index, group_port: u8) void {
     const child_input = &self.nodes.items(.inputs)[binding.node.idx][binding.port];
     if (!child_input.isNoop())
         self.nodes.items(.output_connected)[child_input.node.idx][child_input.output_port] = false;
+    const group_input = self.nodes.items(.inputs)[group.idx][group_port];
+    if (group_input.isNoop()) {
+        // Preserve the child's own defaults until this group port has a source.
+        child_input.* = .{};
+        return;
+    }
     child_input.* = .{
         .node = group_state.input_nodes[group_port],
         .output_port = 0,
@@ -727,8 +742,9 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
     self.lockGraph();
     defer self.unlockGraph();
 
+    self.releaseVoiceStorage(node, gpa);
     if (self.nodes.items(.deinitialize)[node.idx]) |deinitialize|
-        deinitialize(self, node, gpa);
+        deinitialize(self, node, 0, gpa);
 
     const last_index = self.nodes.len - 1;
     const removing_output = self.output.idx == node.idx;
@@ -856,19 +872,20 @@ pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) 
 
     var input_nodes: [max_outlets]Node.Index = @splat(.noop);
     var output_nodes: [max_outlets]Node.Index = @splat(.noop);
+    const group_voice_capacity = self.groupVoiceCapacity(group);
     for (0..max_outlets) |port| {
         try self.nodes.append(gpa, Node.GroupInput.create("group input", group, @intCast(port)));
         const input_index = self.nodes.len - 1;
-        errdefer _ = self.nodes.pop();
         self.nodes.items(.sample_tap)[input_index].queue =
             try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
+        try self.ensureCacheCapacity(gpa, .{ .idx = input_index }, group_voice_capacity);
         input_nodes[port] = .{ .idx = input_index };
 
         try self.nodes.append(gpa, Node.GroupOutput.create("group output", group, @intCast(port)));
         const output_index = self.nodes.len - 1;
-        errdefer _ = self.nodes.pop();
         self.nodes.items(.sample_tap)[output_index].queue =
             try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
+        try self.ensureCacheCapacity(gpa, .{ .idx = output_index }, group_voice_capacity);
         output_nodes[port] = .{ .idx = output_index };
     }
     self.nodes.items(.state)[group.idx].group.input_nodes = input_nodes;
@@ -876,7 +893,12 @@ pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) 
 }
 
 /// Adds one ordinary node to a non-nested group's member table.
-pub fn addGroupMember(self: *DSP, group: Node.Index, member: Node.Index) bool {
+pub fn addGroupMember(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    group: Node.Index,
+    member: Node.Index,
+) bool {
     self.lockGraph();
     defer self.unlockGraph();
     if (group.idx == member.idx) return false;
@@ -889,10 +911,43 @@ pub fn addGroupMember(self: *DSP, group: Node.Index, member: Node.Index) bool {
     if (state.member_count >= max_group_members) return false;
     for (state.members[0..state.member_count]) |existing|
         if (existing.idx == member.idx) return true;
+    const capacity = @max(
+        self.groupVoiceCapacity(group),
+        self.nodes.items(.polyphony)[member.idx],
+    );
+    self.ensureCacheCapacity(gpa, group, capacity) catch return false;
+    for (state.input_nodes) |endpoint|
+        if (!endpoint.isNoop())
+            self.ensureCacheCapacity(gpa, endpoint, capacity) catch return false;
+    for (state.output_nodes) |endpoint|
+        if (!endpoint.isNoop())
+            self.ensureCacheCapacity(gpa, endpoint, capacity) catch return false;
     state.members[state.member_count] = member;
     state.member_count += 1;
     self.rebuildGroupSubgraphHashLocked(group);
     return true;
+}
+
+/// Ensures a loaded group's cache and serialized boundary endpoints match its members' voices.
+pub fn prepareGroupVoiceStorage(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    group: Node.Index,
+) std.mem.Allocator.Error!void {
+    assert(group.idx < self.nodes.len);
+    self.lockGraph();
+    defer self.unlockGraph();
+    assert(self.nodes.items(.state)[group.idx] == .group);
+
+    const state = self.nodes.items(.state)[group.idx].group;
+    const capacity = self.groupVoiceCapacity(group);
+    try self.ensureCacheCapacity(gpa, group, capacity);
+    for (state.input_nodes) |endpoint|
+        if (!endpoint.isNoop())
+            try self.ensureCacheCapacity(gpa, endpoint, capacity);
+    for (state.output_nodes) |endpoint|
+        if (!endpoint.isNoop())
+            try self.ensureCacheCapacity(gpa, endpoint, capacity);
 }
 
 /// Appends a node and returns its index in the graph.
@@ -902,27 +957,235 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
 
     try self.nodes.append(gpa, node);
     const new_index = self.nodes.len - 1;
-    var sample_tap_initialized = false;
-    errdefer {
-        if (node.deinitialize) |deinitialize|
-            deinitialize(self, .{ .idx = new_index }, gpa);
-        if (sample_tap_initialized)
-            self.nodes.items(.sample_tap)[new_index].queue.deinit(gpa);
-        _ = self.nodes.pop();
-    }
 
     self.nodes.items(.sample_tap)[new_index].queue =
         try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
-    sample_tap_initialized = true;
     if (std.meta.activeTag(self.nodes.items(.state)[new_index]) == .group)
         self.rebuildGroupSubgraphHashLocked(.{ .idx = new_index });
 
     const index = Node.Index{ .idx = new_index };
 
     if (node.initialize) |initialize|
-        try initialize(self, index, gpa);
+        try initialize(self, index, 0, gpa);
+
+    if (std.meta.activeTag(self.nodes.items(.state)[new_index]) == .group)
+        try self.ensureCacheCapacity(gpa, index, self.groupVoiceCapacity(index))
+    else if (node.polyphony > 1)
+        try self.ensureVoiceStorage(gpa, index, node.polyphony);
 
     return index;
+}
+
+/// Errors returned while changing a node's configured voice count.
+pub const PolyphonyError = error{ InvalidNode, InvalidPolyphony, OutOfMemory };
+
+/// Changes one ordinary node's voice limit and prepares its off-thread resources.
+pub fn setNodePolyphony(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    node: Node.Index,
+    count: u8,
+) PolyphonyError!void {
+    assert(node.idx < self.nodes.len);
+    if (count == 0 or count > max_polyphony) return error.InvalidPolyphony;
+
+    self.lockGraph();
+    defer self.unlockGraph();
+
+    const tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    if (tag == .group or tag == .group_input or tag == .group_output or
+        tag == .output or tag == .noop)
+        return error.InvalidNode;
+
+    const previous = self.nodes.items(.polyphony)[node.idx];
+    if (previous == count) return;
+
+    if (count > previous) {
+        self.ensureVoiceStorage(gpa, node, count) catch |err| {
+            if (previous == 1) {
+                self.releaseVoiceStorage(node, gpa);
+            } else {
+                self.releaseAdditionalVoiceStates(node, previous - 1, gpa);
+            }
+            return err;
+        };
+        self.nodes.items(.polyphony)[node.idx] = count;
+        self.ensureParentGroupStorage(gpa, node) catch |err| {
+            self.nodes.items(.polyphony)[node.idx] = previous;
+            if (previous == 1) {
+                self.releaseVoiceStorage(node, gpa);
+                self.refreshGroupStorageAfterShrink(gpa);
+            } else {
+                self.releaseAdditionalVoiceStates(node, previous - 1, gpa);
+            }
+            return err;
+        };
+        self.nodes.items(.state)[node.idx].reset(0);
+        if (node_metadata.get(tag).has_per_voice_state) {
+            const states = self.nodes.items(.additional_states)[node.idx] orelse unreachable;
+            assert(self.nodes.items(.additional_state_count)[node.idx] >= count - 1);
+            for (states[0 .. count - 1], 1..) |*state, voice|
+                state.reset(@intCast(voice));
+        }
+        return;
+    }
+
+    self.nodes.items(.polyphony)[node.idx] = count;
+    if (count == 1) {
+        self.releaseVoiceStorage(node, gpa);
+    } else {
+        self.releaseAdditionalVoiceStates(node, count - 1, gpa);
+    }
+    self.refreshGroupStorageAfterShrink(gpa);
+}
+
+/// Returns the displayed voice count for an ordinary node or a group wrapper.
+pub fn polyphonyForDisplay(self: *const DSP, node: Node.Index) u8 {
+    if (self.nodes.items(.state)[node.idx] == .group)
+        return self.groupVoiceCapacity(node);
+    return self.nodes.items(.polyphony)[node.idx];
+}
+
+/// Allocates fixed-size voice caches and initializes storage for additional voices.
+fn ensureVoiceStorage(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    node: Node.Index,
+    count: u8,
+) std.mem.Allocator.Error!void {
+    assert(count > 1 and count <= max_polyphony);
+    try self.ensureCacheCapacity(gpa, node, count);
+
+    const tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    if (!node_metadata.get(tag).has_per_voice_state) return;
+
+    if (self.nodes.items(.additional_states)[node.idx] == null) {
+        const states = try gpa.create([max_polyphony]Node.State);
+        self.nodes.items(.additional_states)[node.idx] = states;
+    }
+    const states = self.nodes.items(.additional_states)[node.idx].?;
+    while (self.nodes.items(.additional_state_count)[node.idx] < count - 1) {
+        const voice = self.nodes.items(.additional_state_count)[node.idx] + 1;
+        var fresh = self.nodes.items(.state)[node.idx];
+        if (fresh == .delay)
+            // A delay voice owns its history buffer, so never inherit the source slice.
+            fresh.delay.dry_history = &.{};
+        fresh.reset(voice);
+        states[voice - 1] = fresh;
+        self.nodes.items(.additional_state_count)[node.idx] += 1;
+        if (self.nodes.items(.initialize_voice)[node.idx]) |initialize|
+            initialize(self, node, voice, gpa) catch |err| {
+                if (self.nodes.items(.deinitialize)[node.idx]) |deinitialize|
+                    deinitialize(self, node, voice, gpa);
+                self.nodes.items(.additional_state_count)[node.idx] -= 1;
+                return err;
+            };
+    }
+}
+
+/// Allocates a node's extra cache array when its effective capacity exceeds one.
+fn ensureCacheCapacity(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    node: Node.Index,
+    count: u8,
+) std.mem.Allocator.Error!void {
+    assert(count >= 1 and count <= max_polyphony);
+    if (count == 1 or self.nodes.items(.additional_caches)[node.idx] != null) return;
+    const caches = try gpa.create([max_polyphony]Node.Cache);
+    for (caches) |*cache| cache.* = .{};
+    self.nodes.items(.additional_caches)[node.idx] = caches;
+}
+
+/// Releases a node's additional caches and deinitializes its extra voice states.
+fn releaseVoiceStorage(self: *DSP, node: Node.Index, gpa: std.mem.Allocator) void {
+    if (self.nodes.items(.additional_states)[node.idx]) |states| {
+        self.releaseAdditionalVoiceStates(node, 0, gpa);
+        gpa.destroy(states);
+        self.nodes.items(.additional_states)[node.idx] = null;
+        self.nodes.items(.additional_state_count)[node.idx] = 0;
+    }
+
+    if (self.nodes.items(.additional_caches)[node.idx]) |caches| {
+        gpa.destroy(caches);
+        self.nodes.items(.additional_caches)[node.idx] = null;
+    }
+}
+
+/// Deinitializes removed extra voices without disturbing retained voices.
+fn releaseAdditionalVoiceStates(
+    self: *DSP,
+    node: Node.Index,
+    keep_count: u8,
+    gpa: std.mem.Allocator,
+) void {
+    if (self.nodes.items(.additional_states)[node.idx] == null) return;
+    const state_count = self.nodes.items(.additional_state_count)[node.idx];
+    assert(keep_count <= state_count);
+    if (self.nodes.items(.deinitialize)[node.idx]) |deinitialize|
+        for (keep_count..state_count) |voice_index|
+            deinitialize(self, node, @intCast(voice_index + 1), gpa);
+    self.nodes.items(.additional_state_count)[node.idx] = keep_count;
+}
+
+/// Returns the maximum configured voice capacity among a group's direct members.
+fn groupVoiceCapacity(self: *const DSP, group: Node.Index) u8 {
+    const state = self.nodes.items(.state)[group.idx].group;
+    var count: u8 = 1;
+    for (state.members[0..state.member_count]) |member|
+        count = @max(count, self.nodes.items(.polyphony)[member.idx]);
+    return count;
+}
+
+/// Ensures the containing group's caches can carry a member's new voice count.
+fn ensureParentGroupStorage(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    member: Node.Index,
+) std.mem.Allocator.Error!void {
+    for (self.nodes.items(.state), 0..) |state, group_index| {
+        if (state != .group) continue;
+        var contains_member = false;
+        for (state.group.members[0..state.group.member_count]) |candidate|
+            if (candidate.idx == member.idx) {
+                contains_member = true;
+                break;
+            };
+        if (!contains_member) continue;
+
+        const group = Node.Index{ .idx = group_index };
+        const capacity = self.groupVoiceCapacity(group);
+        try self.ensureCacheCapacity(gpa, group, capacity);
+        for (state.group.input_nodes) |endpoint|
+            if (!endpoint.isNoop())
+                try self.ensureCacheCapacity(gpa, endpoint, capacity);
+        for (state.group.output_nodes) |endpoint|
+            if (!endpoint.isNoop())
+                try self.ensureCacheCapacity(gpa, endpoint, capacity);
+    }
+}
+
+/// Frees derived group caches after all their members have returned to one voice.
+fn refreshGroupStorageAfterShrink(self: *DSP, gpa: std.mem.Allocator) void {
+    for (self.nodes.items(.state), 0..) |state, group_index| {
+        if (state != .group or self.groupVoiceCapacity(.{ .idx = group_index }) > 1) continue;
+        const group = state.group;
+        self.releaseCacheStorage(.{ .idx = group_index }, gpa);
+        for (group.input_nodes) |endpoint|
+            if (!endpoint.isNoop())
+                self.releaseCacheStorage(endpoint, gpa);
+        for (group.output_nodes) |endpoint|
+            if (!endpoint.isNoop())
+                self.releaseCacheStorage(endpoint, gpa);
+    }
+}
+
+/// Releases only a node's extra output and group-input buffers.
+fn releaseCacheStorage(self: *DSP, node: Node.Index, gpa: std.mem.Allocator) void {
+    if (self.nodes.items(.additional_caches)[node.idx]) |caches| {
+        gpa.destroy(caches);
+        self.nodes.items(.additional_caches)[node.idx] = null;
+    }
 }
 
 /// Presses a key on a keyboard node using its atomic voice state.
@@ -972,13 +1235,11 @@ fn stream(self: *DSP, into: []f32) void {
 
     // A new generation invalidates all node caches from the previous block.
     self.render_generation += 1;
-    // Render only the configured output; dependencies are evaluated lazily.
-    self.renderNode(self.output, @intCast(into.len)) catch {
+    // The output node folds parallel voices into its one device-facing buffer.
+    self.renderNode(self.output, 0, @intCast(into.len)) catch {
         @memset(into, 0);
         return;
     };
-
-    // Copy the completed graph output to PortAudio's destination buffer.
     const output_buffer = &self.nodes.items(.cache)[self.output.idx].outputs[0];
     @memcpy(into, output_buffer.samples[0..into.len]);
 }
@@ -999,9 +1260,82 @@ pub fn withGraphLock(self: *DSP, context: anytype, callback: anytype) void {
     callback(context);
 }
 
-/// Evaluates one node and all of its dependencies for the requested sample count.
-fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
-    const cache = &self.nodes.items(.cache)[node.idx];
+/// Returns a node's cache for one voice, using the inline cache for voice zero.
+fn cacheForVoice(self: *DSP, node: Node.Index, voice: u8) *Node.Cache {
+    assert(voice < max_polyphony);
+    if (voice == 0) return &self.nodes.items(.cache)[node.idx];
+    const additional = self.nodes.items(.additional_caches)[node.idx] orelse unreachable;
+    return &additional[voice - 1];
+}
+
+/// Resolves a node's primary state or an additional state by voice index.
+fn stateForVoice(self: *DSP, node: Node.Index, voice: u8) *Node.State {
+    assert(voice < max_polyphony);
+    const tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    if (voice == 0 or !node_metadata.get(tag).has_per_voice_state)
+        return &self.nodes.items(.state)[node.idx];
+    assert(voice <= self.nodes.items(.additional_state_count)[node.idx]);
+    const additional = self.nodes.items(.additional_states)[node.idx] orelse unreachable;
+    return &additional[voice - 1];
+}
+
+/// Returns the concrete runtime state for the voice currently being rendered.
+fn processingState(self: *DSP, node: Node.Index) *Node.State {
+    return self.stateForVoice(node, self.render_voice);
+}
+
+/// Returns the voice count available from one node output port.
+fn outputVoiceCount(self: *DSP, node: Node.Index, port: u8) u8 {
+    const state = self.nodes.items(.state)[node.idx];
+    if (state == .group) {
+        const binding = state.group.output_bindings[port] orelse return 1;
+        return self.effectiveVoiceCount(binding.node);
+    }
+    return self.effectiveVoiceCount(node);
+}
+
+/// Returns the configured and input-limited voice count for one node.
+fn effectiveVoiceCount(self: *DSP, node: Node.Index) u8 {
+    const state = self.nodes.items(.state)[node.idx];
+    switch (state) {
+        .output => {
+            return 1;
+        },
+        .group => {
+            var count: u8 = 1;
+            for (state.group.output_bindings) |binding| {
+                if (binding) |value|
+                    count = @max(count, self.effectiveVoiceCount(value.node));
+            }
+            return count;
+        },
+        .group_input => {
+            const endpoint = state.group_input;
+            const input = self.nodes.items(.inputs)[endpoint.group.idx][endpoint.port];
+            // An unconnected group input supplies silence, but must not cap
+            // the voices of another connected input on the same child node.
+            return if (input.isNoop()) max_polyphony else self.outputVoiceCount(input.node, input.output_port);
+        },
+        .group_output => {
+            const input = self.nodes.items(.inputs)[node.idx][0];
+            return if (input.isNoop()) 1 else self.outputVoiceCount(input.node, input.output_port);
+        },
+        else => {},
+    }
+
+    const metadata = node_metadata.get(std.meta.activeTag(state));
+    var count = self.nodes.items(.polyphony)[node.idx];
+    for (self.nodes.items(.inputs)[node.idx][0..metadata.input_count]) |input| {
+        if (input.isNoop()) continue;
+        count = @min(count, self.outputVoiceCount(input.node, input.output_port));
+    }
+    return count;
+}
+
+/// Evaluates one node voice and its matching input voices for the requested block.
+fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void {
+    assert(voice < self.effectiveVoiceCount(node));
+    const cache = self.cacheForVoice(node, voice);
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
     const output_count = if (node.idx == self.output.idx)
         1
@@ -1047,7 +1381,15 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
         }
     }
 
+    // Parameters are shared by voices; copy them into this voice's runtime
+    // state after parameter links have updated the node's primary state.
+    if (voice > 0 and node_metadata.get(source_tag).has_per_voice_state)
+        self.copyVoiceParameters(node, voice);
+
     // The node recursively requests any connected inputs during processing.
+    const previous_voice = self.render_voice;
+    self.render_voice = voice;
+    defer self.render_voice = previous_voice;
     try self.nodes.items(.process)[node.idx](
         self,
         node,
@@ -1058,21 +1400,54 @@ fn renderNode(self: *DSP, node: Node.Index, sample_count: u32) !void {
     cache.sample_count = sample_count;
     cache.generation = self.render_generation;
 
-    // Publish a bounded, non-blocking copy after processing completes. For the
-    // graph output sink, output zero is the final signal copied to PortAudio.
+    // Each node has one SampleTap; publish its primary voice after rendering.
+    if (voice == 0)
+        self.publishSampleTap(node, voice, outputs[0..], active_sample_count, output_count);
+}
+
+/// Publishes one primary-voice cache to the node's non-blocking sample queue.
+fn publishSampleTap(
+    self: *DSP,
+    node: Node.Index,
+    voice: u8,
+    outputs: []const *Buffer,
+    sample_count: usize,
+    output_count: u8,
+) void {
+    assert(voice == 0);
     const sample_tap = &self.nodes.items(.sample_tap)[node.idx];
     var block: SampleTap.Block = .{
         .samples = undefined,
-        .sample_count = active_sample_count,
+        .sample_count = sample_count,
         .output_count = output_count,
     };
     for (0..@intCast(output_count)) |output_port| {
         @memcpy(
-            block.samples[output_port][0..active_sample_count],
-            outputs[output_port].samples[0..active_sample_count],
+            block.samples[output_port][0..sample_count],
+            outputs[output_port].samples[0..sample_count],
         );
     }
     _ = sample_tap.queue.tryPush(block);
+}
+
+/// Copies shared parameter payloads into one stateful voice without changing its DSP history.
+fn copyVoiceParameters(self: *DSP, node: Node.Index, voice: u8) void {
+    const primary = self.nodes.items(.state)[node.idx];
+    const additional = self.nodes.items(.additional_states)[node.idx] orelse unreachable;
+    const destination = &additional[voice - 1];
+    switch (primary) {
+        inline else => |source_state| {
+            if (@hasField(@TypeOf(source_state), "parameters")) {
+                switch (destination.*) {
+                    inline else => |*destination_state| {
+                        if (@TypeOf(source_state) == @TypeOf(destination_state.*) and
+                            @hasField(@TypeOf(destination_state.*), "parameters"))
+                            destination_state.parameters = source_state.parameters;
+                    },
+                }
+            }
+        },
+    }
 }
 
 /// Copies parameter payloads between corresponding members of linked groups.
@@ -1109,9 +1484,9 @@ fn getOutput(
     sample_count: u32,
 ) !*Buffer {
     // Rendering is cached, so repeated requests for this source are cheap.
-    try self.renderNode(connection.node, sample_count);
+    try self.renderNode(connection.node, self.render_voice, sample_count);
 
-    return &self.nodes.items(.cache)[connection.node.idx].outputs[
+    return &self.cacheForVoice(connection.node, self.render_voice).outputs[
         @intCast(connection.output_port)
     ];
 }
@@ -1219,13 +1594,23 @@ pub const Node = struct {
     inputs: [max_outlets]Connection = @splat(.{}),
     /// Whether each output port is connected to a destination input.
     output_connected: [max_outlets]bool = @splat(false),
+    /// Configured voice limit for this node; group and output wrappers derive theirs.
+    polyphony: u8 = 1,
     /// Per-generation output cache.
     cache: Cache = .{},
+    /// Lazily allocated caches for voices after the inline first voice.
+    additional_caches: ?*[max_polyphony]Cache = null,
+    /// Per-voice copies of persistent DSP state for stateful node kinds.
+    additional_states: ?*[max_polyphony]State = null,
+    /// Number of initialized entries in `additional_states`.
+    additional_state_count: u8 = 0,
     /// Main-thread-readable history of this node's rendered outputs.
     sample_tap: SampleTap = .{},
     /// Function used to render this node's outputs.
     process: Process,
     initialize: ?Initialize = null,
+    /// Allocates resources owned separately by each additional voice.
+    initialize_voice: ?VoiceInitialize = null,
     deinitialize: ?Deinitialize = null,
     /// Reciprocal parameter source and target links.
     parameter_link: ParameterLink = .{},
@@ -1286,6 +1671,16 @@ pub const Node = struct {
         group_input: GroupInput,
         group_output: GroupOutput,
         midi: MIDI,
+
+        /// Resets the active node payload while preserving its configuration.
+        pub fn reset(self: *State, voice: u8) void {
+            switch (self.*) {
+                inline else => |*node_state| {
+                    if (comptime @hasDecl(@TypeOf(node_state.*), "reset"))
+                        node_state.reset(voice);
+                },
+            }
+        }
     };
 
     /// Reciprocal one-to-one parameter relationships for a node.
@@ -1325,6 +1720,8 @@ pub const Node = struct {
         color: Display.Color,
         /// Whether this node exposes a parameter payload that can be linked.
         has_parameters: bool = false,
+        /// Whether the node needs separate DSP state for each graph voice.
+        has_per_voice_state: bool = false,
         /// Whether the editor exposes parameter-link outlets for this node.
         can_link_parameters: bool = true,
         inputs: [max_outlets]OutletMetadata = @splat(.{}),
@@ -1390,16 +1787,25 @@ pub const Node = struct {
         outputs: []const *Buffer,
     ) ProcessError!void;
     pub const InitializeError = error{OutOfMemory} || pm.Error;
-    /// Called once when a node is added to the graph.
+    /// Initializes node-level resources when the node is added to the graph.
     pub const Initialize = *const fn (
         dsp: *DSP,
         node: Index,
+        voice: u8,
         allocator: std.mem.Allocator,
     ) InitializeError!void;
-    /// Releases any node-owned resources before the node is removed.
+    /// Initializes allocator-owned resources for an additional node voice.
+    pub const VoiceInitialize = *const fn (
+        dsp: *DSP,
+        node: Index,
+        voice: u8,
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error!void;
+    /// Releases resources owned by one node voice before it is discarded.
     pub const Deinitialize = *const fn (
         dsp: *DSP,
         node: Index,
+        voice: u8,
         allocator: std.mem.Allocator,
     ) void;
 
@@ -1492,7 +1898,7 @@ pub const Node = struct {
             };
         }
 
-        /// Copies the connected source buffer into the output buffer.
+        /// Combines the connected source voices into the device-facing buffer.
         fn process(
             dsp: *DSP,
             node: Index,
@@ -1504,12 +1910,19 @@ pub const Node = struct {
             // An unconnected output remains silent after the renderer's clear.
             if (input.isNoop()) return;
 
-            // Render the source at the same size, then copy its valid samples.
-            const source = try dsp.getOutput(input, into[0].sample_count);
-            @memcpy(
-                into[0].samples[0..into[0].sample_count],
-                source.samples[0..source.sample_count],
-            );
+            // Render each available source voice and combine them for the device.
+            @memset(into[0].samples[0..into[0].sample_count], 0);
+            const voice_count = dsp.outputVoiceCount(input.node, input.output_port);
+            for (0..voice_count) |voice| {
+                try dsp.renderNode(input.node, @intCast(voice), into[0].sample_count);
+                const source = &dsp.cacheForVoice(input.node, @intCast(voice)).outputs[
+                    @intCast(input.output_port)
+                ];
+                for (
+                    into[0].samples[0..into[0].sample_count],
+                    source.samples[0..source.sample_count],
+                ) |*sample, voice_sample| sample.* += voice_sample;
+            }
         }
     };
 
@@ -1560,7 +1973,8 @@ pub const Node = struct {
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
-            const cache = &dsp.nodes.items(.cache)[node.idx];
+            const voice = dsp.render_voice;
+            const cache = dsp.cacheForVoice(node, voice);
             const group_inputs = dsp.nodes.items(.inputs)[node.idx];
 
             // Materialize each external group input in fixed storage before
@@ -1570,6 +1984,10 @@ pub const Node = struct {
                 const buffer = &cache.input_buffers[port];
                 buffer.sample_count = into[0].sample_count;
                 if (input.isNoop()) {
+                    @memset(buffer.samples[0..buffer.sample_count], 0);
+                    continue;
+                }
+                if (voice >= dsp.outputVoiceCount(input.node, input.output_port)) {
                     @memset(buffer.samples[0..buffer.sample_count], 0);
                     continue;
                 }
@@ -1583,8 +2001,9 @@ pub const Node = struct {
             const state = dsp.nodes.items(.state)[node.idx].group;
             for (state.output_bindings, 0..) |binding, port| {
                 const selected = binding orelse continue;
-                try dsp.renderNode(selected.node, into[0].sample_count);
-                const source = &dsp.nodes.items(.cache)[selected.node.idx].outputs[selected.port];
+                if (voice >= dsp.outputVoiceCount(selected.node, selected.port)) continue;
+                try dsp.renderNode(selected.node, voice, into[port].sample_count);
+                const source = &dsp.cacheForVoice(selected.node, voice).outputs[selected.port];
                 @memcpy(
                     into[port].samples[0..into[port].sample_count],
                     source.samples[0..source.sample_count],
@@ -1619,7 +2038,7 @@ pub const Node = struct {
         /// Copies the owning group's materialized input buffer.
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             const state = dsp.nodes.items(.state)[node.idx].group_input;
-            const source = &dsp.nodes.items(.cache)[state.group.idx].input_buffers[state.port];
+            const source = &dsp.cacheForVoice(state.group, dsp.render_voice).input_buffers[state.port];
             @memcpy(into[0].samples[0..source.sample_count], source.samples[0..source.sample_count]);
         }
     };
@@ -1893,8 +2312,6 @@ pub const Node = struct {
 
     /// Emits up to eight simultaneously held keyboard notes as frequencies.
     pub const Keyboard = struct {
-        /// Number of independent frequency and gate voice pairs.
-        pub const voice_count = 4;
         /// Sentinel MIDI value used before a voice has played a note.
         const empty_pitch: u8 = std.math.maxInt(u8);
 
@@ -1906,17 +2323,17 @@ pub const Node = struct {
             .has_parameters = true,
             .can_link_parameters = false,
             .outputs = .{
-                .{ .name = "frequency 1", .short_name = "freq1", .unit = "Hz", .color = .feijoa },
-                .{ .name = "gate 1", .short_name = "gate1", .color = .feijoa },
-                .{ .name = "frequency 2", .short_name = "freq2", .unit = "Hz", .color = .feijoa },
-                .{ .name = "gate 2", .short_name = "gate2", .color = .feijoa },
-                .{ .name = "frequency 3", .short_name = "freq3", .unit = "Hz", .color = .feijoa },
-                .{ .name = "gate 3", .short_name = "gate3", .color = .feijoa },
-                .{ .name = "frequency 4", .short_name = "freq4", .unit = "Hz", .color = .feijoa },
-                .{ .name = "gate 4", .short_name = "gate4", .color = .feijoa },
+                .{ .name = "Frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
+                .{ .name = "Gate", .short_name = "gate", .color = .feijoa },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
             },
             .input_count = 0,
-            .output_count = voice_count * 2,
+            .output_count = 2,
         };
 
         /// User-controlled octave of the lower keyboard row.
@@ -1928,9 +2345,9 @@ pub const Node = struct {
         /// Configuration copied at creation time.
         parameters: Parameters,
         /// SDL keycode assigned to each voice, or unknown for an unused voice.
-        voice_keys: [voice_count]std.atomic.Value(u32) = @splat(.{ .raw = 0 }),
+        voice_keys: [max_polyphony]std.atomic.Value(u32) = @splat(.{ .raw = 0 }),
         /// Last MIDI pitch assigned to each voice, or empty_pitch if unused.
-        voice_pitches: [voice_count]std.atomic.Value(u8) = @splat(.{ .raw = empty_pitch }),
+        voice_pitches: [max_polyphony]std.atomic.Value(u8) = @splat(.{ .raw = empty_pitch }),
 
         /// Creates a keyboard node with all voices released.
         pub fn create(name: []const u8, parameters: Parameters) Node {
@@ -1948,7 +2365,7 @@ pub const Node = struct {
             const pitch = self.pitchForKey(key) orelse return false;
             if (self.voiceForKey(key) != null) return true;
 
-            for (0..voice_count) |voice| {
+            for (0..max_polyphony) |voice| {
                 if (self.voice_keys[voice].load(.acquire) == @backingInt(sdl.Keycode.unknown)) {
                     self.voice_pitches[voice].store(@intCast(pitch), .release);
                     self.voice_keys[voice].store(@backingInt(key), .release);
@@ -1969,6 +2386,13 @@ pub const Node = struct {
         pub fn releaseAll(self: *Keyboard) void {
             for (&self.voice_keys) |*voice|
                 voice.store(@backingInt(sdl.Keycode.unknown), .release);
+        }
+
+        /// Releases held notes and clears their remembered pitches.
+        pub fn reset(self: *Keyboard, _: u8) void {
+            self.releaseAll();
+            for (&self.voice_pitches) |*pitch|
+                pitch.store(empty_pitch, .release);
         }
 
         /// Returns the voice assigned to a key, if it is currently held.
@@ -2024,35 +2448,29 @@ pub const Node = struct {
             );
         }
 
-        /// Fills one frequency and one gate output for every voice.
+        /// Emits the frequency and gate belonging to the currently rendered voice.
         fn process(
             dsp: *DSP,
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].keyboard;
-            for (0..voice_count) |voice| {
-                const raw_key = state.voice_keys[voice].load(.acquire);
-                const raw_pitch = state.voice_pitches[voice].load(.acquire);
-                const pitch = if (raw_key != @backingInt(sdl.Keycode.unknown))
-                    state.pitchForKey(@fromBackingInt(@intCast(raw_key))) orelse
-                        if (raw_pitch != empty_pitch) @as(u7, @intCast(raw_pitch)) else null
-                else if (raw_pitch != empty_pitch)
-                    @as(u7, @intCast(raw_pitch))
-                else
-                    null;
-                const sample = if (pitch) |value| frequency(value) else 0;
-                const frequency_output = voice * 2;
-                const gate_output = frequency_output + 1;
-                @memset(
-                    into[frequency_output].samples[0..into[frequency_output].sample_count],
-                    sample,
-                );
-                @memset(
-                    into[gate_output].samples[0..into[gate_output].sample_count],
-                    if (raw_key == @backingInt(sdl.Keycode.unknown)) 0 else 1,
-                );
-            }
+            const voice = dsp.render_voice;
+            const raw_key = state.voice_keys[voice].load(.acquire);
+            const raw_pitch = state.voice_pitches[voice].load(.acquire);
+            const pitch = if (raw_key != @backingInt(sdl.Keycode.unknown))
+                state.pitchForKey(@fromBackingInt(@intCast(raw_key))) orelse
+                    if (raw_pitch != empty_pitch) @as(u7, @intCast(raw_pitch)) else null
+            else if (raw_pitch != empty_pitch)
+                @as(u7, @intCast(raw_pitch))
+            else
+                null;
+            const sample = if (pitch) |value| frequency(value) else 0;
+            @memset(into[0].samples[0..into[0].sample_count], sample);
+            @memset(
+                into[1].samples[0..into[1].sample_count],
+                if (raw_key == @backingInt(sdl.Keycode.unknown)) 0 else 1,
+            );
         }
     };
 
@@ -2064,6 +2482,7 @@ pub const Node = struct {
             .short_name = "osc",
             .color = .curious_blue,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .inputs = .{
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .curious_blue },
                 .{ .name = "amplitude", .short_name = "amp", .color = .curious_blue },
@@ -2119,6 +2538,12 @@ pub const Node = struct {
         /// Mutable phase accumulator, in radians.
         phase: f32 = 0,
 
+        /// Clears oscillator history while retaining its waveform settings.
+        pub fn reset(self: *Oscillator, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
+
         /// Creates an oscillator with a reset phase accumulator.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -2133,7 +2558,7 @@ pub const Node = struct {
         /// Renders one stereo block, applying optional per-sample modulation.
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             // Load graph connections and persistent oscillator state.
-            const state = &dsp.nodes.items(.state)[node.idx].oscillator;
+            const state = &dsp.processingState(node).oscillator;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const frequency_connection = input_outlets[0];
             const amplitude_connection = input_outlets[1];
@@ -2347,6 +2772,7 @@ pub const Node = struct {
             .short_name = "seq",
             .color = .feijoa,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .can_link_parameters = false,
             .outputs = .{
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
@@ -2384,6 +2810,12 @@ pub const Node = struct {
         /// Last played frequency, retained through gaps and after non-looping playback.
         last_frequency: f32 = 0,
 
+        /// Returns playback state to the beginning and preserves the note sequence.
+        pub fn reset(self: *MonophonicSequencer, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
+
         /// Creates a three-output sequencer with reset playback state.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -2413,7 +2845,7 @@ pub const Node = struct {
             node: Index,
             into: []const *Buffer,
         ) ProcessError!void {
-            const state = &dsp.nodes.items(.state)[node.idx].monophonic_sequencer;
+            const state = &dsp.processingState(node).monophonic_sequencer;
             const parameters = state.parameters;
 
             // Convert one audio frame into musical ticks at the configured tempo.
@@ -2505,6 +2937,7 @@ pub const Node = struct {
             .short_name = "adsr",
             .color = .fuschia_pink,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .inputs = .{
                 .{ .name = "gate", .short_name = "gate", .color = .fuschia_pink },
                 .{ .name = "velocity", .short_name = "vel", .color = .fuschia_pink },
@@ -2584,6 +3017,12 @@ pub const Node = struct {
         /// Velocity latched while the gate is held.
         velocity: f32 = 1,
 
+        /// Returns the envelope to its idle defaults while preserving its settings.
+        pub fn reset(self: *ADSR, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
+
         /// Creates an envelope with an idle runtime state.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -2602,7 +3041,7 @@ pub const Node = struct {
             into: []const *Buffer,
         ) ProcessError!void {
             // Resolve persistent state and the two control inputs.
-            const state = &dsp.nodes.items(.state)[node.idx].adsr;
+            const state = &dsp.processingState(node).adsr;
             const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const gate_connection = input_outlets[0];
@@ -2781,6 +3220,7 @@ pub const Node = struct {
             .short_name = "mmf",
             .color = .havelock_blue,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .havelock_blue },
                 .{ .name = "cutoff", .short_name = "cut", .unit = "Hz", .color = .havelock_blue },
@@ -2833,6 +3273,12 @@ pub const Node = struct {
         /// Band-pass integrator state for left and right channels.
         band: [2]f32 = .{ 0, 0 },
 
+        /// Clears the filter integrators while retaining its response settings.
+        pub fn reset(self: *MultimodeFilter, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
+
         /// Creates a filter with reset integrator state.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -2851,7 +3297,7 @@ pub const Node = struct {
             into: []const *Buffer,
         ) ProcessError!void {
             // Resolve persistent filter state and the three possible inputs.
-            const state = &dsp.nodes.items(.state)[node.idx].multimode_filter;
+            const state = &dsp.processingState(node).multimode_filter;
             const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
 
@@ -2930,6 +3376,15 @@ pub const Node = struct {
         /// Frame slot where the next dry stereo sample is written.
         history_cursor: usize = 0,
 
+        /// Clears delay history while retaining parameters and owned buffer storage.
+        pub fn reset(self: *Delay, _: u8) void {
+            const parameters = self.parameters;
+            const dry_history = self.dry_history;
+            self.* = .{ .parameters = parameters, .dry_history = dry_history };
+            if (dry_history.len != 0)
+                @memset(dry_history, 0);
+        }
+
         /// Maximum delay time supported by one tap, in milliseconds.
         pub const max_delay_ms: f32 = 2_000;
         /// Lowest allowed feedback count.
@@ -2943,6 +3398,7 @@ pub const Node = struct {
             .short_name = "dly",
             .color = .desert,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .can_link_parameters = false,
             .inputs = .{
                 .{ .name = "dry signal", .short_name = "in", .color = .desert },
@@ -2989,6 +3445,7 @@ pub const Node = struct {
                 .name = name,
                 .process = process,
                 .initialize = initialize,
+                .initialize_voice = initialize,
                 .deinitialize = deinitialize,
             };
         }
@@ -3008,15 +3465,16 @@ pub const Node = struct {
         fn initialize(
             dsp: *DSP,
             node: Index,
+            voice: u8,
             allocator: std.mem.Allocator,
-        ) InitializeError!void {
-            const state = &dsp.nodes.items(.state)[node.idx].delay;
+        ) std.mem.Allocator.Error!void {
+            const state = &dsp.stateForVoice(node, voice).delay;
             try state.ensureHistoryCapacity(allocator, state.parameters);
         }
 
         /// Releases the delay history allocated during initialization or growth.
-        fn deinitialize(dsp: *DSP, node: Index, allocator: std.mem.Allocator) void {
-            const state = &dsp.nodes.items(.state)[node.idx].delay;
+        fn deinitialize(dsp: *DSP, node: Index, voice: u8, allocator: std.mem.Allocator) void {
+            const state = &dsp.stateForVoice(node, voice).delay;
             if (state.dry_history.len != 0)
                 allocator.free(state.dry_history);
             state.dry_history = &.{};
@@ -3067,7 +3525,7 @@ pub const Node = struct {
 
         /// Renders a dry/wet blend from the input and its requested delayed copies.
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
-            const state = &dsp.nodes.items(.state)[node.idx].delay;
+            const state = &dsp.processingState(node).delay;
             const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             if (input_outlets[0].isNoop()) return;
@@ -3176,6 +3634,7 @@ pub const Node = struct {
             .short_name = "bcr",
             .color = .desert,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .inputs = .{
                 .{ .name = "audio", .short_name = "in", .color = .desert },
                 .{},
@@ -3213,6 +3672,12 @@ pub const Node = struct {
         /// Number of source frames represented by `last_sample`.
         held_frames: u32 = 0,
 
+        /// Clears the held sample while preserving the reduction settings.
+        pub fn reset(self: *BitCrusher, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
+
         /// Creates a bit crusher with an empty held frame.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -3232,7 +3697,7 @@ pub const Node = struct {
         ) ProcessError!void {
             // Derive quantization and frame-hold settings from the configuration.
             const output = into[0];
-            const state = &dsp.nodes.items(.state)[node.idx].bit_crusher;
+            const state = &dsp.processingState(node).bit_crusher;
             const parameters = state.parameters;
             const levels: f32 = @floatFromInt((@as(u32, 1) << parameters.bit_depth) - 1);
             const frames_to_hold = sample_rate / parameters.target_sample_rate;
@@ -3280,6 +3745,7 @@ pub const Node = struct {
             .short_name = "noi",
             .color = .logan,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .inputs = .{
                 .{ .name = "amplitude", .short_name = "amp", .color = .logan },
                 .{},
@@ -3334,6 +3800,15 @@ pub const Node = struct {
         /// Per-channel integrator state for brown noise.
         brown_state: [2]f32 = .{ 0, 0 },
 
+        /// Resets random and color-filter history with a voice-specific seed.
+        pub fn reset(self: *Noise, voice: u8) void {
+            const parameters = self.parameters;
+            self.* = .{
+                .parameters = parameters,
+                .random = std.Random.DefaultPrng.init(parameters.seed +% voice),
+            };
+        }
+
         /// Creates a deterministic noise source with reset color-filter state.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -3355,7 +3830,7 @@ pub const Node = struct {
             into: []const *Buffer,
         ) ProcessError!void {
             // Resolve persistent generator/filter state and the optional amplitude input.
-            const state = &dsp.nodes.items(.state)[node.idx].noise;
+            const state = &dsp.processingState(node).noise;
             const parameters = state.parameters;
             const amplitude_connection = dsp.nodes.items(.inputs)[node.idx][0];
             const amplitude_buffer = if (amplitude_connection.isNoop())
@@ -3413,6 +3888,16 @@ pub const Node = struct {
     };
 
     pub const MIDI = struct {
+        /// One note's controls, held in a stable voice slot until note-off.
+        pub const Held = struct {
+            /// Pitch converted to frequency in hertz.
+            freq: f32 = 0,
+            /// Whether the note remains held.
+            gate: f32 = 0,
+            /// Normalized MIDI velocity for the held note.
+            velocity: f32 = 0,
+        };
+
         pub const metadata = Node.Metadata{
             .name = "MIDI",
             .short_name = "midi",
@@ -3442,9 +3927,17 @@ pub const Node = struct {
         parameters: Parameters,
         /// Opened input stream, absent when the saved device is unavailable.
         stream: ?*pm.MidiStream = null,
-        held_freq: f32 = 0,
-        held_gate: f32 = 0,
-        held_velocity: f32 = 0,
+        /// Active MIDI notes indexed by the voice slot sent to downstream nodes.
+        held: [max_polyphony]Held = @splat(.{}),
+        /// Generation in which this node last polled its input stream.
+        last_event_generation: u64 = std.math.maxInt(u64),
+
+        /// Clears held notes while keeping the open MIDI input stream.
+        pub fn reset(self: *MIDI, _: u8) void {
+            const parameters = self.parameters;
+            const midi_stream = self.stream;
+            self.* = .{ .parameters = parameters, .stream = midi_stream };
+        }
 
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -3458,8 +3951,8 @@ pub const Node = struct {
             };
         }
 
-        fn initialize(dsp: *DSP, node: Index, _: std.mem.Allocator) InitializeError!void {
-            const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
+        fn initialize(dsp: *DSP, node: Index, voice: u8, _: std.mem.Allocator) InitializeError!void {
+            const state: *MIDI = &dsp.stateForVoice(node, voice).midi;
             if (state.parameters.device < 0) return;
 
             // Device indices can become stale between saving and loading a graph.
@@ -3485,8 +3978,8 @@ pub const Node = struct {
             state.stream = midi_stream;
         }
 
-        fn deinitialize(dsp: *DSP, node: Index, _: std.mem.Allocator) void {
-            const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
+        fn deinitialize(dsp: *DSP, node: Index, voice: u8, _: std.mem.Allocator) void {
+            const state: *MIDI = &dsp.stateForVoice(node, voice).midi;
             if (state.stream) |midi_stream| {
                 midi_stream.close() catch {};
                 state.stream = null;
@@ -3504,58 +3997,65 @@ pub const Node = struct {
             return concert_a_freq * std.math.pow(f32, 2.0, semitone_offset);
         }
 
+        /// Releases the first held voice matching a pitch and records its release velocity.
+        fn releaseHeldNote(state: *MIDI, frequency: f32, velocity: f32) void {
+            for (&state.held) |*held| {
+                if (held.gate == 0 or held.freq != frequency) continue;
+                held.gate = 0;
+                held.velocity = velocity;
+                break;
+            }
+        }
+
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
 
-            // If device == -1, do nothing
-            if (state.parameters.device < 0) return;
-            const midi_stream = state.stream orelse return;
-
-            if (try midi_stream.poll()) {
-                var read = [1]pm.Event{undefined};
-                const read_count = midi_stream.read(read[0..]);
-                if (read_count > 0) {
-                    const msg = midi.Message.init(read[0].message);
-
-                    if (msg == .data) {
-                        switch (msg.data.command) {
-                            .note_on => |on| {
-                                // freq
-                                const freq = noteFrequency(on.note);
-                                state.held_freq = freq;
-                                into[0].samples = @splat(freq);
-                                // vel
-                                const velocity = @as(f32, @floatFromInt(on.attack_velocity)) / 127;
-                                state.held_velocity = velocity;
-                                into[2].samples = @splat(velocity);
-                                // gate
-                                state.held_gate = if (freq > 0 and velocity > 0) 1 else 0;
-                                into[1].samples = @splat(1);
-                            },
-                            .note_off => |off| {
-                                // freq
-                                const freq = noteFrequency(off.note);
-                                state.held_freq = freq;
-                                into[0].samples = @splat(freq);
-                                // vel
-                                const velocity = @as(f32, @floatFromInt(off.release_velocity)) / 127;
-                                state.held_velocity = velocity;
-                                into[2].samples = @splat(velocity);
-                                // gate
-                                state.held_gate = 0;
-                                into[1].samples = @splat(0);
-                            },
-                            else => {
-                                // TODO
-                            },
+            // The renderer calls this once per voice. Poll once per block so
+            // each voice sees the same note event and held-note snapshot.
+            if (state.last_event_generation != dsp.render_generation) {
+                state.last_event_generation = dsp.render_generation;
+                if (state.parameters.device >= 0) {
+                    if (state.stream) |midi_stream| {
+                        if (try midi_stream.poll()) {
+                            var read = [1]pm.Event{undefined};
+                            if (midi_stream.read(read[0..]) > 0) {
+                                const msg = midi.Message.init(read[0].message);
+                                if (msg == .data) switch (msg.data.command) {
+                                    .note_on => |on| {
+                                        const frequency = noteFrequency(on.note);
+                                        const velocity = @as(f32, @floatFromInt(on.attack_velocity)) / 127;
+                                        if (velocity > 0) {
+                                            for (&state.held) |*held| {
+                                                if (held.gate != 0) continue;
+                                                held.* = .{
+                                                    .freq = frequency,
+                                                    .gate = 1,
+                                                    .velocity = velocity,
+                                                };
+                                                break;
+                                            }
+                                        } else {
+                                            // MIDI commonly encodes note-off as note-on with zero velocity.
+                                            releaseHeldNote(state, frequency, velocity);
+                                        }
+                                    },
+                                    .note_off => |off| {
+                                        const frequency = noteFrequency(off.note);
+                                        const velocity = @as(f32, @floatFromInt(off.release_velocity)) / 127;
+                                        releaseHeldNote(state, frequency, velocity);
+                                    },
+                                    else => {},
+                                };
+                            }
                         }
                     }
                 }
-            } else {
-                into[0].samples = @splat(state.held_freq);
-                into[2].samples = @splat(state.held_velocity);
-                into[1].samples = @splat(state.held_gate);
             }
+
+            const held = state.held[dsp.render_voice];
+            @memset(into[0].samples[0..into[0].sample_count], held.freq);
+            @memset(into[1].samples[0..into[1].sample_count], held.gate);
+            @memset(into[2].samples[0..into[2].sample_count], held.velocity);
         }
     };
 };

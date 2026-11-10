@@ -698,6 +698,11 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     const selected_tag = std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]);
     const parameters_editable = self.dsp.nodes.items(.parameter_link)[selected.idx].source == null and
         (selected_tag != .output or selected.idx == self.dsp.output.idx);
+    const polyphony_editable = selected_tag != .group and
+        selected_tag != .group_input and
+        selected_tag != .group_output and
+        selected_tag != .noop and
+        selected_tag != .output;
     const state = self.dsp.nodes.items(.state)[parameter_node.idx];
     switch (state) {
         inline else => |node_state| try self.writeReflectedParameters(
@@ -715,6 +720,10 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
             self.selected_observer_width,
             self.selected_observer_height,
             parameters_editable,
+            if (polyphony_editable)
+                self.dsp.polyphonyForDisplay(selected)
+            else
+                null,
         ),
     }
 }
@@ -794,16 +803,19 @@ fn writeReflectedParameters(
     observer_width: u32,
     observer_height: u32,
     parameters_editable: bool,
+    polyphony: ?u8,
 ) !void {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
-    const item_count = comptime reflectedParameterItemCount(@TypeOf(parameters));
-    var items: [item_count]Display.LabelValue = undefined;
-    var value_buffers: [item_count][256]u8 = undefined;
-    var value_widths: [item_count]u32 = undefined;
-    var editable: [item_count]bool = undefined;
-    var cell_names: [item_count][]const u8 = undefined;
-    var cell_array_indices: [item_count]?usize = undefined;
-    var label_buffers: [item_count][64]u8 = undefined;
+    const reflected_item_count = comptime reflectedParameterItemCount(@TypeOf(parameters));
+    const max_item_count = reflected_item_count + 1;
+    const item_count = reflected_item_count + @as(usize, @intFromBool(polyphony != null));
+    var items: [max_item_count]Display.LabelValue = undefined;
+    var value_buffers: [max_item_count][256]u8 = undefined;
+    var value_widths: [max_item_count]u32 = undefined;
+    var editable: [max_item_count]bool = undefined;
+    var cell_names: [max_item_count][]const u8 = undefined;
+    var cell_array_indices: [max_item_count]?usize = undefined;
+    var label_buffers: [max_item_count][64]u8 = undefined;
 
     cell_names[0] = node_name_field_name;
     items[0] = .{
@@ -816,6 +828,20 @@ fn writeReflectedParameters(
     cell_array_indices[0] = null;
 
     var reflected_item_index: usize = 1;
+    if (polyphony) |voice_count| {
+        const formatted_value = formatParameterValue(&value_buffers[1], voice_count);
+        items[1] = .{
+            .label = "polyphony",
+            .value = formatted_value,
+            .value_color = .golden_rod,
+        };
+        value_widths[1] = @intCast(formatted_value.len);
+        editable[1] = true;
+        cell_names[1] = "polyphony";
+        cell_array_indices[1] = null;
+        reflected_item_index = 2;
+    }
+
     inline for (field_names) |field_name| {
         const value = @field(parameters, field_name);
         switch (@typeInfo(@TypeOf(value))) {
@@ -898,19 +924,19 @@ fn writeReflectedParameters(
     );
     if (pane_height < 2) return;
     const row_count = @min(
-        @as(u32, @intCast(items.len)),
+        @as(u32, @intCast(item_count)),
         parameters_pane_max_rows,
     );
     const rows = @min(row_count, pane_height - 2);
     // Match the selected-pane column packing while retaining each value's
     // coordinates for mouse hit-testing and the active text field.
     var content_width: u32 = 0;
-    if (items.len != 0 and row_count != 0) {
+    if (item_count != 0 and row_count != 0) {
         var item_index: usize = 0;
-        while (item_index < items.len) {
+        while (item_index < item_count) {
             const column_end = @min(
                 item_index + @as(usize, @intCast(rows)),
-                items.len,
+                item_count,
             );
             var label_width: u32 = 0;
             var column_width: u32 = 0;
@@ -931,7 +957,7 @@ fn writeReflectedParameters(
 
             content_width += column_width;
             item_index = column_end;
-            if (item_index < items.len)
+            if (item_index < item_count)
                 content_width += 1;
         }
     }
@@ -1023,8 +1049,8 @@ fn writeReflectedParameters(
 
     var column_x = parameter_x;
     var item_index: usize = 0;
-    while (item_index < items.len and column_x < pane_width) {
-        const column_end = @min(item_index + @as(usize, @intCast(rows)), items.len);
+    while (item_index < item_count and column_x < pane_width) {
+        const column_end = @min(item_index + @as(usize, @intCast(rows)), item_count);
         var label_width: u32 = 0;
         var column_width: u32 = 0;
         for (item_index..column_end) |index|
@@ -1537,7 +1563,17 @@ fn duplicateGroup(
     }
 
     for (source_state.members[0..source_state.member_count]) |member| {
-        new_members[member_count] = try self.dsp.addNode(gpa, self.duplicateNodeState(.{ .idx = member.idx }));
+        const duplicate = try self.dsp.addNode(
+            gpa,
+            self.duplicateNodeState(.{ .idx = member.idx }),
+        );
+        const polyphony = self.dsp.nodes.items(.polyphony)[member.idx];
+        if (polyphony > 1)
+            self.dsp.setNodePolyphony(gpa, duplicate, polyphony) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidNode, error.InvalidPolyphony => unreachable,
+            };
+        new_members[member_count] = duplicate;
         member_count += 1;
     }
     const duplicate_group = try self.dsp.addNode(gpa, DSP.Node.Group.create(
@@ -1640,8 +1676,14 @@ fn duplicateNodeAt(
     const duplicate_index = try self.dsp.addNode(gpa, self.duplicateNodeState(source));
     errdefer self.dsp.remove(gpa, duplicate_index);
     if (self.active_group) |group|
-        if (!self.dsp.addGroupMember(group, duplicate_index))
+        if (!self.dsp.addGroupMember(gpa, group, duplicate_index))
             return error.InvalidGroup;
+    const polyphony = self.dsp.nodes.items(.polyphony)[source.idx];
+    if (polyphony > 1)
+        self.dsp.setNodePolyphony(gpa, duplicate_index, polyphony) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidNode, error.InvalidPolyphony => unreachable,
+        };
     if (self.active_group) |_| {
         const root_position = self.space.findFreePosition(duplicate_index, self.space.viewportCenter()) orelse
             return error.InvalidVisualNodeLayout;
@@ -1829,6 +1871,14 @@ fn commitParameterEdit(self: *Self) void {
                 self.dsp.setMidiDevice(active.node, device_id) catch {},
             else => {},
         }
+    } else if (std.mem.eql(u8, active.field_name, "polyphony")) {
+        const count = std.fmt.parseInt(
+            u8,
+            self.parameter_editor.text_field.inputSlice(),
+            10,
+        ) catch null;
+        if (count) |value|
+            self.dsp.setNodePolyphony(self.serializer.allocator, active.node, value) catch {};
     } else {
         var context = ParameterEditor.CommitContext{ .editor = self };
         self.dsp.withGraphLock(&context, commitParameterLocked);
@@ -1880,6 +1930,18 @@ fn commitParameterLocked(context: *ParameterEditor.CommitContext) void {
         // Parameter commits run under the graph lock on the UI thread, so any
         // required growth stays outside the real-time audio callback.
         delay.ensureHistoryCapacity(self.serializer.allocator, next_parameters) catch return;
+        if (self.dsp.nodes.items(.additional_states)[active.node.idx]) |voices| {
+            const voice_count = self.dsp.nodes.items(.additional_state_count)[active.node.idx];
+            for (voices[0..voice_count]) |*voice_state| {
+                switch (voice_state.*) {
+                    .delay => |*voice_delay| voice_delay.ensureHistoryCapacity(
+                        self.serializer.allocator,
+                        next_parameters,
+                    ) catch return,
+                    else => unreachable,
+                }
+            }
+        }
         delay.parameters = next_parameters;
         context.accepted = true;
         return;
@@ -1908,6 +1970,12 @@ fn formatNodeParameter(
 ) []const u8 {
     if (std.mem.eql(u8, field_name, node_name_field_name))
         return self.dsp.nodes.items(.name)[node];
+    if (std.mem.eql(u8, field_name, "polyphony"))
+        return std.fmt.bufPrint(
+            buffer,
+            "{d}",
+            .{self.dsp.polyphonyForDisplay(.{ .idx = node })},
+        ) catch "";
     const state = self.dsp.nodes.items(.state)[node];
     if (std.mem.eql(u8, field_name, "device")) {
         if (state == .output)
@@ -3130,7 +3198,7 @@ pub const CommandPalette = struct {
         errdefer self.editor.dsp.remove(gpa, index);
 
         if (self.editor.active_group) |group| {
-            if (!self.editor.dsp.addGroupMember(group, index))
+            if (!self.editor.dsp.addGroupMember(gpa, group, index))
                 return error.InvalidGroup;
         }
 

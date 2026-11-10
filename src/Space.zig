@@ -1126,6 +1126,15 @@ fn writeNodeBody(
             try display.write(gpa, &glyph, @intCast(character_x), @intCast(y), background, .white);
     }
 
+    const voice_count = self.dsp.polyphonyForDisplay(.{ .idx = node.idx });
+    if (voice_count > 1) {
+        const voice_glyph = [_]u8{@intCast('0' + voice_count)};
+        const marker_offset = footprint.width - @as(u32, if (self.isGroup(node)) 3 else 2);
+        const marker_x = x + @as(i64, @intCast(marker_offset));
+        if (marker_x >= 0 and y >= 0)
+            try display.write(gpa, &voice_glyph, @intCast(marker_x), @intCast(y), background, .white);
+    }
+
     const displayed_name = name[0..@min(name.len, content_width)];
     const name_x = x + 1 + @as(i64, @intCast((content_width - displayed_name.len) / 2));
     const name_y = y + @as(i64, @intCast((footprint.height - 1) / 2));
@@ -1394,9 +1403,11 @@ fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Boun
         (metadata.short_name.len + 1) * 2
     else
         0;
+    const minimum_width_for_header = metadata.short_name.len + 4 +
+        @as(usize, @intFromBool(self.isGroup(node)));
     const width = @max(
-        @min(label_width, @as(usize, 16)),
-        minimum_width_for_parameter_label,
+        @max(@min(label_width, @as(usize, 16)), minimum_width_for_parameter_label),
+        minimum_width_for_header,
     );
 
     return .{
