@@ -37,6 +37,7 @@ message Node {
     MIDIParameterse midi = 19;
     OutputParameters output = 22;
     DelayParameters delay = 23;
+    InputParameters input = 25;
   }
 }
 
@@ -131,6 +132,12 @@ message KeyboardParameters {
 
 // Stable device identity avoids persisting PortAudio's process-local index.
 message OutputParameters {
+  optional string host_api_name = 1;
+  optional string device_name = 2;
+}
+
+// Stable device identity avoids persisting PortAudio's process-local index.
+message InputParameters {
   optional string host_api_name = 1;
   optional string device_name = 2;
 }

@@ -195,6 +195,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             state,
             arena_gpa,
             self.dsp.devices,
+            self.dsp.input_devices,
             self.dsp.midi_devices,
         );
         try document.nodes.append(arena_gpa, node);
@@ -386,6 +387,7 @@ fn parametersToProto(
     state: DSP.Node.State,
     gpa: std.mem.Allocator,
     devices: []const pa.Device,
+    input_devices: []const pa.InputDevice,
     midi_devices: []const pm.Device,
 ) !?P.Node.parameters_union {
     return switch (state) {
@@ -396,6 +398,13 @@ fn parametersToProto(
             break :blk .{ .output = .{
                 .host_api_name = device.host_api_name,
                 .device_name = device.name,
+            } };
+        },
+        .input => |value| blk: {
+            const device = pa.inputDeviceById(input_devices, value.parameters.input);
+            break :blk .{ .input = .{
+                .host_api_name = if (device) |current| current.host_api_name else null,
+                .device_name = if (device) |current| current.name else null,
             } };
         },
         .midi => |value| blk: {
@@ -498,6 +507,18 @@ fn nodeFromProto(
             else => default_device,
         } else default_device;
         return DSP.Node.Output.create(name, device_id);
+    }
+    if (std.mem.eql(u8, serialized.kind, "input")) {
+        const default_device = pa.defaultInputDevice(self.dsp.input_devices) orelse pa.no_device;
+        const device_id = if (serialized.parameters) |parameters| switch (parameters) {
+            .input => |value| pa.findInputDevice(
+                self.dsp.input_devices,
+                value.host_api_name orelse "",
+                value.device_name orelse "",
+            ) orelse default_device,
+            else => default_device,
+        } else default_device;
+        return DSP.Node.Input.create(name, .{ .input = device_id });
     }
     if (std.mem.eql(u8, serialized.kind, "noop")) return DSP.Node.Noop.create(name);
     if (std.mem.eql(u8, serialized.kind, "group")) {
@@ -717,6 +738,7 @@ fn validateDocument(document: P.SynthDocument) !void {
                 .delay,
                 .noise,
                 .midi,
+                .input,
                 => try validateNodeParameters(node, tag),
                 .group => try validateGroup(node, index, document.nodes.items),
                 .group_input, .group_output => try validateGroupEndpoint(node, document.nodes.items),
@@ -839,6 +861,7 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
     switch (tag) {
         .constant => _ = try requiredParameters(node, .constant),
         .midi => _ = try requiredParameters(node, .midi),
+        .input => _ = try requiredParameters(node, .input),
         .oscillator => {
             const value = try requiredParameters(node, .oscillator);
             _ = try enumFromString(DSP.Node.Oscillator.Waveform, value.waveform orelse "");

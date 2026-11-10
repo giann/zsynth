@@ -56,6 +56,8 @@ pub const CursorState = struct {
 io: std.Io,
 /// Devices that passed the graph's stereo 48 kHz output-format check.
 audio_devices: []pa.Device,
+/// Devices that support mono or stereo 48 kHz capture.
+input_devices: []pa.InputDevice,
 /// Available MIDI input devices collected after PortMidi initialization.
 midi_devices: []pm.Device,
 /// Device used when a new graph is created or a saved device is unavailable.
@@ -155,41 +157,50 @@ pub fn init(process: std.process.Init, allocator: std.mem.Allocator) !Self {
         },
     );
 
+    const post_processing = try allocator.dupe(
+        PostProcessing,
+        &.{
+            try PostProcessing.sharpenProcess(
+                allocator,
+                &renderer,
+                0.50,
+                screen_width,
+                screen_height,
+            ),
+            // try PostProcessing.bloomProcess(
+            //     allocator,
+            //     &renderer,
+            //     0.85,
+            //     0.35,
+            //     screen_width,
+            //     screen_height,
+            // ),
+            try PostProcessing.grainProcess(
+                allocator,
+                &renderer,
+                .{},
+                screen_width,
+                screen_height,
+            ),
+        },
+    );
+    const input_devices = pa.enumerateInputDevices(allocator, DSP.sample_rate) catch |err| {
+        for (post_processing) |*post|
+            post.deinit(&renderer);
+        allocator.free(post_processing);
+        return err;
+    };
+
     var self = Self{
         .io = process.io,
         .audio_devices = audio_devices,
+        .input_devices = input_devices,
         .midi_devices = midi_devices,
         .default_audio_device = default_audio_device,
         .renderer = renderer,
         .display = display,
         .ui_display = ui_display,
-        .post_processing = try allocator.dupe(
-            PostProcessing,
-            &.{
-                try PostProcessing.sharpenProcess(
-                    allocator,
-                    &renderer,
-                    0.50,
-                    screen_width,
-                    screen_height,
-                ),
-                // try PostProcessing.bloomProcess(
-                //     allocator,
-                //     &renderer,
-                //     0.85,
-                //     0.35,
-                //     screen_width,
-                //     screen_height,
-                // ),
-                try PostProcessing.grainProcess(
-                    allocator,
-                    &renderer,
-                    .{},
-                    screen_width,
-                    screen_height,
-                ),
-            },
-        ),
+        .post_processing = post_processing,
         .state_stack = state_stack,
     };
     // Seed the cursor at the center until the first motion event arrives.
@@ -351,6 +362,7 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     stbi.deinit();
     pm.deinitDevices(allocator, self.midi_devices);
     pm.deinit() catch {};
+    pa.deinitInputDevices(allocator, self.input_devices);
     pa.deinitDevices(allocator, self.audio_devices);
     pa.deinit() catch {};
 }

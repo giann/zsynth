@@ -245,7 +245,12 @@ fn enter(
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
     try sdl.startTextInput(self.zsynth.renderer.window);
     // Initialize the DSP with the application's cached audio and MIDI devices.
-    self.dsp.init(self.zsynth.audio_devices, self.zsynth.midi_devices, gpa) catch
+    self.dsp.init(
+        self.zsynth.audio_devices,
+        self.zsynth.input_devices,
+        self.zsynth.midi_devices,
+        gpa,
+    ) catch
         return error.AudioError;
     self.serializer = .{
         .dsp = &self.dsp,
@@ -262,7 +267,7 @@ fn enter(
 }
 
 /// Replaces the current graph with a fresh no-op and output node.
-fn newGraph(self: *Self, gpa: std.mem.Allocator) !void {
+fn newGraph(self: *Self, gpa: std.mem.Allocator) StateStack.State.Error!void {
     if (self.group_space != null)
         self.leaveGroupView(gpa);
     self.parameter_editor.active = null;
@@ -886,11 +891,15 @@ fn writeReflectedParameters(
                     std.mem.eql(u8, field_name, "device");
                 const is_midi_device = comptime @TypeOf(parameters) == DSP.Node.MIDI.Parameters and
                     std.mem.eql(u8, field_name, "device");
-                const is_device = is_audio_device or is_midi_device;
+                const is_input_device = comptime @TypeOf(parameters) == DSP.Node.Input.Parameters and
+                    std.mem.eql(u8, field_name, "input");
+                const is_device = is_audio_device or is_midi_device or is_input_device;
                 const formatted_value = if (is_audio_device)
                     self.outputDeviceLabel(value)
                 else if (is_midi_device)
                     self.midiDeviceLabel(value)
+                else if (is_input_device)
+                    self.inputDeviceLabel(value)
                 else
                     formatParameterValue(&value_buffers[reflected_item_index], value);
                 const value_color: Display.Color = if (is_device) .science_blue else switch (@typeInfo(@TypeOf(value))) {
@@ -907,6 +916,8 @@ fn writeReflectedParameters(
                     self.outputDeviceLabelWidth()
                 else if (is_midi_device)
                     self.midiDeviceLabelWidth()
+                else if (is_input_device)
+                    self.inputDeviceLabelWidth()
                 else
                     parameterValueWidth(@TypeOf(value), formatted_value.len);
                 editable[reflected_item_index] = parameters_editable and
@@ -1268,7 +1279,12 @@ fn keyUpDown(
         },
         .d => {
             if (command) {
-                try self.duplicateSelectedNodes(gpa, shift);
+                self.duplicateSelectedNodes(gpa, shift) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidVisualNodeLayout => return error.InvalidVisualNodeLayout,
+                    error.InvalidGroup => return error.InvalidGroup,
+                    else => return error.AudioError,
+                };
             } else if (self.editorSpace().selected_count != 0) {
                 try self.removeSelectedNodes(gpa);
             } else return false;
@@ -1285,7 +1301,7 @@ fn keyUpDown(
 }
 
 /// Creates a non-nested group from the current ordinary selection.
-fn createSelectedGroup(self: *Self, gpa: std.mem.Allocator) !void {
+fn createSelectedGroup(self: *Self, gpa: std.mem.Allocator) StateStack.State.Error!void {
     if (self.active_group != null) return;
     if (self.editorSpace().selected_count < 2) return;
 
@@ -1322,10 +1338,13 @@ fn createSelectedGroup(self: *Self, gpa: std.mem.Allocator) !void {
     const owned_name = try gpa.dupe(u8, "group");
     try self.owned_node_names.append(gpa, owned_name);
 
-    const group = try self.dsp.addNode(gpa, DSP.Node.Group.create(
+    const group = self.dsp.addNode(gpa, DSP.Node.Group.create(
         owned_name,
         members[0..member_count],
-    ));
+    )) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AudioError,
+    };
 
     self.editorSpace().addNode(gpa, group, self.editorSpace().nodePosition(members[0])) catch |err| {
         if (err == error.InvalidVisualNodeLayout) self.rollbackCreatedGroup(gpa, group);
@@ -1516,7 +1535,7 @@ fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
 fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
     const source_name = self.dsp.nodes.items(.name)[source.idx];
     return switch (self.dsp.nodes.items(.state)[source.idx]) {
-        .midi => unreachable,
+        .input, .midi => unreachable,
         .add => DSP.Node.Add.create(source_name),
         .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
         .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
@@ -1878,6 +1897,14 @@ fn commitParameterEdit(self: *Self) void {
                 self.dsp.setMidiDevice(active.node, device_id) catch {},
             else => {},
         }
+    } else if (std.mem.eql(u8, active.field_name, "input")) {
+        const label = self.parameter_editor.text_field.inputSlice();
+        if (self.inputDeviceIdForLabel(label)) |device_id|
+            self.dsp.setInputDevice(
+                self.serializer.allocator,
+                active.node,
+                device_id,
+            ) catch {};
     } else if (std.mem.eql(u8, active.field_name, "polyphony")) {
         const count = std.fmt.parseInt(
             u8,
@@ -1984,6 +2011,8 @@ fn formatNodeParameter(
             .{self.dsp.polyphonyForDisplay(.{ .idx = node })},
         ) catch "";
     const state = self.dsp.nodes.items(.state)[node];
+    if (std.mem.eql(u8, field_name, "input") and state == .input)
+        return self.inputDeviceLabel(state.input.parameters.input);
     if (std.mem.eql(u8, field_name, "device")) {
         if (state == .output)
             return self.outputDeviceLabel(state.output.parameters.device);
@@ -2031,6 +2060,10 @@ fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
     const active = self.parameter_editor.active orelse return "";
 
     const state = self.dsp.nodes.items(.state)[active.node.idx];
+    if (std.mem.eql(u8, active.field_name, "input")) return switch (state) {
+        .input => self.inputDeviceCompletion(field.inputSlice()),
+        else => "",
+    };
     if (std.mem.eql(u8, active.field_name, "device")) return switch (state) {
         .output => self.outputDeviceCompletion(field.inputSlice()),
         .midi => self.midiDeviceCompletion(field.inputSlice()),
@@ -2075,6 +2108,38 @@ fn outputDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
 /// Resolves an exact completed output-device label to its runtime ID.
 fn deviceIdForLabel(self: *const Self, label: []const u8) ?pa.DeviceId {
     for (self.zsynth.audio_devices) |device| {
+        if (std.ascii.eqlIgnoreCase(device.label, label))
+            return device.id;
+    }
+    return null;
+}
+
+/// Returns the cached display label for a PortAudio input device index.
+fn inputDeviceLabel(self: *const Self, device_id: pa.DeviceId) []const u8 {
+    const device = pa.inputDeviceById(self.zsynth.input_devices, device_id) orelse return "unavailable";
+    return device.label;
+}
+
+/// Returns the longest cached input-device label for the selected-node field.
+fn inputDeviceLabelWidth(self: *const Self) u32 {
+    var width: usize = "unavailable".len;
+    for (self.zsynth.input_devices) |device|
+        width = @max(width, device.label.len);
+    return @intCast(width);
+}
+
+/// Finds the first PortAudio input-device label matching the current prefix.
+fn inputDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
+    for (self.zsynth.input_devices) |device| {
+        if (parameterStartsWithIgnoreCase(device.label, input))
+            return device.label;
+    }
+    return "";
+}
+
+/// Resolves an exact completed input-device label to its runtime ID.
+fn inputDeviceIdForLabel(self: *const Self, label: []const u8) ?pa.DeviceId {
+    for (self.zsynth.input_devices) |device| {
         if (std.ascii.eqlIgnoreCase(device.label, label))
             return device.id;
     }
@@ -2708,8 +2773,11 @@ fn addNode(
     allocator: std.mem.Allocator,
     node: DSP.Node,
     position: Space.Position,
-) !DSP.Node.Index {
-    const index = try self.dsp.addNode(allocator, node);
+) StateStack.State.Error!DSP.Node.Index {
+    const index = self.dsp.addNode(allocator, node) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AudioError,
+    };
     try addVisualNode(self, allocator, index, position);
     return index;
 }
@@ -3197,11 +3265,19 @@ pub const CommandPalette = struct {
             gpa.free(owned_name);
             return err;
         };
-        const node = createNode(tag, owned_name, self.editor.zsynth.midi_devices);
+        const node = createNode(
+            tag,
+            owned_name,
+            self.editor.zsynth.input_devices,
+            self.editor.zsynth.midi_devices,
+        );
         const index = self.editor.dsp.addNode(gpa, node) catch |err| {
             _ = self.editor.owned_node_names.pop();
             gpa.free(owned_name);
-            return err;
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AudioError,
+            };
         };
         errdefer self.editor.dsp.remove(gpa, index);
 
@@ -3331,6 +3407,7 @@ pub const CommandPalette = struct {
     fn createNode(
         tag: DSP.Node.Tag,
         name: []const u8,
+        input_devices: []const pa.InputDevice,
         midi_devices: []const pm.Device,
     ) DSP.Node {
         return switch (tag) {
@@ -3358,6 +3435,9 @@ pub const CommandPalette = struct {
             .duplicate => DSP.Node.Duplicate.create(name),
             .noise => DSP.Node.Noise.create(name, .{
                 .seed = 0,
+            }),
+            .input => DSP.Node.Input.create(name, .{
+                .input = pa.defaultInputDevice(input_devices) orelse pa.no_device,
             }),
             .midi => DSP.Node.MIDI.create(
                 name,

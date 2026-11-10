@@ -1,4 +1,4 @@
-//! Small, Zig-oriented bindings for PortAudio's device and output-stream APIs.
+//! Small, Zig-oriented bindings for PortAudio's device and stream APIs.
 const std = @import("std");
 
 /// Errors returned by PortAudio operations exposed by this module.
@@ -38,7 +38,7 @@ pub const Error = error{
 /// Runtime index used to identify a PortAudio device.
 pub const DeviceId = c_int;
 
-/// Sentinel returned by PortAudio when no default output is available.
+/// Sentinel used when no PortAudio device is selected or available.
 pub const no_device: DeviceId = -1;
 
 /// Stereo output device collected during PortAudio initialization.
@@ -55,6 +55,22 @@ pub const Device = struct {
     low_output_latency: f64,
 };
 
+/// Mono or stereo input device that supports the requested sample rate.
+pub const InputDevice = struct {
+    /// PortAudio index used to open a stream during this process.
+    id: DeviceId,
+    /// Host API name copied for display and document identity.
+    host_api_name: []u8,
+    /// Device name copied for display and document identity.
+    name: []u8,
+    /// Disambiguated completion label shown in the selected-node editor.
+    label: []u8,
+    /// Number of channels the application will request from this device.
+    channel_count: c_int,
+    /// Suggested low latency reported by the device.
+    low_input_latency: f64,
+};
+
 /// Opaque PortAudio stream handle.
 pub const Stream = opaque {};
 
@@ -68,7 +84,7 @@ pub const StreamCallbackTimeInfo = extern struct {
     output_buffer_dac_time: f64,
 };
 
-/// Callback signature used to fill an output stream's interleaved buffer.
+/// Callback signature used to process interleaved PortAudio stream buffers.
 pub const StreamCallback = *const fn (
     ?*const anyopaque,
     ?*anyopaque,
@@ -153,6 +169,8 @@ extern fn Pa_Terminate() callconv(.c) c_int;
 extern fn Pa_GetDeviceCount() callconv(.c) c_int;
 /// Returns the current system default output device, or `no_device`.
 extern fn Pa_GetDefaultOutputDevice() callconv(.c) DeviceId;
+/// Returns the current system default input device, or `no_device`.
+extern fn Pa_GetDefaultInputDevice() callconv(.c) DeviceId;
 /// Returns information for an enumerated device, or null for an invalid index.
 extern fn Pa_GetDeviceInfo(device: DeviceId) callconv(.c) ?*const PaDeviceInfo;
 /// Returns information for an enumerated host API, or null for an invalid index.
@@ -251,6 +269,106 @@ pub fn enumerateOutputDevices(
     return try devices.toOwnedSlice(allocator);
 }
 
+/// Returns mono or stereo input devices that support the requested sample rate.
+pub fn enumerateInputDevices(
+    allocator: std.mem.Allocator,
+    sample_rate: f64,
+) (Error || std.mem.Allocator.Error)![]InputDevice {
+    const device_count = Pa_GetDeviceCount();
+    if (device_count < 0) return errorFromCode(device_count);
+
+    var devices: std.ArrayList(InputDevice) = .empty;
+
+    for (0..@intCast(device_count)) |index| {
+        const id: DeviceId = @intCast(index);
+        const info = Pa_GetDeviceInfo(id) orelse continue;
+        if (info.max_input_channels < 1) continue;
+
+        var channel_count: c_int = if (info.max_input_channels >= 2) 2 else 1;
+        var parameters = StreamParameters{
+            .device = id,
+            .channel_count = channel_count,
+            .sample_format = 1,
+            .suggested_latency = info.default_low_input_latency,
+            .host_api_specific_stream_info = null,
+        };
+        if (Pa_IsFormatSupported(&parameters, null, sample_rate) != 0) {
+            if (channel_count == 1) continue;
+            channel_count = 1;
+            parameters.channel_count = channel_count;
+            if (Pa_IsFormatSupported(&parameters, null, sample_rate) != 0)
+                continue;
+        }
+
+        const host_info = Pa_GetHostApiInfo(info.host_api) orelse continue;
+        const name_ptr = info.name orelse continue;
+        const host_name_ptr = host_info.name orelse continue;
+        appendInputDevice(
+            allocator,
+            &devices,
+            id,
+            std.mem.span(host_name_ptr),
+            std.mem.span(name_ptr),
+            channel_count,
+            info.default_low_input_latency,
+        ) catch |err| {
+            deinitInputDeviceNames(allocator, devices.items);
+            devices.deinit(allocator);
+            return err;
+        };
+    }
+
+    return devices.toOwnedSlice(allocator) catch |err| {
+        deinitInputDeviceNames(allocator, devices.items);
+        devices.deinit(allocator);
+        return err;
+    };
+}
+
+/// Copies one supported input device into the owned enumeration list.
+fn appendInputDevice(
+    allocator: std.mem.Allocator,
+    devices: *std.ArrayList(InputDevice),
+    id: DeviceId,
+    host_api_name: []const u8,
+    name: []const u8,
+    channel_count: c_int,
+    low_input_latency: f64,
+) std.mem.Allocator.Error!void {
+    const owned_name = allocator.dupe(u8, name) catch |err| return err;
+    const owned_host_name = allocator.dupe(u8, host_api_name) catch |err| {
+        allocator.free(owned_name);
+        return err;
+    };
+    const label = std.fmt.allocPrint(allocator, "{s}: {s}", .{ owned_host_name, owned_name }) catch |err| {
+        allocator.free(owned_host_name);
+        allocator.free(owned_name);
+        return err;
+    };
+    devices.append(allocator, .{
+        .id = id,
+        .host_api_name = owned_host_name,
+        .name = owned_name,
+        .label = label,
+        .channel_count = channel_count,
+        .low_input_latency = low_input_latency,
+    }) catch |err| {
+        allocator.free(label);
+        allocator.free(owned_host_name);
+        allocator.free(owned_name);
+        return err;
+    };
+}
+
+/// Frees copied strings without freeing the ArrayList's own item storage.
+fn deinitInputDeviceNames(allocator: std.mem.Allocator, devices: []InputDevice) void {
+    for (devices) |device| {
+        allocator.free(device.host_api_name);
+        allocator.free(device.name);
+        allocator.free(device.label);
+    }
+}
+
 /// Frees copied device names produced by `enumerateOutputDevices`.
 pub fn deinitDevices(allocator: std.mem.Allocator, devices: []Device) void {
     for (devices) |device| {
@@ -259,6 +377,23 @@ pub fn deinitDevices(allocator: std.mem.Allocator, devices: []Device) void {
         allocator.free(device.label);
     }
     allocator.free(devices);
+}
+
+/// Frees copied device names produced by `enumerateInputDevices`.
+pub fn deinitInputDevices(allocator: std.mem.Allocator, devices: []InputDevice) void {
+    deinitInputDeviceNames(allocator, devices);
+    allocator.free(devices);
+}
+
+/// Returns the system default input if supported, or the first supported input.
+pub fn defaultInputDevice(devices: []const InputDevice) ?DeviceId {
+    const id = Pa_GetDefaultInputDevice();
+    if (id >= 0) {
+        for (devices) |device|
+            if (device.id == id)
+                return id;
+    }
+    return if (devices.len == 0) null else devices[0].id;
 }
 
 /// Finds the runtime device ID matching a persisted host API and device name.
@@ -283,6 +418,28 @@ pub fn deviceById(devices: []const Device, id: DeviceId) ?*const Device {
     return null;
 }
 
+/// Returns the descriptor for a current runtime input device ID.
+pub fn inputDeviceById(devices: []const InputDevice, id: DeviceId) ?*const InputDevice {
+    for (devices) |*device| {
+        if (device.id == id) return device;
+    }
+    return null;
+}
+
+/// Finds the runtime input ID matching a persisted host API and device name.
+pub fn findInputDevice(
+    devices: []const InputDevice,
+    host_api_name: []const u8,
+    name: []const u8,
+) ?DeviceId {
+    for (devices) |device| {
+        if (std.mem.eql(u8, device.host_api_name, host_api_name) and
+            std.mem.eql(u8, device.name, name))
+            return device.id;
+    }
+    return null;
+}
+
 /// Opens a stopped float32 stereo output stream using PortAudio's variable block size.
 pub fn openOutputStream(
     device: *const Device,
@@ -302,6 +459,34 @@ pub fn openOutputStream(
         &stream,
         null,
         &parameters,
+        sample_rate,
+        0,
+        0,
+        callback,
+        user_data,
+    ));
+    return stream;
+}
+
+/// Opens a stopped float32 input stream using PortAudio's variable block size.
+pub fn openInputStream(
+    device: *const InputDevice,
+    sample_rate: f64,
+    callback: StreamCallback,
+    user_data: ?*anyopaque,
+) Error!*Stream {
+    const parameters = StreamParameters{
+        .device = device.id,
+        .channel_count = device.channel_count,
+        .sample_format = 1,
+        .suggested_latency = device.low_input_latency,
+        .host_api_specific_stream_info = null,
+    };
+    var stream: *Stream = undefined;
+    try checkError(Pa_OpenStream(
+        &stream,
+        &parameters,
+        null,
         sample_rate,
         0,
         0,

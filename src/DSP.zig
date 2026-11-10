@@ -51,6 +51,8 @@ pub const SampleTap = struct {
 
 /// Output devices cached by the application for this DSP's lifetime.
 devices: []const pa.Device,
+/// Input devices cached by the application for this DSP's lifetime.
+input_devices: []const pa.InputDevice,
 /// MIDI input devices cached by the application for this DSP's lifetime.
 midi_devices: []const pm.Device,
 
@@ -77,6 +79,7 @@ playing: bool = false,
 pub fn init(
     self: *DSP,
     devices: []const pa.Device,
+    input_devices: []const pa.InputDevice,
     midi_devices: []const pm.Device,
     gpa: std.mem.Allocator,
 ) !void {
@@ -84,6 +87,7 @@ pub fn init(
     // Initialize graph-owned fields before creating dependent resources.
     self.* = DSP{
         .devices = devices,
+        .input_devices = input_devices,
         .midi_devices = midi_devices,
     };
 
@@ -138,15 +142,52 @@ pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
 pub fn start(self: *DSP) AudioError!void {
     if (self.playing) return;
     try self.ensureOutputStream();
-    try pa.startStream(self.audio_stream.?);
+    for (self.nodes.items(.state)) |*state| {
+        if (state.* != .input) continue;
+        const input = &state.input;
+        if (input.stream == null or input.capture_started) continue;
+        pa.startStream(input.stream.?) catch |err| {
+            self.stopInputStreams() catch {};
+            return err;
+        };
+        input.capture_started = true;
+    }
+    pa.startStream(self.audio_stream.?) catch |err| {
+        self.stopInputStreams() catch {};
+        return err;
+    };
     self.playing = true;
 }
 
 /// Stops streaming while keeping the selected device open.
 pub fn stop(self: *DSP) AudioError!void {
-    if (!self.playing) return;
-    try pa.stopStream(self.audio_stream.?);
-    self.playing = false;
+    var first_error: ?pa.Error = null;
+    if (self.playing) {
+        pa.stopStream(self.audio_stream.?) catch |err| {
+            first_error = err;
+        };
+        if (first_error == null) self.playing = false;
+    }
+    self.stopInputStreams() catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    if (first_error) |err| return err;
+}
+
+/// Stops every active input capture stream while preserving its open handle.
+fn stopInputStreams(self: *DSP) pa.Error!void {
+    var first_error: ?pa.Error = null;
+    for (self.nodes.items(.state)) |*state| {
+        if (state.* != .input) continue;
+        const input = &state.input;
+        if (!input.capture_started) continue;
+        pa.stopStream(input.stream.?) catch |err| {
+            if (first_error == null) first_error = err;
+            continue;
+        };
+        input.capture_started = false;
+    }
+    if (first_error) |err| return err;
 }
 
 /// Reports whether the PortAudio output stream is currently playing.
@@ -221,6 +262,64 @@ pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) pm.Er
     // The callback can only have held the old pointer before the locked swap.
     if (previous_stream) |old_stream|
         old_stream.close() catch {};
+}
+
+/// Replaces an Input node's source and resumes capture when playback is active.
+pub fn setInputDevice(
+    self: *DSP,
+    gpa: std.mem.Allocator,
+    node: Node.Index,
+    device_id: pa.DeviceId,
+) pa.Error!void {
+    assert(self.nodes.items(.state)[node.idx] == .input);
+    assert(device_id == pa.no_device or pa.inputDeviceById(self.input_devices, device_id) != null);
+
+    self.lockGraph();
+    const current = &self.nodes.items(.state)[node.idx].input;
+    const already_open = current.parameters.input == device_id and
+        (device_id == pa.no_device or current.stream != null);
+    self.unlockGraph();
+    if (already_open) return;
+
+    // Build and optionally start replacement resources before publishing them;
+    // a failure leaves the existing source usable.
+    var next_capture: ?*Node.Input.Capture = null;
+    var next_stream: ?*pa.Stream = null;
+    if (device_id != pa.no_device) {
+        const device = pa.inputDeviceById(self.input_devices, device_id) orelse return error.InvalidDevice;
+        const opened = try Node.Input.openCapture(gpa, device);
+        next_capture = opened.capture;
+        next_stream = opened.stream;
+    }
+    const was_playing = self.playing;
+    if (was_playing) {
+        if (next_stream) |capture_stream| {
+            pa.startStream(capture_stream) catch |err| {
+                pa.closeStream(capture_stream) catch {};
+                Node.Input.closeCapture(gpa, next_capture.?);
+                return err;
+            };
+        }
+    }
+
+    self.lockGraph();
+    const state = &self.nodes.items(.state)[node.idx].input;
+    const previous_stream = state.stream;
+    const previous_capture = state.capture;
+    const previous_started = state.capture_started;
+    state.stream = next_stream;
+    state.capture = next_capture;
+    state.capture_started = was_playing and next_stream != null;
+    state.parameters.input = device_id;
+    state.last_render_generation = std.math.maxInt(u64);
+    self.unlockGraph();
+
+    if (previous_stream) |capture_stream| {
+        if (previous_started) pa.stopStream(capture_stream) catch {};
+        pa.closeStream(capture_stream) catch {};
+    }
+    if (previous_capture) |capture|
+        Node.Input.closeCapture(gpa, capture);
 }
 
 /// Opens or replaces the stream when the output node's device has changed.
@@ -1622,6 +1721,7 @@ pub const Node = struct {
         constant,
         duplicate,
         keyboard,
+        input,
         mixer,
         monophonic_sequencer,
         multimode_filter,
@@ -1651,6 +1751,8 @@ pub const Node = struct {
         duplicate: Duplicate,
         /// Computer-keyboard note source state.
         keyboard: Keyboard,
+        /// PortAudio audio capture source state.
+        input: Input,
         /// Multi-input mixer state.
         mixer: Mixer,
         /// Monophonic note sequencer state.
@@ -1789,7 +1891,7 @@ pub const Node = struct {
         node: Index,
         outputs: []const *Buffer,
     ) ProcessError!void;
-    pub const InitializeError = error{OutOfMemory} || pm.Error;
+    pub const InitializeError = error{OutOfMemory} || pm.Error || pa.Error;
     /// Initializes node-level resources when the node is added to the graph.
     pub const Initialize = *const fn (
         dsp: *DSP,
@@ -2541,6 +2643,201 @@ pub const Node = struct {
                 into[1].samples[0..into[1].sample_count],
                 if (raw_key == @backingInt(sdl.Keycode.unknown)) 0 else 1,
             );
+        }
+    };
+
+    /// Captures one mono or stereo PortAudio input and fans it out to graph voices.
+    pub const Input = struct {
+        /// Input source configuration.
+        parameters: Parameters,
+        /// Stable callback context and queued audio shared by every graph voice.
+        capture: ?*Capture = null,
+        /// PortAudio stream opened while this node is initialized.
+        stream: ?*pa.Stream = null,
+        /// Whether the capture stream currently runs during DSP playback.
+        capture_started: bool = false,
+        /// Last block read once and reused by every voice in a render generation.
+        last_block: [block_size * 2]f32 = @splat(0),
+        /// Generation in which this node last consumed captured input frames.
+        last_render_generation: u64 = std.math.maxInt(u64),
+
+        /// Fixed queue depth in captured audio frames.
+        const capture_queue_capacity = 512;
+
+        /// One captured frame converted to the graph's stereo layout.
+        pub const Frame = struct {
+            /// Captured or duplicated left channel sample.
+            left: f32,
+            /// Captured right channel sample.
+            right: f32,
+        };
+
+        /// Stable callback context and bounded queue, separately allocated because node storage moves.
+        pub const Capture = struct {
+            /// Single-producer queue filled by PortAudio and consumed by DSP rendering.
+            queue: utils.SpscQueue(Frame),
+            /// One for mono capture or two for stereo capture.
+            channel_count: u8,
+        };
+
+        /// Opened stream and capture context created together.
+        pub const OpenedCapture = struct {
+            /// Stable context written by the PortAudio callback.
+            capture: *Capture,
+            /// Stopped input stream ready for playback to start.
+            stream: *pa.Stream,
+        };
+
+        /// Device selection edited in the selected-node parameters pane.
+        pub const Parameters = struct {
+            /// Runtime PortAudio ID selected for audio capture.
+            input: pa.DeviceId,
+        };
+
+        /// Port metadata for a graph audio-input source.
+        pub const metadata = Node.Metadata{
+            .name = "Input",
+            .short_name = "in",
+            .color = .havelock_blue,
+            .has_parameters = true,
+            .can_link_parameters = false,
+            .duplicatable = false,
+            .input_count = 0,
+            .output_count = 1,
+            .outputs = .{
+                .{ .name = "audio", .short_name = "out", .color = .havelock_blue, .observer = .waveform },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+        };
+
+        /// Creates an Input node using the selected runtime PortAudio device.
+        pub fn create(name: []const u8, parameters: Parameters) Node {
+            return .{
+                .state = .{ .input = .{ .parameters = parameters } },
+                .name = name,
+                .process = process,
+                .initialize = initialize,
+                .deinitialize = deinitialize,
+            };
+        }
+
+        /// Allocates a stable callback context and opens its stopped PortAudio stream.
+        pub fn openCapture(
+            gpa: std.mem.Allocator,
+            device: *const pa.InputDevice,
+        ) pa.Error!OpenedCapture {
+            const capture = gpa.create(Capture) catch @panic("Out of memory allocating input capture");
+            const queue = utils.SpscQueue(Frame).initCapacity(gpa, capture_queue_capacity) catch
+                @panic("Out of memory allocating input frame queue");
+            capture.* = .{
+                .queue = queue,
+                .channel_count = @intCast(device.channel_count),
+            };
+            const capture_stream = pa.openInputStream(
+                device,
+                sample_rate,
+                onInputCallback,
+                @ptrCast(capture),
+            ) catch |err| {
+                capture.queue.deinit(gpa);
+                gpa.destroy(capture);
+                return err;
+            };
+            return .{ .capture = capture, .stream = capture_stream };
+        }
+
+        /// Releases queue storage and the stable callback context after stream closure.
+        pub fn closeCapture(gpa: std.mem.Allocator, capture: *Capture) void {
+            capture.queue.deinit(gpa);
+            gpa.destroy(capture);
+        }
+
+        /// Opens the configured input unless no device is selected or it is unavailable.
+        fn initialize(dsp: *DSP, node: Index, _: u8, gpa: std.mem.Allocator) InitializeError!void {
+            const state = &dsp.nodes.items(.state)[node.idx].input;
+            if (state.parameters.input == pa.no_device) return;
+
+            const device = pa.inputDeviceById(dsp.input_devices, state.parameters.input) orelse {
+                state.parameters.input = pa.no_device;
+                return;
+            };
+            const opened = try openCapture(gpa, device);
+            if (dsp.playing) {
+                pa.startStream(opened.stream) catch |err| {
+                    pa.closeStream(opened.stream) catch {};
+                    closeCapture(gpa, opened.capture);
+                    return err;
+                };
+            }
+            state.capture = opened.capture;
+            state.stream = opened.stream;
+            state.capture_started = dsp.playing;
+        }
+
+        /// Stops and closes this node's stream before releasing callback storage.
+        fn deinitialize(dsp: *DSP, node: Index, _: u8, gpa: std.mem.Allocator) void {
+            const state = &dsp.nodes.items(.state)[node.idx].input;
+            if (state.stream) |capture_stream| {
+                if (state.capture_started) pa.stopStream(capture_stream) catch {};
+                pa.closeStream(capture_stream) catch {};
+                state.stream = null;
+            }
+            state.capture_started = false;
+            if (state.capture) |capture| {
+                closeCapture(gpa, capture);
+                state.capture = null;
+            }
+        }
+
+        /// Copies one captured block to every requested voice without blocking rendering.
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+            const state = &dsp.nodes.items(.state)[node.idx].input;
+            const sample_count: usize = @intCast(into[0].sample_count);
+            assert(sample_count <= state.last_block.len and sample_count % 2 == 0);
+
+            if (state.last_render_generation != dsp.render_generation) {
+                state.last_render_generation = dsp.render_generation;
+                @memset(state.last_block[0..sample_count], 0);
+                if (state.capture) |capture| {
+                    const frame_count = sample_count / 2;
+                    for (0..frame_count) |frame_index| {
+                        const queued = capture.queue.front() orelse break;
+                        state.last_block[frame_index * 2] = queued.left;
+                        state.last_block[frame_index * 2 + 1] = queued.right;
+                        capture.queue.pop();
+                    }
+                }
+            }
+
+            @memcpy(into[0].samples[0..sample_count], state.last_block[0..sample_count]);
+        }
+
+        /// Converts captured frames to stereo and publishes them without waiting for the renderer.
+        fn onInputCallback(
+            input: ?*const anyopaque,
+            _: ?*anyopaque,
+            frame_count: c_ulong,
+            _: ?*const pa.StreamCallbackTimeInfo,
+            _: c_ulong,
+            user_data: ?*anyopaque,
+        ) callconv(.c) c_int {
+            const source = input orelse return 0;
+            const capture: *Capture = @ptrCast(@alignCast(user_data.?));
+            const samples: [*]const f32 = @ptrCast(@alignCast(source));
+            const channels: usize = capture.channel_count;
+            for (0..@intCast(frame_count)) |frame_index| {
+                const sample_index = frame_index * channels;
+                const left = samples[sample_index];
+                const right = if (channels == 1) left else samples[sample_index + 1];
+                _ = capture.queue.tryPush(.{ .left = left, .right = right });
+            }
+            return 0;
         }
     };
 
@@ -4139,6 +4436,7 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .bit_crusher = Node.BitCrusher.metadata,
         .constant = Node.Constant.metadata,
         .duplicate = Node.Duplicate.metadata,
+        .input = Node.Input.metadata,
         .keyboard = Node.Keyboard.metadata,
         .mixer = Node.Mixer.metadata,
         .monophonic_sequencer = Node.MonophonicSequencer.metadata,
