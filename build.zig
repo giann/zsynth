@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     addSdl3(b, target, exe);
     addZstbi(b, exe);
     addZpool(b, exe);
+    addZaudio(b, exe);
     addImGUI(b, exe);
     addProtobuf(exe, protobuf_dep);
     exe.step.dependOn(gen_proto);
@@ -133,6 +134,13 @@ fn addZpool(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
 fn addZstbi(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
     const zstbi = b.dependency("zstbi", .{});
     compile_step.root_module.addImport("zstbi", zstbi.module("root"));
+}
+
+/// Adds zaudio's bindings and miniaudio implementation for decoder APIs.
+fn addZaudio(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
+    const zaudio = b.dependency("zaudio", .{});
+    compile_step.root_module.addImport("zaudio", zaudio.module("root"));
+    compile_step.root_module.linkLibrary(zaudio.artifact("miniaudio"));
 }
 
 fn addSdl3(
