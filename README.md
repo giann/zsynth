@@ -17,10 +17,11 @@ and effects to be composed into a real-time sound pipeline.
 - ADSR
 - BitCrusher
 - Noise: white, pink and brown
-- Utility nodes: Add, Multiply, Constant
-- Keyboard
+- Utility nodes: Add, Multiply, Constant, Duplicate
 - MIDI input
 - Delay
+- Ability to group nodes together
+- Polyphony
 
 ## TODO
 
@@ -38,11 +39,8 @@ and effects to be composed into a real-time sound pipeline.
 - save groups as reusable templates
 - undo/redo history
 
-## Controls and UI elements
+### Controls and UI elements
 
 - knob
 - dial
 - radio/check button
-
-The idea: you design the DSP graph and then you have can draw your UI with
-prefab elements to make your own synth that looks how you want

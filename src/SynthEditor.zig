@@ -105,8 +105,10 @@ const ParameterEditor = struct {
 
 /// Number of parameter rows available after applying the pane padding.
 const parameters_pane_padding: u32 = 1;
-/// Minimum selected-pane height, including its border and horizontal meter.
+/// Reference pane height used to size graph and waveform observers.
 const parameters_pane_min_height: u32 = 7;
+/// Maximum selected-pane content height, excluding its two border cells.
+const parameters_pane_max_content_height: u32 = 5;
 /// Maximum number of parameter rows packed into one selected-pane column.
 const parameters_pane_max_rows: u32 = 5;
 /// Label prefix used by the fixed playback status HUD.
@@ -945,18 +947,16 @@ fn writeReflectedParameters(
         }
     }
 
-    const pane_height = @min(
-        display_height,
-        @max(
-            parameters_pane_min_height,
-            observer_height + 2,
-        ),
-    );
-    if (pane_height < 2) return;
     const row_count = @min(
         @as(u32, @intCast(item_count)),
         parameters_pane_max_rows,
     );
+    const content_height = @min(
+        parameters_pane_max_content_height,
+        @max(observer_height, row_count),
+    );
+    const pane_height = @min(display_height, content_height + 2);
+    if (pane_height < 2) return;
     const rows = @min(row_count, pane_height - 2);
     // Match the selected-pane column packing while retaining each value's
     // coordinates for mouse hit-testing and the active text field.
@@ -4648,7 +4648,7 @@ pub const OutputPiano = struct {
             false, true,  false, true,  false, false,
             true,  false, true,  false, true,  false,
         };
-        const filled = [_]u8{0xFE};
+        const filled = [_]u8{0xDD};
         const blank = [_]u8{' '};
 
         assert(self.width <= max_key_count);
