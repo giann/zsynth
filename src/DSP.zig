@@ -4257,8 +4257,8 @@ pub const Node = struct {
     pub const MIDI = struct {
         /// One note's controls, held in a stable voice slot until note-off.
         pub const Held = struct {
-            /// Pitch converted to frequency in hertz.
-            freq: f32 = 0,
+            /// Raw MIDI pitch for the held note.
+            note: u7 = 0,
             /// Whether the note remains held.
             gate: f32 = 0,
             /// Normalized MIDI velocity for the held note.
@@ -4364,10 +4364,10 @@ pub const Node = struct {
             return concert_a_freq * std.math.pow(f32, 2.0, semitone_offset);
         }
 
-        /// Releases the first held voice matching a pitch and records its release velocity.
-        fn releaseHeldNote(state: *MIDI, frequency: f32, velocity: f32) void {
+        /// Releases the first held voice matching a note and records its release velocity.
+        fn releaseHeldNote(state: *MIDI, note: u7, velocity: f32) void {
             for (&state.held) |*held| {
-                if (held.gate == 0 or held.freq != frequency) continue;
+                if (held.gate == 0 or held.note != note) continue;
                 held.gate = 0;
                 held.velocity = velocity;
                 break;
@@ -4389,13 +4389,12 @@ pub const Node = struct {
                                 const msg = midi.Message.init(read[0].message);
                                 if (msg == .data) switch (msg.data.command) {
                                     .note_on => |on| {
-                                        const frequency = noteFrequency(on.note);
                                         const velocity = @as(f32, @floatFromInt(on.attack_velocity)) / 127;
                                         if (velocity > 0) {
                                             for (&state.held) |*held| {
                                                 if (held.gate != 0) continue;
                                                 held.* = .{
-                                                    .freq = frequency,
+                                                    .note = on.note,
                                                     .gate = 1,
                                                     .velocity = velocity,
                                                 };
@@ -4403,13 +4402,12 @@ pub const Node = struct {
                                             }
                                         } else {
                                             // MIDI commonly encodes note-off as note-on with zero velocity.
-                                            releaseHeldNote(state, frequency, velocity);
+                                            releaseHeldNote(state, on.note, velocity);
                                         }
                                     },
                                     .note_off => |off| {
-                                        const frequency = noteFrequency(off.note);
                                         const velocity = @as(f32, @floatFromInt(off.release_velocity)) / 127;
-                                        releaseHeldNote(state, frequency, velocity);
+                                        releaseHeldNote(state, off.note, velocity);
                                     },
                                     else => {},
                                 };
@@ -4420,7 +4418,7 @@ pub const Node = struct {
             }
 
             const held = state.held[dsp.render_voice];
-            @memset(into[0].samples[0..into[0].sample_count], held.freq);
+            @memset(into[0].samples[0..into[0].sample_count], noteFrequency(held.note));
             @memset(into[1].samples[0..into[1].sample_count], held.gate);
             @memset(into[2].samples[0..into[2].sample_count], held.velocity);
         }
