@@ -2502,15 +2502,9 @@ pub const Node = struct {
             .has_parameters = true,
             .can_link_parameters = false,
             .outputs = .{
-                .{
-                    .name = "Frequency",
-                    .short_name = "freq",
-                    .unit = "Hz",
-                    .color = .feijoa,
-                    .observer = .piano,
-                },
+                .{ .name = "Frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
                 .{ .name = "Gate", .short_name = "gate", .color = .feijoa },
-                .{},
+                .{ .name = "Note", .short_name = "note", .color = .feijoa, .observer = .piano },
                 .{},
                 .{},
                 .{},
@@ -2518,7 +2512,7 @@ pub const Node = struct {
                 .{},
             },
             .input_count = 0,
-            .output_count = 2,
+            .output_count = 3,
         };
 
         /// User-controlled octave of the lower keyboard row.
@@ -2655,6 +2649,10 @@ pub const Node = struct {
             @memset(
                 into[1].samples[0..into[1].sample_count],
                 if (raw_key == @backingInt(sdl.Keycode.unknown)) 0 else 1,
+            );
+            @memset(
+                into[2].samples[0..into[2].sample_count],
+                if (pitch) |value| @floatFromInt(value) else 0,
             );
         }
     };
@@ -3144,7 +3142,7 @@ pub const Node = struct {
         }
     };
 
-    /// Emits frequency, gate, and velocity signals from a monophonic note sequence.
+    /// Emits frequency, gate, velocity, and MIDI note signals from a monophonic note sequence.
     pub const MonophonicSequencer = struct {
         /// Port metadata for the monophonic sequencer node.
         pub const metadata = Node.Metadata{
@@ -3158,14 +3156,14 @@ pub const Node = struct {
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
                 .{ .name = "gate", .short_name = "gate", .color = .feijoa },
                 .{ .name = "velocity", .short_name = "vel", .color = .feijoa },
-                .{},
+                .{ .name = "note", .short_name = "note", .color = .feijoa, .observer = .piano },
                 .{},
                 .{},
                 .{},
                 .{},
             },
             .input_count = 0,
-            .output_count = 3,
+            .output_count = 4,
         };
 
         /// Number of ticks in one quarter note.
@@ -3189,6 +3187,8 @@ pub const Node = struct {
         note_index: usize = 0,
         /// Last played frequency, retained through gaps and after non-looping playback.
         last_frequency: f32 = 0,
+        /// Last played MIDI note, retained through gaps and after non-looping playback.
+        last_note: f32 = 0,
 
         /// Returns playback state to the beginning and preserves the note sequence.
         pub fn reset(self: *MonophonicSequencer, _: u8) void {
@@ -3196,7 +3196,7 @@ pub const Node = struct {
             self.* = .{ .parameters = parameters };
         }
 
-        /// Creates a three-output sequencer with reset playback state.
+        /// Creates a four-output sequencer with reset playback state.
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
                 .state = .{
@@ -3219,7 +3219,7 @@ pub const Node = struct {
             return @intFromFloat(@round(samples_f64));
         }
 
-        /// Advances the sequence and emits frequency, gate, and velocity per frame.
+        /// Advances the sequence and emits frequency, gate, velocity, and MIDI note per frame.
         fn process(
             dsp: *DSP,
             node: Index,
@@ -3252,6 +3252,7 @@ pub const Node = struct {
                 const sample_index = frame * 2;
 
                 var frequency: f32 = state.last_frequency;
+                var note_value: f32 = state.last_note;
                 var gate: f32 = 0;
                 var velocity: f32 = 0;
 
@@ -3269,6 +3270,8 @@ pub const Node = struct {
                         into[1].samples[sample_index + 1] = 0;
                         into[2].samples[sample_index] = 0;
                         into[2].samples[sample_index + 1] = 0;
+                        into[3].samples[sample_index] = state.last_note;
+                        into[3].samples[sample_index + 1] = state.last_note;
                         continue;
                     }
                 }
@@ -3290,6 +3293,8 @@ pub const Node = struct {
                     if (tick >= note.start_tick and note.pitch != null) {
                         frequency = note.frequency();
                         state.last_frequency = frequency;
+                        note_value = @floatFromInt(note.pitch.?);
+                        state.last_note = note_value;
                         gate = 1;
                         velocity = note.velocity;
                     }
@@ -3302,6 +3307,8 @@ pub const Node = struct {
                 into[1].samples[sample_index + 1] = gate;
                 into[2].samples[sample_index] = velocity;
                 into[2].samples[sample_index + 1] = velocity;
+                into[3].samples[sample_index] = note_value;
+                into[3].samples[sample_index + 1] = note_value;
 
                 // Advance playback by one audio frame.
                 state.position += ticks_per_frame;
@@ -4285,21 +4292,16 @@ pub const Node = struct {
             .has_parameters = true,
             .can_link_parameters = false,
             .duplicatable = false,
-            .output_count = 3,
+            .output_count = 4,
             .input_count = 0,
             .outputs = .{
-                .{
-                    .name = "Frequency",
-                    .short_name = "freq",
-                    .color = .carnation,
-                    .observer = .piano,
-                },
+                .{ .name = "Frequency", .short_name = "freq", .color = .carnation },
                 .{ .name = "Gate", .short_name = "gate", .color = .carnation },
                 .{ .name = "Velocity", .short_name = "vel", .color = .carnation },
+                .{ .name = "Note", .short_name = "note", .color = .carnation, .observer = .piano },
                 .{}, // TODO: CC
                 .{}, // TODO: After touch
                 .{}, // TODO: Pitch bend (frequency offset)
-                .{},
                 .{},
             },
         };
@@ -4439,6 +4441,7 @@ pub const Node = struct {
             @memset(into[0].samples[0..into[0].sample_count], noteFrequency(held.note));
             @memset(into[1].samples[0..into[1].sample_count], held.gate);
             @memset(into[2].samples[0..into[2].sample_count], held.velocity);
+            @memset(into[3].samples[0..into[3].sample_count], @floatFromInt(held.note));
         }
     };
 };
