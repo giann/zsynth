@@ -1620,6 +1620,7 @@ pub const Node = struct {
         adsr,
         bit_crusher,
         constant,
+        duplicate,
         keyboard,
         mixer,
         monophonic_sequencer,
@@ -1646,6 +1647,8 @@ pub const Node = struct {
         bit_crusher: BitCrusher,
         /// Constant-value source state.
         constant: Constant,
+        /// One-input signal splitter state.
+        duplicate: Duplicate,
         /// Computer-keyboard note source state.
         keyboard: Keyboard,
         /// Multi-input mixer state.
@@ -2162,6 +2165,73 @@ pub const Node = struct {
                     sum += inputs[i].samples[offset];
 
                 output.samples[offset] = sum;
+            }
+        }
+    };
+
+    /// Copies one input signal to each connected output port.
+    pub const Duplicate = struct {
+        /// Port metadata for the signal splitter.
+        pub const metadata = Node.Metadata{
+            .name = "Duplicate",
+            .short_name = "dup",
+            .color = .astral,
+            .can_link_parameters = false,
+            .inputs = .{
+                .{ .name = "input", .short_name = "in", .color = .astral },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "output 1", .short_name = "out1", .color = .astral },
+                .{ .name = "output 2", .short_name = "out2", .color = .astral },
+                .{ .name = "output 3", .short_name = "out3", .color = .astral },
+                .{ .name = "output 4", .short_name = "out4", .color = .astral },
+                .{ .name = "output 5", .short_name = "out5", .color = .astral },
+                .{ .name = "output 6", .short_name = "out6", .color = .astral },
+                .{ .name = "output 7", .short_name = "out7", .color = .astral },
+                .{ .name = "output 8", .short_name = "out8", .color = .astral },
+            },
+            .input_count = 1,
+            .output_count = max_outlets,
+        };
+
+        /// Creates a splitter with one input and every output initially unused.
+        pub fn create(name: []const u8) Node {
+            return .{
+                .state = .{ .duplicate = .{} },
+                .name = name,
+                .process = process,
+            };
+        }
+
+        /// Copies the input buffer only to output ports with graph connections.
+        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+            const input = dsp.nodes.items(.inputs)[node.idx][0];
+            if (input.isNoop()) return;
+
+            const output_connected = dsp.nodes.items(.output_connected)[node.idx];
+            var has_connected_output = false;
+            for (output_connected) |connected| {
+                if (connected) {
+                    has_connected_output = true;
+                    break;
+                }
+            }
+            if (!has_connected_output) return;
+
+            const source = try dsp.getOutput(input, into[0].sample_count);
+            for (output_connected, 0..) |connected, output_port| {
+                if (!connected) continue;
+                @memcpy(
+                    into[output_port].samples[0..source.sample_count],
+                    source.samples[0..source.sample_count],
+                );
             }
         }
     };
@@ -4068,6 +4138,7 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .adsr = Node.ADSR.metadata,
         .bit_crusher = Node.BitCrusher.metadata,
         .constant = Node.Constant.metadata,
+        .duplicate = Node.Duplicate.metadata,
         .keyboard = Node.Keyboard.metadata,
         .mixer = Node.Mixer.metadata,
         .monophonic_sequencer = Node.MonophonicSequencer.metadata,

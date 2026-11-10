@@ -18,6 +18,14 @@ nodes: std.MultiArrayList(VisualNode) = .empty,
 selected_nodes: [max_selected_nodes]VisualNode.Index = undefined,
 /// Number of valid entries in `selected_nodes`.
 selected_count: u8 = 0,
+/// Whether the current selection is being previewed as a drag transaction.
+selected_node_drag_active: bool = false,
+/// Node indices captured when the current selection drag began.
+dragged_nodes: [max_selected_nodes]VisualNode.Index = undefined,
+/// Original positions used to validate or roll back the current selection drag.
+drag_origin_positions: [max_selected_nodes]Position = undefined,
+/// Number of valid entries in `dragged_nodes` and `drag_origin_positions`.
+dragged_node_count: u8 = 0,
 graph_north_west: Position = .{ .x = 0, .y = 0 },
 graph_south_east: Position = .{ .x = 0, .y = 0 },
 // Keep track of occupied positions
@@ -705,6 +713,8 @@ pub fn reset(self: *Self, gpa: std.mem.Allocator) void {
     self.occupied.clearRetainingCapacity();
     self.path_occupied.clearRetainingCapacity();
     self.clearSelection();
+    self.selected_node_drag_active = false;
+    self.dragged_node_count = 0;
     self.graph_north_west = .{ .x = 0, .y = 0 };
     self.graph_south_east = .{ .x = 0, .y = 0 };
 }
@@ -718,6 +728,75 @@ pub fn singleSelectedNode(self: *const Self) ?VisualNode.Index {
 /// Clears every selected node.
 pub fn clearSelection(self: *Self) void {
     self.selected_count = 0;
+}
+
+/// Captures the current selection as one drag transaction.
+pub fn beginSelectedNodeDrag(self: *Self) bool {
+    if (self.selected_count == 0) return false;
+
+    self.dragged_node_count = self.selected_count;
+    for (self.selected_nodes[0..self.selected_count], 0..) |node, index| {
+        self.dragged_nodes[index] = node;
+        self.drag_origin_positions[index] = self.nodePosition(node);
+    }
+    self.selected_node_drag_active = true;
+    return true;
+}
+
+/// Moves the captured selection for preview without checking node occupancy.
+pub fn previewSelectedNodeDrag(self: *Self, delta: Position) bool {
+    if (!self.selected_node_drag_active) return false;
+
+    var positions: [max_selected_nodes]Position = undefined;
+    for (self.dragged_nodes[0..self.dragged_node_count], 0..) |_, index| {
+        const origin = self.drag_origin_positions[index];
+        const x = @as(i64, origin.x) + delta.x;
+        const y = @as(i64, origin.y) + delta.y;
+        if (x < std.math.minInt(i32) + 2 or y < std.math.minInt(i32) + 1 or
+            x > std.math.maxInt(i32) - 32 or y > std.math.maxInt(i32) - 32)
+            return false;
+        positions[index] = .{ .x = @intCast(x), .y = @intCast(y) };
+    }
+
+    for (self.dragged_nodes[0..self.dragged_node_count], 0..) |node, index|
+        self.nodes.items(.position)[node.idx] = positions[index];
+    self.updateGraphBounds();
+    return true;
+}
+
+/// Validates a selection drag, restoring its original positions on collision.
+pub fn finishSelectedNodeDrag(self: *Self, gpa: std.mem.Allocator) !bool {
+    if (!self.selected_node_drag_active) return false;
+
+    var changed = false;
+    for (self.dragged_nodes[0..self.dragged_node_count], 0..) |node, index|
+        changed = changed or !std.meta.eql(self.nodePosition(node), self.drag_origin_positions[index]);
+
+    if (!changed) {
+        self.selected_node_drag_active = false;
+        self.dragged_node_count = 0;
+        return true;
+    }
+
+    if (try self.rebuildOccupancy(gpa)) {
+        self.selected_node_drag_active = false;
+        self.dragged_node_count = 0;
+        return true;
+    }
+
+    for (self.dragged_nodes[0..self.dragged_node_count], 0..) |node, index|
+        self.nodes.items(.position)[node.idx] = self.drag_origin_positions[index];
+    self.updateGraphBounds();
+    const restored = try self.rebuildOccupancy(gpa);
+    assert(restored);
+    self.selected_node_drag_active = false;
+    self.dragged_node_count = 0;
+    return false;
+}
+
+/// Returns whether a selection drag is currently previewing node positions.
+pub fn isSelectedNodeDragActive(self: *const Self) bool {
+    return self.selected_node_drag_active;
 }
 
 /// Returns whether a node is currently selected.
@@ -934,6 +1013,14 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
 
 /// Removes a visual node and rebuilds the spatial and routing state.
 pub fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
+    if (self.selected_node_drag_active) {
+        for (self.dragged_nodes[0..self.dragged_node_count], 0..) |dragged, index|
+            self.nodes.items(.position)[dragged.idx] = self.drag_origin_positions[index];
+        self.selected_node_drag_active = false;
+        self.dragged_node_count = 0;
+        self.updateGraphBounds();
+    }
+
     self.clearPaths(gpa);
     self.path_occupied.clearRetainingCapacity();
 
@@ -967,27 +1054,38 @@ pub fn write(
     self: *Self,
     gpa: std.mem.Allocator,
     display: *Display,
+    draw_paths: bool,
 ) !void {
     // Draw groups before ordinary nodes so their selection outline remains stable.
     for (self.nodes.items(.dsp_node), 0..) |node, index| {
         if (node.isNoop() or !self.isGroup(.{ .idx = index }) or
             self.isHiddenNode(.{ .idx = index })) continue;
-        try self.writeNode(gpa, display, node);
+        if (draw_paths) {
+            try self.writeNode(gpa, display, node);
+        } else {
+            try self.writeNodeBody(gpa, display, node, .black);
+        }
     }
     for (self.nodes.items(.dsp_node), 0..) |node, index| {
         if (node.isNoop() or self.isGroup(.{ .idx = index }) or
             self.isHiddenNode(.{ .idx = index })) continue;
-        try self.writeNode(gpa, display, node);
+        if (draw_paths) {
+            try self.writeNode(gpa, display, node);
+        } else {
+            try self.writeNodeBody(gpa, display, node, .black);
+        }
     }
 
     for (self.selected_nodes[0..self.selected_count]) |node| {
         if (!node.isNoop() and !self.isHiddenNode(node)) {
             try self.writeNodeBody(gpa, display, node, .ebony);
-            try self.writeOutgoingPaths(gpa, display, node, .ebony);
+            if (draw_paths)
+                try self.writeOutgoingPaths(gpa, display, node, .ebony);
         }
     }
 
-    try self.writeOutputTail(gpa, display);
+    if (draw_paths)
+        try self.writeOutputTail(gpa, display);
 }
 
 /// Draws the transient amber marquee used to select nodes in empty space.

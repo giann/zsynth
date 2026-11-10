@@ -389,7 +389,7 @@ fn parametersToProto(
     midi_devices: []const pm.Device,
 ) !?P.Node.parameters_union {
     return switch (state) {
-        .noop, .add, .multiply, .group, .group_input, .group_output => null,
+        .noop, .add, .duplicate, .multiply, .group, .group_input, .group_output => null,
         .output => |value| blk: {
             const device = pa.deviceById(devices, value.parameters.device) orelse
                 return error.InvalidOutputDevice;
@@ -485,6 +485,7 @@ fn nodeFromProto(
     name: []const u8,
 ) !DSP.Node {
     if (std.mem.eql(u8, serialized.kind, "add")) return DSP.Node.Add.create(name);
+    if (std.mem.eql(u8, serialized.kind, "duplicate")) return DSP.Node.Duplicate.create(name);
     if (std.mem.eql(u8, serialized.kind, "multiply")) return DSP.Node.Multiply.create(name);
     if (std.mem.eql(u8, serialized.kind, "output")) {
         const default_device = pa.defaultDevice(self.dsp.devices) orelse self.dsp.devices[0].id;
@@ -702,6 +703,7 @@ fn validateDocument(document: P.SynthDocument) !void {
             switch (tag) {
                 .noop => unreachable,
                 .add,
+                .duplicate,
                 .multiply,
                 .output,
                 .constant,
@@ -899,6 +901,6 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
             .output => {},
             else => return error.InvalidNodeParameters,
         },
-        .add, .multiply, .noop, .group, .group_input, .group_output => {},
+        .add, .duplicate, .multiply, .noop, .group, .group_input, .group_output => {},
     }
 }

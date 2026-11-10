@@ -483,7 +483,10 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
 /// Redraws the editor's status text in the runtime-owned display.
 fn write(self: *Self, gpa: std.mem.Allocator) !void {
     self.zsynth.display.reset();
-    try self.editorSpace().write(gpa, &self.zsynth.display);
+    const space = self.editorSpace();
+    const draw_paths = !space.isSelectedNodeDragActive() or
+        !self.zsynth.cursor.left_mouse_moved;
+    try space.write(gpa, &self.zsynth.display, draw_paths);
     if (self.zsynth.cursor.selection_dragging)
         try self.editorSpace().writeSelectionMarquee(
             gpa,
@@ -1163,6 +1166,9 @@ fn keyUpDown(
 
     if (!event.down) return self.parameter_editor.active != null;
 
+    if (self.editorSpace().isSelectedNodeDragActive())
+        try self.finishLeftMouseDrag(gpa);
+
     if (self.parameter_editor.active != null) {
         switch (event.key) {
             .escape => {
@@ -1516,6 +1522,7 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
         .constant => |value| DSP.Node.Constant.create(source_name, value.parameters),
         .delay => |value| DSP.Node.Delay.create(source_name, value.parameters),
+        .duplicate => DSP.Node.Duplicate.create(source_name),
         .keyboard => |value| DSP.Node.Keyboard.create(source_name, value.parameters),
         .mixer => |value| DSP.Node.Mixer.create(source_name, value.parameters),
         .monophonic_sequencer => |value| DSP.Node.MonophonicSequencer.create(source_name, value.parameters),
@@ -2314,37 +2321,19 @@ fn mouseButton(
                 display_cell[0],
                 display_cell[1],
             )) |grabbed| {
-                if (!grabbed.isNoop() and self.editorSpace().isSelected(grabbed)) {
+                if (self.zsynth.cursor.left_mouse_down and !grabbed.isNoop() and
+                    self.editorSpace().isSelected(grabbed))
+                {
                     _ = self.editorSpace().revealNode(grabbed);
                     const world = self.editorSpace().worldPositionAtDisplayCell(display_cell[0], display_cell[1]);
                     self.zsynth.cursor.drag_position = .{ world.x, world.y };
+                    self.zsynth.cursor.drag_anchor = .{ world.x, world.y };
+                    _ = self.editorSpace().beginSelectedNodeDrag();
                 }
             };
             try self.write(gpa);
         } else {
-            self.zsynth.cursor.left_mouse_down = false;
-            if (self.zsynth.cursor.selection_dragging) {
-                self.editorSpace().selectRectangle(
-                    .{
-                        .x = self.zsynth.cursor.selection_anchor[0],
-                        .y = self.zsynth.cursor.selection_anchor[1],
-                    },
-                    .{
-                        .x = self.zsynth.cursor.drag_position[0],
-                        .y = self.zsynth.cursor.drag_position[1],
-                    },
-                );
-                self.refreshSelectionUi();
-                self.zsynth.cursor.selection_dragging = false;
-                self.zsynth.cursor.left_mouse_moved = false;
-                try self.write(gpa);
-            } else if (self.zsynth.cursor.left_mouse_moved) {
-                try self.editorSpace().computePaths(gpa);
-                self.zsynth.cursor.left_mouse_moved = false;
-                try self.write(gpa);
-            } else {
-                self.zsynth.cursor.left_mouse_moved = false;
-            }
+            try self.finishLeftMouseDrag(gpa);
         }
         return true;
     }
@@ -2354,6 +2343,42 @@ fn mouseButton(
     self.zsynth.cursor.middle_mouse_down = event.down;
     self.zsynth.cursor.viewport_pan_remainder = .{ 0, 0 };
     return true;
+}
+
+/// Finishes the current left-button gesture and commits or rolls back node movement.
+fn finishLeftMouseDrag(self: *Self, gpa: std.mem.Allocator) !void {
+    const cursor = &self.zsynth.cursor;
+    cursor.left_mouse_down = false;
+
+    if (cursor.selection_dragging) {
+        self.editorSpace().selectRectangle(
+            .{
+                .x = cursor.selection_anchor[0],
+                .y = cursor.selection_anchor[1],
+            },
+            .{
+                .x = cursor.drag_position[0],
+                .y = cursor.drag_position[1],
+            },
+        );
+        self.refreshSelectionUi();
+        cursor.selection_dragging = false;
+        cursor.left_mouse_moved = false;
+        try self.write(gpa);
+        return;
+    }
+
+    const moved = cursor.left_mouse_moved;
+    if (self.editorSpace().isSelectedNodeDragActive())
+        _ = try self.editorSpace().finishSelectedNodeDrag(gpa);
+
+    if (moved) {
+        try self.editorSpace().computePaths(gpa);
+        cursor.left_mouse_moved = false;
+        try self.write(gpa);
+    } else {
+        cursor.left_mouse_moved = false;
+    }
 }
 
 /// Releases keyboard notes before a mouse selection replaces the current set.
@@ -2500,27 +2525,7 @@ fn mouseMoved(
 
     if (self.zsynth.cursor.left_mouse_down) {
         if (event.state.left == 0) {
-            self.zsynth.cursor.left_mouse_down = false;
-            if (self.zsynth.cursor.selection_dragging) {
-                self.editorSpace().selectRectangle(
-                    .{
-                        .x = self.zsynth.cursor.selection_anchor[0],
-                        .y = self.zsynth.cursor.selection_anchor[1],
-                    },
-                    .{
-                        .x = self.zsynth.cursor.drag_position[0],
-                        .y = self.zsynth.cursor.drag_position[1],
-                    },
-                );
-                self.refreshSelectionUi();
-                self.zsynth.cursor.selection_dragging = false;
-                self.zsynth.cursor.left_mouse_moved = false;
-                try self.write(gpa);
-            } else if (self.zsynth.cursor.left_mouse_moved) {
-                try self.editorSpace().computePaths(gpa);
-                self.zsynth.cursor.left_mouse_moved = false;
-                try self.write(gpa);
-            }
+            try self.finishLeftMouseDrag(gpa);
             return true;
         }
 
@@ -2530,20 +2535,23 @@ fn mouseMoved(
         if (cursor_position.drag_position[0] == world.x and
             cursor_position.drag_position[1] == world.y)
             return true;
-        const previous_world = cursor_position.drag_position;
         cursor_position.drag_position = .{ world.x, world.y };
 
         if (cursor_position.selection_dragging) {
             cursor_position.left_mouse_moved = true;
             try self.write(gpa);
-        } else if (self.editorSpace().selected_count != 0) {
-            const moved = try self.editorSpace().moveSelectedNodes(gpa, .{
-                .x = world.x - previous_world[0],
-                .y = world.y - previous_world[1],
-            });
-            if (moved) {
+        } else if (self.editorSpace().isSelectedNodeDragActive()) {
+            const delta_x = @as(i64, world.x) - cursor_position.drag_anchor[0];
+            const delta_y = @as(i64, world.y) - cursor_position.drag_anchor[1];
+            if (delta_x < std.math.minInt(i32) or delta_x > std.math.maxInt(i32) or
+                delta_y < std.math.minInt(i32) or delta_y > std.math.maxInt(i32))
+                return true;
+
+            if (self.editorSpace().previewSelectedNodeDrag(.{
+                .x = @intCast(delta_x),
+                .y = @intCast(delta_y),
+            })) {
                 cursor_position.left_mouse_moved = true;
-                try self.editorSpace().computePaths(gpa);
                 try self.write(gpa);
             }
         }
@@ -3347,6 +3355,7 @@ pub const CommandPalette = struct {
             }),
             .bit_crusher => DSP.Node.BitCrusher.create(name, .{}),
             .delay => DSP.Node.Delay.create(name, .{}),
+            .duplicate => DSP.Node.Duplicate.create(name),
             .noise => DSP.Node.Noise.create(name, .{
                 .seed = 0,
             }),
