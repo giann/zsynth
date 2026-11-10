@@ -27,6 +27,8 @@ const SelectedObserver = union(enum) {
     line_plot: Self.OutputGraph,
     /// Waveform graph for an output marked as a waveform observer.
     waveform: Self.OutputWaveform,
+    /// Piano keyboard for an output marked as a piano observer.
+    piano: Self.OutputPiano,
 };
 
 /// Converts a logical pixel extent to the number of display cells it occupies.
@@ -381,6 +383,10 @@ fn update(
             assert(waveform.parameters.node.idx == selected_node.idx);
             waveform.update(&self.dsp);
         },
+        .piano => |*piano| {
+            assert(piano.parameters.node.idx == selected_node.idx);
+            piano.update(&self.dsp);
+        },
     };
 }
 
@@ -448,6 +454,16 @@ fn refreshSelectionUi(self: *Self) void {
                         waveform.parameters.height,
                         graphic.cell_height * graphic.scale,
                     ),
+                );
+            },
+            .piano => {
+                var piano: OutputPiano = .{};
+                piano.configure(selected_node, port);
+                self.selected_observers[output_port] = .{ .piano = piano };
+                self.selected_observer_width += piano.width;
+                self.selected_observer_height = @max(
+                    self.selected_observer_height,
+                    OutputPiano.height,
                 );
             },
         }
@@ -1054,6 +1070,13 @@ fn writeReflectedParameters(
                         graphic.cell_width * graphic.scale,
                     );
                 },
+                .piano => |*piano| {
+                    try piano.write(gpa, display, .{
+                        observer_x,
+                        pane_top + parameters_pane_padding,
+                    });
+                    observer_x += piano.width;
+                },
             }
             observers_drawn += 1;
             if (observers_drawn < observer_count)
@@ -1266,6 +1289,7 @@ fn keyUpDown(
                     .meter => |*meter| meter.reset(),
                     .line_plot => |*graph| graph.reset(),
                     .waveform => |*waveform| waveform.reset(),
+                    .piano => |*piano| piano.reset(),
                 };
                 self.output_waveform.reset();
                 try self.writeSelectedParametersPane(gpa);
@@ -1915,7 +1939,11 @@ fn commitParameterEdit(self: *Self) void {
             self.dsp.setNodePolyphony(self.serializer.allocator, active.node, value) catch {};
     } else {
         var context = ParameterEditor.CommitContext{ .editor = self };
-        self.dsp.withGraphLock(&context, commitParameterLocked);
+        self.dsp.withGraphLock(
+            *ParameterEditor.CommitContext,
+            &context,
+            commitParameterLocked,
+        );
     }
     var buffer: [64]u8 = undefined;
     const committed = self.parameter_editor.active orelse return;
@@ -4464,6 +4492,182 @@ pub const OutputWaveform = struct {
             }
         }
         return sample_count;
+    }
+};
+
+/// Displays the held notes from a Keyboard or MIDI node on a moving piano range.
+pub const OutputPiano = struct {
+    /// Node whose held-note state supplies the highlighted keys.
+    parameters: Parameters = .{},
+    /// Highlight state for the semitones in the displayed piano range.
+    active: [max_key_count]bool = @splat(false),
+    /// Width of the rendered piano in display cells.
+    width: u32 = key_count * 2,
+    /// MIDI octave of the lowest C currently shown by the piano.
+    first_octave: i8 = 2,
+
+    /// Number of semitones in one octave.
+    pub const key_count: u32 = 12;
+    /// Maximum number of semitones retained by the fixed observer buffer.
+    pub const max_key_count: u32 = 128;
+    /// Height of the piano observer in display cells, including its label.
+    pub const height: u32 = 3;
+
+    /// Node and octave used by one piano observer.
+    pub const Parameters = struct {
+        /// Node whose held notes are displayed.
+        node: DSP.Node.Index = undefined,
+        /// Number of octaves displayed by the piano.
+        octave: u8 = 2,
+    };
+
+    /// Arguments passed through the graph lock while collecting held notes.
+    const UpdateContext = struct {
+        /// Observer receiving the active-note snapshot.
+        observer: *OutputPiano,
+        /// DSP graph containing the selected node.
+        dsp: *DSP,
+    };
+
+    /// Binds the piano to a node and clears its current highlighted notes.
+    pub fn configure(self: *OutputPiano, node: DSP.Node.Index, _: u8) void {
+        self.parameters.node = node;
+        assert(self.parameters.octave > 0);
+        assert(@as(u32, self.parameters.octave) * key_count <= max_key_count);
+        self.width = @as(u32, self.parameters.octave) * key_count;
+        self.first_octave = 2;
+        self.reset();
+    }
+
+    /// Clears all highlighted keys.
+    pub fn reset(self: *OutputPiano) void {
+        self.active = @splat(false);
+    }
+
+    /// Takes a synchronized snapshot of the node's currently held notes.
+    pub fn update(self: *OutputPiano, dsp: *DSP) void {
+        var context = UpdateContext{ .observer = self, .dsp = dsp };
+        dsp.withGraphLock(*UpdateContext, &context, updateLocked);
+    }
+
+    /// Collects Keyboard and MIDI notes while the DSP graph is quiescent.
+    fn updateLocked(context: *UpdateContext) void {
+        const self = context.observer;
+        self.reset();
+
+        var notes: [DSP.max_polyphony]u7 = undefined;
+        var note_count: usize = 0;
+        var keyboard_octave: ?i8 = null;
+        const state = &context.dsp.nodes.items(.state)[self.parameters.node.idx];
+        switch (state.*) {
+            .keyboard => |*keyboard| {
+                keyboard_octave = keyboard.parameters.octave;
+                for (&keyboard.voice_keys, 0..) |*key, voice| {
+                    if (key.load(.acquire) == @backingInt(sdl.Keycode.unknown))
+                        continue;
+                    const pitch = keyboard.voice_pitches[voice].load(.acquire);
+                    if (pitch == std.math.maxInt(u8))
+                        continue;
+                    notes[note_count] = @intCast(pitch);
+                    note_count += 1;
+                }
+            },
+            .midi => |*midi| {
+                for (midi.held) |held| {
+                    if (held.gate == 0)
+                        continue;
+                    notes[note_count] = held.note;
+                    note_count += 1;
+                }
+            },
+            else => {},
+        }
+
+        if (note_count != 0)
+            self.first_octave = self.selectWindow(notes[0..note_count])
+        else if (keyboard_octave) |octave|
+            self.first_octave = octave;
+
+        for (notes[0..note_count]) |pitch|
+            self.markPitch(pitch);
+    }
+
+    /// Selects the C-based display window containing the most held notes.
+    fn selectWindow(self: *const OutputPiano, notes: []const u7) i8 {
+        assert(notes.len != 0);
+
+        var minimum_octave: i16 = 127;
+        var maximum_octave: i16 = -128;
+        for (notes) |pitch| {
+            const octave = @divTrunc(@as(i16, pitch), 12) - 1;
+            minimum_octave = @min(minimum_octave, octave);
+            maximum_octave = @max(maximum_octave, octave);
+        }
+
+        const displayed_key_count: i16 = @intCast(
+            @as(u32, self.parameters.octave) * key_count,
+        );
+        var best_octave = minimum_octave;
+        var best_count: usize = 0;
+        var candidate = minimum_octave;
+        while (candidate <= maximum_octave) : (candidate += 1) {
+            const first_pitch = (candidate + 1) * 12;
+            var count: usize = 0;
+            for (notes) |pitch| {
+                const offset = @as(i16, pitch) - first_pitch;
+                if (offset >= 0 and offset < displayed_key_count)
+                    count += 1;
+            }
+            if (count > best_count) {
+                best_count = count;
+                best_octave = candidate;
+            }
+        }
+        return @intCast(best_octave);
+    }
+
+    /// Marks a pitch when it belongs to the current displayed octave range.
+    fn markPitch(self: *OutputPiano, pitch: u7) void {
+        const first_pitch = (@as(i16, self.first_octave) + 1) * 12;
+        const offset = @as(i16, pitch) - first_pitch;
+        const displayed_key_count: i16 = @intCast(
+            @as(u32, self.parameters.octave) * key_count,
+        );
+        if (offset >= 0 and offset < displayed_key_count)
+            self.active[@intCast(offset)] = true;
+    }
+
+    /// Writes the piano keyboard and its lowest-note label at the supplied origin.
+    pub fn write(
+        self: *const OutputPiano,
+        gpa: std.mem.Allocator,
+        display: *Display,
+        position: [2]u32,
+    ) !void {
+        const black_keys = [_]bool{
+            false, true,  false, true,  false, false,
+            true,  false, true,  false, true,  false,
+        };
+        const filled = [_]u8{0xFE};
+        const blank = [_]u8{' '};
+
+        assert(self.width <= max_key_count);
+        for (0..self.width) |key| {
+            const x = position[0] + @as(u32, @intCast(key));
+            const semitone = key % key_count;
+            const is_black = black_keys[semitone];
+            const top_glyph = if (is_black) filled else blank;
+            const top_fg = if (self.active[key]) Display.Color.gray_chateau else Display.Color.black;
+            try display.write(gpa, top_glyph[0..], x, position[1], .white, top_fg);
+
+            const bottom_glyph = if (self.active[key] and !is_black) filled else blank;
+            const bottom_fg = if (self.active[key]) Display.Color.gray_chateau else Display.Color.black;
+            try display.write(gpa, bottom_glyph[0..], x, position[1] + 1, .white, bottom_fg);
+        }
+
+        var label: [16]u8 = undefined;
+        const label_text = std.fmt.bufPrint(&label, "C{d}", .{self.first_octave}) catch unreachable;
+        try display.write(gpa, label_text, position[0], position[1] + 2, .ebony, .white);
     }
 };
 

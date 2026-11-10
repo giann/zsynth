@@ -1353,7 +1353,12 @@ fn unlockGraph(self: *DSP) void {
 }
 
 /// Runs a bounded main-thread update while excluding the audio graph traversal.
-pub fn withGraphLock(self: *DSP, context: anytype, callback: anytype) void {
+pub fn withGraphLock(
+    self: *DSP,
+    comptime Context: type,
+    context: Context,
+    callback: *const fn (Context) void,
+) void {
     self.lockGraph();
     defer self.unlockGraph();
     callback(context);
@@ -1804,6 +1809,8 @@ pub const Node = struct {
         line_plot,
         /// Display recent audio samples as a filled stereo waveform.
         waveform,
+        /// Display held notes on a one-octave piano keyboard.
+        piano,
         /// Do not display an output observer.
         none,
     };
@@ -2495,7 +2502,13 @@ pub const Node = struct {
             .has_parameters = true,
             .can_link_parameters = false,
             .outputs = .{
-                .{ .name = "Frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
+                .{
+                    .name = "Frequency",
+                    .short_name = "freq",
+                    .unit = "Hz",
+                    .color = .feijoa,
+                    .observer = .piano,
+                },
                 .{ .name = "Gate", .short_name = "gate", .color = .feijoa },
                 .{},
                 .{},
@@ -4275,7 +4288,12 @@ pub const Node = struct {
             .output_count = 3,
             .input_count = 0,
             .outputs = .{
-                .{ .name = "Frequency", .short_name = "freq", .color = .carnation },
+                .{
+                    .name = "Frequency",
+                    .short_name = "freq",
+                    .color = .carnation,
+                    .observer = .piano,
+                },
                 .{ .name = "Gate", .short_name = "gate", .color = .carnation },
                 .{ .name = "Velocity", .short_name = "vel", .color = .carnation },
                 .{}, // TODO: CC
