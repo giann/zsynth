@@ -125,7 +125,7 @@ zsynth: *ZSynth,
 /// DSP graph constructed when the editor enters the state stack.
 dsp: DSP,
 space: Space,
-/// Protobuf serializer bound to the live graph and its visual layout.
+/// JSON serializer bound to the live graph and its visual layout.
 serializer: Serializer,
 /// Allocated path of the graph most recently saved or loaded.
 document_path: ?[]u8 = null,
@@ -534,11 +534,17 @@ fn rememberDocumentPath(self: *Self, gpa: std.mem.Allocator, path: []const u8) !
     self.zsynth.cursor.dirty = true;
 }
 
-/// Saves the graph and updates the remembered document path after success.
-fn saveDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+/// Saves the graph as JSON and remembers its normalized path.
+fn saveDocument(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    const normalized_path = try Serializer.pathForJson(gpa, path);
+    defer gpa.free(normalized_path);
     self.persistGroupPositions();
-    try self.serializer.save(path);
-    try self.rememberDocumentPath(gpa, path);
+    try self.serializer.save(normalized_path);
+    try self.rememberDocumentPath(gpa, normalized_path);
 }
 
 /// Loads the graph and updates the remembered document path after success.
@@ -557,15 +563,19 @@ fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
     try self.rememberDocumentPath(gpa, path);
 }
 
-/// Returns the final filename without its path or final extension.
+/// Returns the document filename without its path or format suffix.
 fn documentName(path: []const u8) []const u8 {
     var name_start: usize = 0;
     for (path, 0..) |character, index| {
-        if (character == std.fs.path.sep)
+        if (character == '/' or character == '\\')
             name_start = index + 1;
     }
 
     const name = path[name_start..];
+    if (std.mem.endsWith(u8, name, ".zsynth.json"))
+        return name[0 .. name.len - ".zsynth.json".len];
+    if (std.mem.endsWith(u8, name, ".zsynth"))
+        return name[0 .. name.len - ".zsynth".len];
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |extension_start|
         if (extension_start > 0)
             return name[0..extension_start];
@@ -576,24 +586,9 @@ fn documentName(path: []const u8) []const u8 {
 fn writeDocumentName(self: *Self, gpa: std.mem.Allocator) !void {
     const path = self.document_path orelse return;
 
-    var name_start: usize = 0;
-    for (path, 0..) |character, index| {
-        if (character == '/' or character == '\\')
-            name_start = index + 1;
-    }
-
-    const name = path[name_start..];
-    const displayed_name = if (std.mem.lastIndexOfScalar(u8, name, '.')) |extension_start|
-        if (extension_start > 0)
-            name[0..extension_start]
-        else
-            name
-    else
-        name;
-
     try self.zsynth.ui_display.write(
         gpa,
-        displayed_name,
+        documentName(path),
         0,
         0,
         .black,
@@ -1264,10 +1259,10 @@ fn keyUpDown(
             );
         },
         .s => if (command) {
-            self.saveDocument(gpa, "./simpleDSP.zsynth") catch return error.IoError;
+            self.saveDocument(gpa, "./simpleDSP.zsynth.json") catch return error.IoError;
         } else return false,
         .l => if (command) {
-            self.loadDocument(gpa, "./simpleDSP.zsynth") catch return error.IoError;
+            self.loadDocument(gpa, "./simpleDSP.zsynth.json") catch return error.IoError;
             self.setNodeSelection(null);
             self.zsynth.cursor.dirty = true;
             try self.write(gpa);

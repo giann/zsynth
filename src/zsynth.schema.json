@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth.schema.json",
+  "title": "ZSynth document",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "output_node",
+    "nodes",
+    "viewport_x",
+    "viewport_y"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth.schema.json"
+    },
+    "schema_version": { "const": 1 },
+    "output_node": { "$ref": "#/$defs/uint32" },
+    "nodes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "viewport_x": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+    "viewport_y": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 }
+  },
+  "$defs": {
+    "uint32": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "int32": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+    "uint64": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+    "number": { "type": "number" },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_port", "source_node", "source_port"],
+      "properties": {
+        "input_port": { "$ref": "#/$defs/uint32" },
+        "source_node": { "$ref": "#/$defs/uint32" },
+        "source_port": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "groupBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_port", "member_node", "member_port"],
+      "properties": {
+        "group_port": { "$ref": "#/$defs/uint32" },
+        "member_node": { "$ref": "#/$defs/uint32" },
+        "member_port": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name",
+        "x",
+        "y",
+        "inputs",
+        "parameter_source",
+        "group_members",
+        "group_inputs",
+        "group_outputs"
+      ],
+      "properties": {
+        "kind": { "type": "string" },
+        "name": { "type": "string" },
+        "x": { "$ref": "#/$defs/int32" },
+        "y": { "$ref": "#/$defs/int32" },
+        "inputs": { "type": "array", "items": { "$ref": "#/$defs/connection" } },
+        "parameter_source": { "$ref": "#/$defs/uint32" },
+        "group_members": { "type": "array", "items": { "$ref": "#/$defs/uint32" } },
+        "group_inputs": { "type": "array", "items": { "$ref": "#/$defs/groupBinding" } },
+        "group_outputs": { "type": "array", "items": { "$ref": "#/$defs/groupBinding" } },
+        "group_owner": { "$ref": "#/$defs/uint32" },
+        "group_port": { "$ref": "#/$defs/uint32" },
+        "polyphony": { "$ref": "#/$defs/uint32" },
+        "parameters": { "$ref": "#/$defs/parameters" }
+      }
+    },
+    "parameters": {
+      "oneOf": [
+        { "$ref": "#/$defs/constantVariant" },
+        { "$ref": "#/$defs/oscillatorVariant" },
+        { "$ref": "#/$defs/mixerVariant" },
+        { "$ref": "#/$defs/sequencerVariant" },
+        { "$ref": "#/$defs/adsrVariant" },
+        { "$ref": "#/$defs/filterVariant" },
+        { "$ref": "#/$defs/bitCrusherVariant" },
+        { "$ref": "#/$defs/noiseVariant" },
+        { "$ref": "#/$defs/keyboardVariant" },
+        { "$ref": "#/$defs/midiVariant" },
+        { "$ref": "#/$defs/outputVariant" },
+        { "$ref": "#/$defs/delayVariant" },
+        { "$ref": "#/$defs/inputVariant" }
+      ]
+    },
+    "constantVariant": {
+      "type": "object", "additionalProperties": false, "required": ["constant"],
+      "properties": { "constant": { "$ref": "#/$defs/constantParameters" } }
+    },
+    "oscillatorVariant": {
+      "type": "object", "additionalProperties": false, "required": ["oscillator"],
+      "properties": { "oscillator": { "$ref": "#/$defs/oscillatorParameters" } }
+    },
+    "mixerVariant": {
+      "type": "object", "additionalProperties": false, "required": ["mixer"],
+      "properties": { "mixer": { "$ref": "#/$defs/mixerParameters" } }
+    },
+    "sequencerVariant": {
+      "type": "object", "additionalProperties": false, "required": ["sequencer"],
+      "properties": { "sequencer": { "$ref": "#/$defs/sequencerParameters" } }
+    },
+    "adsrVariant": {
+      "type": "object", "additionalProperties": false, "required": ["adsr"],
+      "properties": { "adsr": { "$ref": "#/$defs/adsrParameters" } }
+    },
+    "filterVariant": {
+      "type": "object", "additionalProperties": false, "required": ["filter"],
+      "properties": { "filter": { "$ref": "#/$defs/filterParameters" } }
+    },
+    "bitCrusherVariant": {
+      "type": "object", "additionalProperties": false, "required": ["bit_crusher"],
+      "properties": { "bit_crusher": { "$ref": "#/$defs/bitCrusherParameters" } }
+    },
+    "noiseVariant": {
+      "type": "object", "additionalProperties": false, "required": ["noise"],
+      "properties": { "noise": { "$ref": "#/$defs/noiseParameters" } }
+    },
+    "keyboardVariant": {
+      "type": "object", "additionalProperties": false, "required": ["keyboard"],
+      "properties": { "keyboard": { "$ref": "#/$defs/keyboardParameters" } }
+    },
+    "midiVariant": {
+      "type": "object", "additionalProperties": false, "required": ["midi"],
+      "properties": { "midi": { "$ref": "#/$defs/midiParameters" } }
+    },
+    "outputVariant": {
+      "type": "object", "additionalProperties": false, "required": ["output"],
+      "properties": { "output": { "$ref": "#/$defs/outputParameters" } }
+    },
+    "delayVariant": {
+      "type": "object", "additionalProperties": false, "required": ["delay"],
+      "properties": { "delay": { "$ref": "#/$defs/delayParameters" } }
+    },
+    "inputVariant": {
+      "type": "object", "additionalProperties": false, "required": ["input"],
+      "properties": { "input": { "$ref": "#/$defs/inputParameters" } }
+    },
+    "constantParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "constant": { "$ref": "#/$defs/number" } }
+    },
+    "oscillatorParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "waveform": { "type": "string" },
+        "phase_offset": { "$ref": "#/$defs/number" },
+        "default_frequency": { "$ref": "#/$defs/number" },
+        "default_amplitude": { "$ref": "#/$defs/number" }
+      }
+    },
+    "mixerParameters": {
+      "type": "object", "additionalProperties": false,
+      "required": ["gains", "pans"],
+      "properties": {
+        "gain": { "$ref": "#/$defs/number" },
+        "gains": { "type": "array", "items": { "$ref": "#/$defs/number" } },
+        "pans": { "type": "array", "items": { "$ref": "#/$defs/number" } }
+      }
+    },
+    "sequencerParameters": {
+      "type": "object", "additionalProperties": false, "required": ["notes"],
+      "properties": {
+        "bpm": { "$ref": "#/$defs/uint32" },
+        "notes": { "type": "array", "items": { "$ref": "#/$defs/note" } },
+        "loop": { "type": "boolean" }
+      }
+    },
+    "note": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "pitch": { "$ref": "#/$defs/uint32" },
+        "has_pitch": { "type": "boolean" },
+        "start_tick": { "$ref": "#/$defs/uint64" },
+        "duration_ticks": { "$ref": "#/$defs/uint64" },
+        "velocity": { "$ref": "#/$defs/number" }
+      }
+    },
+    "adsrParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "attack": { "$ref": "#/$defs/number" },
+        "attack_curve": { "type": "string" },
+        "decay": { "$ref": "#/$defs/number" },
+        "decay_curve": { "type": "string" },
+        "sustain": { "$ref": "#/$defs/number" },
+        "release": { "$ref": "#/$defs/number" },
+        "release_curve": { "type": "string" }
+      }
+    },
+    "filterParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string" },
+        "default_cutoff": { "$ref": "#/$defs/number" },
+        "default_resonance": { "$ref": "#/$defs/number" }
+      }
+    },
+    "bitCrusherParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "target_sample_rate": { "$ref": "#/$defs/uint32" },
+        "bit_depth": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "delayParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "delay_ms": { "$ref": "#/$defs/number" },
+        "wetness": { "$ref": "#/$defs/number" },
+        "feedback": { "$ref": "#/$defs/uint32" },
+        "decay": { "$ref": "#/$defs/number" }
+      }
+    },
+    "noiseParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "seed": { "$ref": "#/$defs/uint64" },
+        "type": { "type": "string" },
+        "amplitude": { "$ref": "#/$defs/number" }
+      }
+    },
+    "keyboardParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "octave": { "$ref": "#/$defs/int32" } }
+    },
+    "midiParameters": {
+      "type": "object", "additionalProperties": false, "required": ["source"],
+      "properties": {
+        "source": { "$ref": "#/$defs/uint32" },
+        "interface_name": { "type": "string" },
+        "device_name": { "type": "string" }
+      }
+    },
+    "outputParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "host_api_name": { "type": "string" }, "device_name": { "type": "string" } }
+    },
+    "inputParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "host_api_name": { "type": "string" }, "device_name": { "type": "string" } }
+    }
+  }
+}

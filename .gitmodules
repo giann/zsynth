@@ -10,3 +10,6 @@
 [submodule "vendors/asio"]
 	path = vendors/asio
 	url = https://github.com/audiosdk/asio.git
+[submodule "vendors/portsmf"]
+	path = vendors/portsmf
+	url = https://github.com/rbdannenberg/portsmf.git

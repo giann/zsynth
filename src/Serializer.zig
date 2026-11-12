@@ -1,23 +1,255 @@
-//! Protobuf persistence for the DSP graph and SynthEditor layout.
+//! JSON persistence for the DSP graph and SynthEditor layout.
 const std = @import("std");
 const DSP = @import("DSP.zig");
 const pa = @import("portaudio.zig");
 const pm = @import("portmidi.zig");
 const Space = @import("Space.zig");
-const P = @import("zsynth.pb.zig");
 
-/// Current on-disk protobuf schema version.
+/// In-memory representation of the JSON document used for persistence.
+const Serialized = struct {
+    /// Persisted synth document and visual editor state.
+    pub const SynthDocument = struct {
+        schema_version: u32 = 0,
+        output_node: u32 = 0,
+        nodes: std.ArrayList(Node) = .empty,
+        viewport_x: i32 = 0,
+        viewport_y: i32 = 0,
+    };
+
+    /// Persisted graph node and its optional parameter variant.
+    pub const Node = struct {
+        kind: []const u8 = &.{},
+        name: []const u8 = &.{},
+        x: i32 = 0,
+        y: i32 = 0,
+        inputs: std.ArrayList(Connection) = .empty,
+        parameter_source: u32 = 0,
+        group_members: std.ArrayList(u32) = .empty,
+        group_inputs: std.ArrayList(GroupBinding) = .empty,
+        group_outputs: std.ArrayList(GroupBinding) = .empty,
+        group_owner: ?u32 = null,
+        group_port: ?u32 = null,
+        polyphony: ?u32 = null,
+        parameters: ?parameters_union = null,
+
+        /// Names the persisted parameter variants.
+        pub const _parameters_case = enum {
+            constant,
+            oscillator,
+            mixer,
+            sequencer,
+            adsr,
+            filter,
+            bit_crusher,
+            noise,
+            keyboard,
+            midi,
+            output,
+            delay,
+            input,
+        };
+
+        /// Stores the typed parameters for a node.
+        pub const parameters_union = union(_parameters_case) {
+            constant: ConstantParameters,
+            oscillator: OscillatorParameters,
+            mixer: MixerParameters,
+            sequencer: SequencerParameters,
+            adsr: AdsrParameters,
+            filter: FilterParameters,
+            bit_crusher: BitCrusherParameters,
+            noise: NoiseParameters,
+            keyboard: KeyboardParameters,
+            midi: MIDIParameterse,
+            output: OutputParameters,
+            delay: DelayParameters,
+            input: InputParameters,
+        };
+    };
+
+    /// Persisted connection between two graph nodes.
+    pub const Connection = struct {
+        input_port: u32 = 0,
+        source_node: u32 = 0,
+        source_port: u32 = 0,
+    };
+
+    /// Persisted binding between a group port and one of its members.
+    pub const GroupBinding = struct {
+        group_port: u32 = 0,
+        member_node: u32 = 0,
+        member_port: u32 = 0,
+    };
+
+    /// Persisted constant node parameters.
+    pub const ConstantParameters = struct { constant: ?f32 = null };
+
+    /// Persisted MIDI device identity and legacy device index.
+    pub const MIDIParameterse = struct {
+        source: u32 = 0,
+        interface_name: ?[]const u8 = null,
+        device_name: ?[]const u8 = null,
+    };
+
+    /// Persisted oscillator parameters.
+    pub const OscillatorParameters = struct {
+        waveform: ?[]const u8 = null,
+        phase_offset: ?f32 = null,
+        default_frequency: ?f32 = null,
+        default_amplitude: ?f32 = null,
+    };
+
+    /// Persisted mixer parameters.
+    pub const MixerParameters = struct {
+        gain: ?f32 = null,
+        gains: std.ArrayList(f32) = .empty,
+        pans: std.ArrayList(f32) = .empty,
+    };
+
+    /// Persisted sequencer parameters.
+    pub const SequencerParameters = struct {
+        bpm: ?u32 = null,
+        notes: std.ArrayList(Note) = .empty,
+        loop: ?bool = null,
+    };
+
+    /// Persisted sequencer note.
+    pub const Note = struct {
+        pitch: ?u32 = null,
+        has_pitch: ?bool = null,
+        start_tick: ?u64 = null,
+        duration_ticks: ?u64 = null,
+        velocity: ?f32 = null,
+    };
+
+    /// Persisted ADSR envelope parameters.
+    pub const AdsrParameters = struct {
+        attack: ?f32 = null,
+        attack_curve: ?[]const u8 = null,
+        decay: ?f32 = null,
+        decay_curve: ?[]const u8 = null,
+        sustain: ?f32 = null,
+        release: ?f32 = null,
+        release_curve: ?[]const u8 = null,
+    };
+
+    /// Persisted multimode filter parameters.
+    pub const FilterParameters = struct {
+        type: ?[]const u8 = null,
+        default_cutoff: ?f32 = null,
+        default_resonance: ?f32 = null,
+    };
+
+    /// Persisted bit crusher parameters.
+    pub const BitCrusherParameters = struct {
+        target_sample_rate: ?u32 = null,
+        bit_depth: ?u32 = null,
+    };
+
+    /// Persisted delay parameters.
+    pub const DelayParameters = struct {
+        delay_ms: ?f32 = null,
+        wetness: ?f32 = null,
+        feedback: ?u32 = null,
+        decay: ?f32 = null,
+    };
+
+    /// Persisted noise parameters.
+    pub const NoiseParameters = struct {
+        seed: ?u64 = null,
+        type: ?[]const u8 = null,
+        amplitude: ?f32 = null,
+    };
+
+    /// Persisted keyboard parameters.
+    pub const KeyboardParameters = struct { octave: ?i32 = null };
+
+    /// Persisted output device identity.
+    pub const OutputParameters = struct {
+        host_api_name: ?[]const u8 = null,
+        device_name: ?[]const u8 = null,
+    };
+
+    /// Persisted input device identity.
+    pub const InputParameters = struct {
+        host_api_name: ?[]const u8 = null,
+        device_name: ?[]const u8 = null,
+    };
+};
+
+/// Current on-disk JSON schema version.
 const schema_version: u32 = 1;
 
+/// Canonical schema reference embedded in saved JSON synth documents.
+const json_schema_uri = "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth.schema.json";
+
+/// JSON representation of a synth document using std.json-compatible slices.
+const JsonSynthDocument = struct {
+    @"$schema": []const u8 = json_schema_uri,
+    schema_version: u32 = 0,
+    output_node: u32 = 0,
+    nodes: []const JsonNode = &.{},
+    viewport_x: i32 = 0,
+    viewport_y: i32 = 0,
+};
+
+/// JSON representation of a graph node and its optional parameter variant.
+const JsonNode = struct {
+    kind: []const u8 = "",
+    name: []const u8 = "",
+    x: i32 = 0,
+    y: i32 = 0,
+    inputs: []const Serialized.Connection = &.{},
+    parameter_source: u32 = 0,
+    group_members: []const u32 = &.{},
+    group_inputs: []const Serialized.GroupBinding = &.{},
+    group_outputs: []const Serialized.GroupBinding = &.{},
+    group_owner: ?u32 = null,
+    group_port: ?u32 = null,
+    polyphony: ?u32 = null,
+    parameters: ?JsonParameters = null,
+};
+
+/// JSON representation of the parameter variants.
+const JsonParameters = union(enum) {
+    constant: Serialized.ConstantParameters,
+    oscillator: Serialized.OscillatorParameters,
+    mixer: JsonMixerParameters,
+    sequencer: JsonSequencerParameters,
+    adsr: Serialized.AdsrParameters,
+    filter: Serialized.FilterParameters,
+    bit_crusher: Serialized.BitCrusherParameters,
+    noise: Serialized.NoiseParameters,
+    keyboard: Serialized.KeyboardParameters,
+    midi: Serialized.MIDIParameterse,
+    output: Serialized.OutputParameters,
+    delay: Serialized.DelayParameters,
+    input: Serialized.InputParameters,
+};
+
+/// Slice-based JSON representation of mixer parameters.
+const JsonMixerParameters = struct {
+    gain: ?f32 = null,
+    gains: []const f32 = &.{},
+    pans: []const f32 = &.{},
+};
+
+/// Slice-based JSON representation of sequencer parameters.
+const JsonSequencerParameters = struct {
+    bpm: ?u32 = null,
+    notes: []const Serialized.Note = &.{},
+    loop: ?bool = null,
+};
+
 /// Returns the ordered member slot for a serialized group member.
-fn serializedGroupMemberSlot(group: P.Node, member: u32) ?u8 {
+fn serializedGroupMemberSlot(group: Serialized.Node, member: u32) ?u8 {
     for (group.group_members.items, 0..) |candidate, slot|
         if (candidate == member) return @intCast(slot);
     return null;
 }
 
 /// Builds and hashes the exact bounded identity used to validate a serialized group link.
-fn serializedGroupSubgraphHash(nodes: []const P.Node, group_index: usize) ?u64 {
+fn serializedGroupSubgraphHash(nodes: []const Serialized.Node, group_index: usize) ?u64 {
     if (group_index >= nodes.len or !std.mem.eql(u8, nodes[group_index].kind, "group")) return null;
     const group = nodes[group_index];
     if (group.group_members.items.len > DSP.max_group_members) return null;
@@ -101,6 +333,30 @@ io: std.Io,
 owned_names: std.ArrayList([]u8) = .empty,
 owned_notes: std.ArrayList([]DSP.Note) = .empty,
 
+/// Returns a path with the canonical JSON synth suffix.
+pub fn pathForJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0)
+        return error.EmptySynthPath;
+
+    const json_suffix = ".zsynth.json";
+    if (std.mem.endsWith(u8, path, json_suffix))
+        return allocator.dupe(u8, path);
+
+    const stem = if (std.mem.endsWith(u8, path, ".zsynth"))
+        path[0 .. path.len - ".zsynth".len]
+    else
+        path;
+    const normalized = try allocator.alloc(u8, stem.len + json_suffix.len);
+    @memcpy(normalized[0..stem.len], stem);
+    @memcpy(normalized[stem.len..], json_suffix);
+    return normalized;
+}
+
+/// Returns whether a path uses the canonical JSON synth suffix.
+fn isJsonPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".zsynth.json");
+}
+
 /// Releases allocations retained by the current loaded document.
 pub fn deinit(self: *Serializer) void {
     for (self.owned_names.items) |name|
@@ -116,7 +372,7 @@ pub fn clearOwned(self: *Serializer) void {
     self.releaseOwned();
 }
 
-/// Writes the current graph, visual node positions, and viewport position to a protobuf file.
+/// Writes the current graph, visual node positions, and viewport position as JSON.
 pub fn save(self: *Serializer, path: []const u8) !void {
     if (path.len == 0)
         return error.EmptySynthPath;
@@ -125,7 +381,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
     defer arena.deinit();
     const arena_gpa = arena.allocator();
 
-    var document = P.SynthDocument{
+    var document = Serialized.SynthDocument{
         .schema_version = schema_version,
         .output_node = @intCast(self.dsp.output.idx),
         .viewport_x = self.space.viewport.x,
@@ -136,7 +392,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
         return error.InvalidVisualGraph;
 
     for (self.dsp.nodes.items(.state), 0..) |state, index| {
-        var node = P.Node{
+        var node = Serialized.Node{
             .kind = @tagName(std.meta.activeTag(state)),
             .name = self.dsp.nodes.items(.name)[index],
             .x = self.space.nodePosition(.{ .idx = index }).x,
@@ -191,7 +447,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             });
         }
 
-        node.parameters = try parametersToProto(
+        node.parameters = try parametersToSerialized(
             state,
             arena_gpa,
             self.dsp.devices,
@@ -210,7 +466,14 @@ pub fn save(self: *Serializer, path: []const u8) !void {
     defer file.close(self.io);
     var buffer: [1024]u8 = undefined;
     var writer = file.writer(self.io, &buffer);
-    try document.encode(&writer.interface, arena_gpa);
+    const json_document = try documentToJson(document, arena_gpa);
+    const contents = try std.json.Stringify.valueAlloc(
+        arena_gpa,
+        json_document,
+        .{ .whitespace = .indent_2 },
+    );
+    try writer.interface.writeAll(contents);
+    try writer.interface.writeByte('\n');
     try writer.interface.flush();
 }
 
@@ -218,6 +481,9 @@ pub fn save(self: *Serializer, path: []const u8) !void {
 pub fn load(self: *Serializer, path: []const u8) !void {
     if (path.len == 0)
         return error.EmptySynthPath;
+
+    if (!isJsonPath(path))
+        return error.UnsupportedSynthFormat;
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
@@ -227,7 +493,15 @@ pub fn load(self: *Serializer, path: []const u8) !void {
     defer file.close(self.io);
     var buffer: [1024]u8 = undefined;
     var reader = file.reader(self.io, &buffer);
-    var document = try P.SynthDocument.decode(&reader.interface, arena_gpa);
+    var json_reader = std.json.Reader.init(arena_gpa, &reader.interface);
+    defer json_reader.deinit();
+    const json_document = try std.json.parseFromTokenSourceLeaky(
+        JsonSynthDocument,
+        arena_gpa,
+        &json_reader,
+        .{},
+    );
+    var document = try documentFromJson(json_document, arena_gpa);
 
     try validateDocument(document);
 
@@ -247,7 +521,7 @@ pub fn load(self: *Serializer, path: []const u8) !void {
 
     for (document.nodes.items[1..], 1..) |serialized, index| {
         const name = try self.ownName(serialized.name);
-        const node = try nodeFromProto(self, serialized, name);
+        const node = try nodeFromSerialized(self, serialized, name);
         const actual = try self.dsp.addNode(self.allocator, node);
         std.debug.assert(actual.idx == index);
         if (serialized.polyphony) |polyphony|
@@ -356,6 +630,131 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         try self.dsp.start();
 }
 
+/// Converts the validated serialized document into the slice-based std.json model.
+fn documentToJson(document: Serialized.SynthDocument, allocator: std.mem.Allocator) !JsonSynthDocument {
+    const nodes = try allocator.alloc(JsonNode, document.nodes.items.len);
+    for (document.nodes.items, 0..) |node, index|
+        nodes[index] = nodeToJson(node);
+    return .{
+        .schema_version = document.schema_version,
+        .output_node = document.output_node,
+        .nodes = nodes,
+        .viewport_x = document.viewport_x,
+        .viewport_y = document.viewport_y,
+    };
+}
+
+/// Converts one serialized node while borrowing its arena-owned slices.
+fn nodeToJson(node: Serialized.Node) JsonNode {
+    return .{
+        .kind = node.kind,
+        .name = node.name,
+        .x = node.x,
+        .y = node.y,
+        .inputs = node.inputs.items,
+        .parameter_source = node.parameter_source,
+        .group_members = node.group_members.items,
+        .group_inputs = node.group_inputs.items,
+        .group_outputs = node.group_outputs.items,
+        .group_owner = node.group_owner,
+        .group_port = node.group_port,
+        .polyphony = node.polyphony,
+        .parameters = parametersToJson(node.parameters),
+    };
+}
+
+/// Converts serialized parameter alternatives to their JSON-compatible representations.
+fn parametersToJson(parameters: ?Serialized.Node.parameters_union) ?JsonParameters {
+    const value = parameters orelse return null;
+    return switch (value) {
+        .constant => |item| .{ .constant = item },
+        .oscillator => |item| .{ .oscillator = item },
+        .mixer => |item| .{ .mixer = .{
+            .gain = item.gain,
+            .gains = item.gains.items,
+            .pans = item.pans.items,
+        } },
+        .sequencer => |item| .{ .sequencer = .{
+            .bpm = item.bpm,
+            .notes = item.notes.items,
+            .loop = item.loop,
+        } },
+        .adsr => |item| .{ .adsr = item },
+        .filter => |item| .{ .filter = item },
+        .bit_crusher => |item| .{ .bit_crusher = item },
+        .noise => |item| .{ .noise = item },
+        .keyboard => |item| .{ .keyboard = item },
+        .midi => |item| .{ .midi = item },
+        .output => |item| .{ .output = item },
+        .delay => |item| .{ .delay = item },
+        .input => |item| .{ .input = item },
+    };
+}
+
+/// Converts a parsed JSON document into the model used by validation and loading.
+fn documentFromJson(document: JsonSynthDocument, allocator: std.mem.Allocator) !Serialized.SynthDocument {
+    var result = Serialized.SynthDocument{
+        .schema_version = document.schema_version,
+        .output_node = document.output_node,
+        .viewport_x = document.viewport_x,
+        .viewport_y = document.viewport_y,
+    };
+    for (document.nodes) |serialized| {
+        var node = Serialized.Node{
+            .kind = serialized.kind,
+            .name = serialized.name,
+            .x = serialized.x,
+            .y = serialized.y,
+            .parameter_source = serialized.parameter_source,
+            .group_owner = serialized.group_owner,
+            .group_port = serialized.group_port,
+            .polyphony = serialized.polyphony,
+            .parameters = try parametersFromJson(serialized.parameters, allocator),
+        };
+        try node.inputs.appendSlice(allocator, serialized.inputs);
+        try node.group_members.appendSlice(allocator, serialized.group_members);
+        try node.group_inputs.appendSlice(allocator, serialized.group_inputs);
+        try node.group_outputs.appendSlice(allocator, serialized.group_outputs);
+        try result.nodes.append(allocator, node);
+    }
+    return result;
+}
+
+/// Converts JSON parameter alternatives into serialized array lists.
+fn parametersFromJson(
+    parameters: ?JsonParameters,
+    allocator: std.mem.Allocator,
+) !?Serialized.Node.parameters_union {
+    const value = parameters orelse return null;
+    return switch (value) {
+        .constant => |item| .{ .constant = item },
+        .oscillator => |item| .{ .oscillator = item },
+        .mixer => |item| blk: {
+            var mixer = Serialized.MixerParameters{ .gain = item.gain };
+            try mixer.gains.appendSlice(allocator, item.gains);
+            try mixer.pans.appendSlice(allocator, item.pans);
+            break :blk .{ .mixer = mixer };
+        },
+        .sequencer => |item| blk: {
+            var sequencer = Serialized.SequencerParameters{
+                .bpm = item.bpm,
+                .loop = item.loop,
+            };
+            try sequencer.notes.appendSlice(allocator, item.notes);
+            break :blk .{ .sequencer = sequencer };
+        },
+        .adsr => |item| .{ .adsr = item },
+        .filter => |item| .{ .filter = item },
+        .bit_crusher => |item| .{ .bit_crusher = item },
+        .noise => |item| .{ .noise = item },
+        .keyboard => |item| .{ .keyboard = item },
+        .midi => |item| .{ .midi = item },
+        .output => |item| .{ .output = item },
+        .delay => |item| .{ .delay = item },
+        .input => |item| .{ .input = item },
+    };
+}
+
 /// Frees names and note arrays retained by the previous loaded graph.
 fn releaseOwned(self: *Serializer) void {
     for (self.owned_names.items) |name|
@@ -366,7 +765,7 @@ fn releaseOwned(self: *Serializer) void {
     self.owned_notes.clearRetainingCapacity();
 }
 
-/// Copies a protobuf node name into storage that outlives the decode arena.
+/// Copies a serialized node name into storage that outlives the decode arena.
 fn ownName(self: *Serializer, name: []const u8) ![]const u8 {
     const owned = try self.allocator.dupe(u8, name);
     self.owned_names.append(self.allocator, owned) catch |err| {
@@ -382,14 +781,14 @@ fn ownNotes(self: *Serializer, notes: []DSP.Note) ![]const DSP.Note {
     return notes;
 }
 
-/// Converts a runtime node state to its typed protobuf configuration.
-fn parametersToProto(
+/// Converts a runtime node state to its typed serialized configuration.
+fn parametersToSerialized(
     state: DSP.Node.State,
     gpa: std.mem.Allocator,
     devices: []const pa.Device,
     input_devices: []const pa.InputDevice,
     midi_devices: []const pm.Device,
-) !?P.Node.parameters_union {
+) !?Serialized.Node.parameters_union {
     return switch (state) {
         .noop, .add, .duplicate, .multiply, .group, .group_input, .group_output => null,
         .output => |value| blk: {
@@ -432,7 +831,7 @@ fn parametersToProto(
             .default_amplitude = value.parameters.default_amplitude,
         } },
         .mixer => |value| blk: {
-            var result = P.MixerParameters{ .gain = value.parameters.gain };
+            var result = Serialized.MixerParameters{ .gain = value.parameters.gain };
             for (value.parameters.gains) |gain|
                 try result.gains.append(gpa, gain);
             for (value.parameters.pans) |pan|
@@ -440,7 +839,7 @@ fn parametersToProto(
             break :blk .{ .mixer = result };
         },
         .monophonic_sequencer => |value| blk: {
-            var result = P.SequencerParameters{
+            var result = Serialized.SequencerParameters{
                 .bpm = value.parameters.bpm,
                 .loop = value.parameters.loop,
             };
@@ -487,10 +886,10 @@ fn parametersToProto(
     };
 }
 
-/// Creates a runtime node from a validated protobuf node.
-fn nodeFromProto(
+/// Creates a runtime node from a validated serialized node.
+fn nodeFromSerialized(
     self: *Serializer,
-    serialized: P.Node,
+    serialized: Serialized.Node,
     name: []const u8,
 ) !DSP.Node {
     if (std.mem.eql(u8, serialized.kind, "add")) return DSP.Node.Add.create(name);
@@ -676,11 +1075,11 @@ fn nodeFromProto(
     return error.UnknownNodeKind;
 }
 
-/// Extracts one required protobuf oneof alternative.
+/// Extracts one required serialized oneof alternative.
 fn requiredParameters(
-    node: P.Node,
-    comptime expected: P.Node._parameters_case,
-) !@TypeOf(@field(@as(P.Node.parameters_union, undefined), @tagName(expected))) {
+    node: Serialized.Node,
+    comptime expected: Serialized.Node._parameters_case,
+) !@TypeOf(@field(@as(Serialized.Node.parameters_union, undefined), @tagName(expected))) {
     return switch (node.parameters orelse return error.MissingNodeParameters) {
         expected => |value| value,
         else => return error.InvalidNodeParameters,
@@ -693,7 +1092,7 @@ fn enumFromString(comptime E: type, name: []const u8) !E {
 }
 
 /// Validates all references before replacing the active graph.
-fn validateDocument(document: P.SynthDocument) !void {
+fn validateDocument(document: Serialized.SynthDocument) !void {
     if (document.schema_version != schema_version)
         return error.UnsupportedSynthSchema;
     if (document.nodes.items.len == 0 or document.nodes.items[0].kind.len == 0)
@@ -807,7 +1206,7 @@ fn validateDocument(document: P.SynthDocument) !void {
 }
 
 /// Validates a non-nested group and every persisted port binding.
-fn validateGroup(node: P.Node, group_index: usize, nodes: []const P.Node) !void {
+fn validateGroup(node: Serialized.Node, group_index: usize, nodes: []const Serialized.Node) !void {
     if (node.group_members.items.len < 2 or node.group_members.items.len > DSP.max_group_members)
         return error.InvalidGraphReference;
     for (node.group_members.items) |member| {
@@ -823,7 +1222,7 @@ fn validateGroup(node: P.Node, group_index: usize, nodes: []const P.Node) !void 
 }
 
 /// Validates the owner and port carried by an explicit group endpoint node.
-fn validateGroupEndpoint(node: P.Node, nodes: []const P.Node) !void {
+fn validateGroupEndpoint(node: Serialized.Node, nodes: []const Serialized.Node) !void {
     const owner = node.group_owner orelse return error.InvalidGraphReference;
     const port = node.group_port orelse return error.InvalidGraphReference;
     if (owner == 0 or owner >= nodes.len or port >= DSP.max_outlets)
@@ -834,10 +1233,10 @@ fn validateGroupEndpoint(node: P.Node, nodes: []const P.Node) !void {
 
 /// Validates one persisted group port-to-child binding.
 fn validateGroupBinding(
-    binding: P.GroupBinding,
+    binding: Serialized.GroupBinding,
     group_index: usize,
     members: []const u32,
-    nodes: []const P.Node,
+    nodes: []const Serialized.Node,
     input: bool,
 ) !void {
     if (binding.group_port >= DSP.max_outlets or binding.member_node == 0 or
@@ -857,7 +1256,7 @@ fn validateGroupBinding(
 }
 
 /// Validates the typed parameter message for one node kind without mutation.
-fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
+fn validateNodeParameters(node: Serialized.Node, tag: DSP.Node.Tag) !void {
     switch (tag) {
         .constant => _ = try requiredParameters(node, .constant),
         .midi => _ = try requiredParameters(node, .midi),
@@ -925,5 +1324,93 @@ fn validateNodeParameters(node: P.Node, tag: DSP.Node.Tag) !void {
             else => return error.InvalidNodeParameters,
         },
         .add, .duplicate, .multiply, .noop, .group, .group_input, .group_output => {},
+    }
+}
+
+test "synth save paths normalize to JSON" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{ "patch", "patch.zsynth.json" },
+        .{ "patch.zsynth", "patch.zsynth.json" },
+        .{ "patch.zsynth.json", "patch.zsynth.json" },
+    };
+    inline for (cases) |case| {
+        const normalized = try pathForJson(allocator, case[0]);
+        defer allocator.free(normalized);
+        try std.testing.expectEqualStrings(case[1], normalized);
+    }
+
+    try std.testing.expect(!isJsonPath("patch.zsynth"));
+    try std.testing.expect(!isJsonPath("patch.json"));
+}
+
+test "JSON adapter round-trips repeated fields and parameter variants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var mixer = Serialized.MixerParameters{ .gain = 0.75 };
+    try mixer.gains.appendSlice(allocator, &.{ 0.25, 0.5 });
+    try mixer.pans.appendSlice(allocator, &.{ -0.5, 0.5 });
+    var sequencer = Serialized.SequencerParameters{ .bpm = 96, .loop = false };
+    try sequencer.notes.append(allocator, .{
+        .pitch = 64,
+        .has_pitch = true,
+        .start_tick = 128,
+        .duration_ticks = 48,
+        .velocity = 0.8,
+    });
+
+    var document = Serialized.SynthDocument{
+        .schema_version = schema_version,
+        .output_node = 1,
+        .viewport_x = -12,
+        .viewport_y = 34,
+    };
+    try document.nodes.append(allocator, .{ .kind = "noop", .name = "sentinel" });
+    var mixer_node = Serialized.Node{
+        .kind = "mixer",
+        .name = "mix",
+        .parameters = .{ .mixer = mixer },
+    };
+    try mixer_node.inputs.append(allocator, .{
+        .input_port = 1,
+        .source_node = 1,
+        .source_port = 0,
+    });
+    try document.nodes.append(allocator, mixer_node);
+    try document.nodes.append(allocator, .{
+        .kind = "monophonic_sequencer",
+        .name = "sequence",
+        .parameters = .{ .sequencer = sequencer },
+    });
+
+    const json_document = try documentToJson(document, allocator);
+    const contents = try std.json.Stringify.valueAlloc(allocator, json_document, .{});
+    try std.testing.expect(std.mem.indexOf(u8, contents, json_schema_uri) != null);
+
+    const parsed = try std.json.parseFromSliceLeaky(JsonSynthDocument, allocator, contents, .{});
+    const restored = try documentFromJson(parsed, allocator);
+    try std.testing.expectEqual(document.schema_version, restored.schema_version);
+    try std.testing.expectEqual(document.output_node, restored.output_node);
+    try std.testing.expectEqual(document.viewport_x, restored.viewport_x);
+    try std.testing.expectEqual(document.viewport_y, restored.viewport_y);
+    try std.testing.expectEqual(document.nodes.items.len, restored.nodes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.nodes.items[1].inputs.items.len);
+    try std.testing.expectEqual(@as(u32, 1), restored.nodes.items[1].inputs.items[0].input_port);
+    switch (restored.nodes.items[1].parameters.?) {
+        .mixer => |value| {
+            try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5 }, value.gains.items);
+            try std.testing.expectEqualSlices(f32, &.{ -0.5, 0.5 }, value.pans.items);
+        },
+        else => return error.UnexpectedParameterVariant,
+    }
+    switch (restored.nodes.items[2].parameters.?) {
+        .sequencer => |value| {
+            try std.testing.expectEqual(@as(u32, 96), value.bpm.?);
+            try std.testing.expectEqual(@as(usize, 1), value.notes.items.len);
+            try std.testing.expectEqual(@as(u64, 128), value.notes.items[0].start_tick.?);
+        },
+        else => return error.UnexpectedParameterVariant,
     }
 }

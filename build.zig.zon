@@ -20,10 +20,6 @@
             .url = "git+https://github.com/zig-gamedev/zaudio.git#44ea21152c67c8ba02de5441ac2a5d58c01ad591",
             .hash = "zaudio-0.11.0-dev-_M-91pt8QQDeq8QvBRqa2RZ6EPFLZv2onBXrHaUk9VUS",
         },
-        .protobuf = .{
-            .url = "git+https://github.com/Arwalk/zig-protobuf.git#83e402d07d0de80f25336b7a99bb751ba1008e71",
-            .hash = "protobuf-7.0.0-0e82akowOwBt9kGJyQm9839yrGtJ-4WY3z7-X9D-oiWO",
-        },
     },
     .paths = .{
         "build.zig",
