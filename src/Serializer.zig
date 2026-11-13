@@ -241,11 +241,220 @@ const JsonSequencerParameters = struct {
     loop: ?bool = null,
 };
 
+/// Current on-disk version of a reusable group template.
+const template_schema_version: u32 = 1;
+
+/// Canonical schema reference embedded in saved template JSON documents.
+const template_schema_uri = "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth-template.schema.json";
+
+/// Connection stored inside a template, including a connection from a group input.
+const JsonTemplateConnection = struct {
+    input_port: u32 = 0,
+    source_node: ?u32 = null,
+    source_port: u32 = 0,
+    group_input: ?u32 = null,
+};
+
+/// JSON representation of one ordinary node stored in a template.
+const JsonTemplateNode = struct {
+    kind: []const u8 = "",
+    name: []const u8 = "",
+    x: i32 = 0,
+    y: i32 = 0,
+    inputs: []const JsonTemplateConnection = &.{},
+    parameter_source: ?u32 = null,
+    polyphony: ?u32 = null,
+    parameters: ?JsonParameters = null,
+};
+
+/// JSON representation of a reusable group template.
+const JsonTemplateDocument = struct {
+    @"$schema": []const u8 = template_schema_uri,
+    schema_version: u32 = 0,
+    name: []const u8 = "",
+    nodes: []const JsonTemplateNode = &.{},
+    group_inputs: []const Serialized.GroupBinding = &.{},
+    group_outputs: []const Serialized.GroupBinding = &.{},
+};
+
 /// Returns the ordered member slot for a serialized group member.
 fn serializedGroupMemberSlot(group: Serialized.Node, member: u32) ?u8 {
     for (group.group_members.items, 0..) |candidate, slot|
         if (candidate == member) return @intCast(slot);
     return null;
+}
+
+/// Returns the local slot occupied by a runtime member index.
+fn memberSlot(members: []const DSP.Node.Index, member: DSP.Node.Index) ?usize {
+    for (members, 0..) |candidate, slot|
+        if (candidate.idx == member.idx) return slot;
+    return null;
+}
+
+/// Converts one parsed template node into the serializer's typed node model.
+fn templateNodeFromJson(
+    node: JsonTemplateNode,
+    allocator: std.mem.Allocator,
+) !Serialized.Node {
+    var result = Serialized.Node{
+        .kind = node.kind,
+        .name = node.name,
+        .x = node.x,
+        .y = node.y,
+        .parameter_source = if (node.parameter_source) |source|
+            try std.math.add(u32, source, 1)
+        else
+            0,
+        .polyphony = node.polyphony,
+        .parameters = try parametersFromJson(node.parameters, allocator),
+    };
+    for (node.inputs) |connection| {
+        if (connection.source_node) |source| {
+            try result.inputs.append(allocator, .{
+                .input_port = connection.input_port,
+                .source_node = try std.math.add(u32, source, 1),
+                .source_port = connection.source_port,
+            });
+        }
+    }
+    return result;
+}
+
+/// Validates a template before it can mutate the live DSP graph.
+fn validateTemplate(document: JsonTemplateDocument) !void {
+    if (document.schema_version != template_schema_version or document.name.len == 0)
+        return error.InvalidSynthDocument;
+    if (document.nodes.len == 0 or document.nodes.len > DSP.max_group_members)
+        return error.InvalidGraphReference;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const arena_gpa = arena.allocator();
+
+    for (document.nodes, 0..) |node, index| {
+        if (node.kind.len == 0 or node.name.len == 0)
+            return error.InvalidSynthDocument;
+        const tag = std.meta.stringToEnum(DSP.Node.Tag, node.kind) orelse
+            return error.UnknownNodeKind;
+        if (tag == .noop or tag == .output or tag == .group or
+            tag == .group_input or tag == .group_output)
+            return error.InvalidGraphReference;
+
+        const serialized = try templateNodeFromJson(node, arena_gpa);
+        try validateNodeParameters(serialized, tag);
+        if (node.polyphony) |polyphony| {
+            if (polyphony == 0 or polyphony > DSP.max_polyphony)
+                return error.InvalidNodeParameters;
+        }
+
+        const metadata = DSP.node_metadata.get(tag);
+        for (node.inputs, 0..) |connection, connection_index| {
+            if (connection.input_port >= metadata.input_count or
+                (connection.source_node == null and connection.group_input == null) or
+                (connection.source_node != null and connection.group_input != null))
+                return error.InvalidGraphReference;
+            for (node.inputs[0..connection_index]) |previous|
+                if (previous.input_port == connection.input_port)
+                    return error.InvalidGraphReference;
+
+            if (connection.source_node) |source| {
+                if (source >= document.nodes.len or source == index)
+                    return error.InvalidGraphReference;
+                const source_tag = std.meta.stringToEnum(
+                    DSP.Node.Tag,
+                    document.nodes[source].kind,
+                ) orelse return error.UnknownNodeKind;
+                if (connection.source_port >= DSP.node_metadata.get(source_tag).output_count)
+                    return error.InvalidGraphReference;
+            } else if (connection.group_input.? >= DSP.max_outlets) {
+                return error.InvalidGraphReference;
+            }
+        }
+
+        if (node.parameter_source) |source| {
+            if (source >= document.nodes.len or source == index)
+                return error.InvalidGraphReference;
+            const source_tag = std.meta.stringToEnum(
+                DSP.Node.Tag,
+                document.nodes[source].kind,
+            ) orelse return error.UnknownNodeKind;
+            if (source_tag != tag or !metadata.has_parameters or !metadata.can_link_parameters)
+                return error.InvalidGraphReference;
+        }
+    }
+
+    for (document.nodes, 0..) |node, index| {
+        for (node.inputs, 0..) |connection, connection_index| {
+            const source = connection.source_node orelse continue;
+            for (document.nodes, 0..) |other_node, other_index| {
+                if (other_index > index) break;
+                for (other_node.inputs, 0..) |other, other_connection_index| {
+                    if (other_index == index and other_connection_index >= connection_index) break;
+                    if (other.source_node == source and other.source_port == connection.source_port)
+                        return error.InvalidGraphReference;
+                }
+            }
+        }
+        if (node.parameter_source) |source| {
+            for (document.nodes[0..index]) |other|
+                if (other.parameter_source == source)
+                    return error.InvalidGraphReference;
+
+            var ancestor = source;
+            while (document.nodes[ancestor].parameter_source) |next| {
+                if (next == index) return error.InvalidGraphReference;
+                ancestor = next;
+            }
+        }
+    }
+
+    try validateTemplateBindings(document.group_inputs, document.nodes, true);
+    try validateTemplateBindings(document.group_outputs, document.nodes, false);
+
+    for (document.nodes, 0..) |node, member_node| {
+        for (node.inputs) |connection| {
+            const group_port = connection.group_input orelse continue;
+            var found = false;
+            for (document.group_inputs) |binding| {
+                if (binding.group_port == group_port and
+                    binding.member_node == member_node and
+                    binding.member_port == connection.input_port)
+                    found = true;
+            }
+            if (!found) return error.InvalidGraphReference;
+        }
+    }
+    for (document.group_inputs) |binding| {
+        var found = false;
+        for (document.nodes[binding.member_node].inputs) |connection| {
+            if (connection.group_input == binding.group_port and
+                connection.input_port == binding.member_port)
+                found = true;
+        }
+        if (!found) return error.InvalidGraphReference;
+    }
+}
+
+/// Validates one set of group port bindings in a template document.
+fn validateTemplateBindings(
+    bindings: []const Serialized.GroupBinding,
+    nodes: []const JsonTemplateNode,
+    input: bool,
+) !void {
+    var used_ports: [DSP.max_outlets]bool = @splat(false);
+    for (bindings) |binding| {
+        if (binding.group_port >= DSP.max_outlets or
+            binding.member_node >= nodes.len or
+            used_ports[binding.group_port])
+            return error.InvalidGraphReference;
+        used_ports[binding.group_port] = true;
+        const tag = std.meta.stringToEnum(DSP.Node.Tag, nodes[binding.member_node].kind) orelse
+            return error.UnknownNodeKind;
+        const metadata = DSP.node_metadata.get(tag);
+        const port_count = if (input) metadata.input_count else metadata.output_count;
+        if (binding.member_port >= port_count)
+            return error.InvalidGraphReference;
+    }
 }
 
 /// Builds and hashes the exact bounded identity used to validate a serialized group link.
@@ -352,9 +561,33 @@ pub fn pathForJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return normalized;
 }
 
+/// Returns a path with the canonical reusable-template suffix.
+pub fn pathForTemplate(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0)
+        return error.EmptySynthPath;
+
+    const template_suffix = ".ztemplate.json";
+    if (std.mem.endsWith(u8, path, template_suffix))
+        return allocator.dupe(u8, path);
+
+    const stem = if (std.mem.endsWith(u8, path, ".ztemplate"))
+        path[0 .. path.len - ".ztemplate".len]
+    else
+        path;
+    const normalized = try allocator.alloc(u8, stem.len + template_suffix.len);
+    @memcpy(normalized[0..stem.len], stem);
+    @memcpy(normalized[stem.len..], template_suffix);
+    return normalized;
+}
+
 /// Returns whether a path uses the canonical JSON synth suffix.
 fn isJsonPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".zsynth.json");
+}
+
+/// Returns whether a path uses the canonical reusable-template suffix.
+fn isTemplatePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".ztemplate.json");
 }
 
 /// Releases allocations retained by the current loaded document.
@@ -475,6 +708,277 @@ pub fn save(self: *Serializer, path: []const u8) !void {
     try writer.interface.writeAll(contents);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
+}
+
+/// Saves one group or ordinary node as a reusable template.
+pub fn saveTemplate(self: *Serializer, path: []const u8, source: DSP.Node.Index) !void {
+    const normalized_path = try pathForTemplate(self.allocator, path);
+    defer self.allocator.free(normalized_path);
+
+    if (source.idx == 0 or source.idx >= self.dsp.nodes.len)
+        return error.InvalidGraphReference;
+
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const arena_gpa = arena.allocator();
+
+    const source_state = self.dsp.nodes.items(.state)[source.idx];
+    const is_group = source_state == .group;
+    var members: [DSP.max_group_members]DSP.Node.Index = undefined;
+    const member_count: usize = if (is_group) blk: {
+        const group = source_state.group;
+        if (group.member_count == 0 or group.member_count > DSP.max_group_members)
+            return error.InvalidGraphReference;
+        @memcpy(members[0..group.member_count], group.members[0..group.member_count]);
+        break :blk group.member_count;
+    } else blk: {
+        if (std.meta.activeTag(source_state) == .output or
+            std.meta.activeTag(source_state) == .group_input or
+            std.meta.activeTag(source_state) == .group_output or
+            std.meta.activeTag(source_state) == .group)
+            return error.InvalidGraphReference;
+        members[0] = source;
+        break :blk 1;
+    };
+
+    var json_nodes = try arena_gpa.alloc(JsonTemplateNode, member_count);
+    const origin = self.space.nodePosition(source);
+    for (members[0..member_count], 0..) |member, slot| {
+        const state = self.dsp.nodes.items(.state)[member.idx];
+        const tag = std.meta.activeTag(state);
+        if (tag == .group or tag == .group_input or tag == .group_output or tag == .output)
+            return error.InvalidGraphReference;
+
+        var serialized = Serialized.Node{
+            .kind = @tagName(tag),
+            .name = self.dsp.nodes.items(.name)[member.idx],
+            .x = self.space.nodePosition(member).x - origin.x,
+            .y = self.space.nodePosition(member).y - origin.y,
+            .parameters = try parametersToSerialized(
+                state,
+                arena_gpa,
+                self.dsp.devices,
+                self.dsp.input_devices,
+                self.dsp.midi_devices,
+            ),
+        };
+        const polyphony = self.dsp.nodes.items(.polyphony)[member.idx];
+        if (polyphony > 1) serialized.polyphony = polyphony;
+
+        var inputs = std.ArrayList(JsonTemplateConnection).empty;
+        for (self.dsp.nodes.items(.inputs)[member.idx], 0..) |connection, input_port| {
+            if (connection.isNoop()) continue;
+
+            if (memberSlot(members[0..member_count], connection.node)) |source_slot| {
+                try inputs.append(arena_gpa, .{
+                    .input_port = @intCast(input_port),
+                    .source_node = @intCast(source_slot),
+                    .source_port = connection.output_port,
+                });
+                continue;
+            }
+
+            if (is_group) switch (self.dsp.nodes.items(.state)[connection.node.idx]) {
+                .group_input => |endpoint| if (endpoint.group.idx == source.idx) {
+                    try inputs.append(arena_gpa, .{
+                        .input_port = @intCast(input_port),
+                        .group_input = endpoint.port,
+                    });
+                    continue;
+                },
+                else => {},
+            };
+
+            // A one-node template intentionally drops connections to the
+            // surrounding graph. Group members must already be isolated.
+            if (is_group) return error.InvalidGraphReference;
+        }
+        serialized.inputs = .empty;
+
+        var parameter_source: ?u32 = null;
+        if (self.dsp.nodes.items(.parameter_link)[member.idx].source) |source_parameter| {
+            if (memberSlot(members[0..member_count], source_parameter)) |source_slot|
+                parameter_source = @intCast(source_slot)
+            else if (is_group)
+                return error.InvalidGraphReference;
+        }
+
+        json_nodes[slot] = .{
+            .kind = serialized.kind,
+            .name = serialized.name,
+            .x = serialized.x,
+            .y = serialized.y,
+            .inputs = inputs.items,
+            .parameter_source = parameter_source,
+            .polyphony = serialized.polyphony,
+            .parameters = parametersToJson(serialized.parameters),
+        };
+    }
+
+    var json_inputs = std.ArrayList(Serialized.GroupBinding).empty;
+    var json_outputs = std.ArrayList(Serialized.GroupBinding).empty;
+    if (is_group) {
+        const group = source_state.group;
+        for (group.input_bindings, 0..) |binding, group_port| {
+            if (binding) |value| {
+                const slot = memberSlot(members[0..member_count], value.node) orelse
+                    return error.InvalidGraphReference;
+                try json_inputs.append(arena_gpa, .{
+                    .group_port = @intCast(group_port),
+                    .member_node = @intCast(slot),
+                    .member_port = value.port,
+                });
+            }
+        }
+        for (group.output_bindings, 0..) |binding, group_port| {
+            if (binding) |value| {
+                const slot = memberSlot(members[0..member_count], value.node) orelse
+                    return error.InvalidGraphReference;
+                try json_outputs.append(arena_gpa, .{
+                    .group_port = @intCast(group_port),
+                    .member_node = @intCast(slot),
+                    .member_port = value.port,
+                });
+            }
+        }
+    }
+
+    const document = JsonTemplateDocument{
+        .schema_version = template_schema_version,
+        .name = self.dsp.nodes.items(.name)[source.idx],
+        .nodes = json_nodes,
+        .group_inputs = json_inputs.items,
+        .group_outputs = json_outputs.items,
+    };
+    try validateTemplate(document);
+
+    var file = try std.Io.Dir.cwd().createFile(self.io, normalized_path, .{});
+    defer file.close(self.io);
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writer(self.io, &buffer);
+    const contents = try std.json.Stringify.valueAlloc(arena_gpa, document, .{ .whitespace = .indent_2 });
+    try writer.interface.writeAll(contents);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+}
+
+/// Loads and inserts a reusable template near the current viewport center.
+pub fn addTemplate(self: *Serializer, path: []const u8) !DSP.Node.Index {
+    const normalized_path = try pathForTemplate(self.allocator, path);
+    defer self.allocator.free(normalized_path);
+
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const arena_gpa = arena.allocator();
+    var file = try std.Io.Dir.cwd().openFile(self.io, normalized_path, .{ .mode = .read_only });
+    defer file.close(self.io);
+    var buffer: [1024]u8 = undefined;
+    var reader = file.reader(self.io, &buffer);
+    var json_reader = std.json.Reader.init(arena_gpa, &reader.interface);
+    defer json_reader.deinit();
+    const document = try std.json.parseFromTokenSourceLeaky(
+        JsonTemplateDocument,
+        arena_gpa,
+        &json_reader,
+        .{},
+    );
+    try validateTemplate(document);
+
+    const first_index = self.dsp.nodes.len;
+    const owned_name_start = self.owned_names.items.len;
+    const owned_notes_start = self.owned_notes.items.len;
+    var member_indices: [DSP.max_group_members]DSP.Node.Index = undefined;
+    var member_count: usize = 0;
+    errdefer {
+        while (self.space.nodes.len > first_index)
+            self.space.remove(self.allocator, .{ .idx = self.space.nodes.len - 1 }) catch {};
+        while (self.dsp.nodes.len > first_index)
+            self.dsp.remove(self.allocator, .{ .idx = self.dsp.nodes.len - 1 });
+        while (self.owned_names.items.len > owned_name_start) {
+            const name = self.owned_names.pop() orelse unreachable;
+            self.allocator.free(name);
+        }
+        while (self.owned_notes.items.len > owned_notes_start) {
+            const notes = self.owned_notes.pop() orelse unreachable;
+            self.allocator.free(notes);
+        }
+    }
+
+    for (document.nodes) |json_node| {
+        const name = try self.ownName(json_node.name);
+        const serialized = try templateNodeFromJson(json_node, arena_gpa);
+        const node = try nodeFromSerialized(self, serialized, name);
+        const actual = try self.dsp.addNode(self.allocator, node);
+        if (serialized.polyphony) |polyphony|
+            try self.dsp.setNodePolyphony(self.allocator, actual, @intCast(polyphony));
+        member_indices[member_count] = actual;
+        member_count += 1;
+    }
+
+    const group_name = try self.ownName(document.name);
+    const group = try self.dsp.addNode(
+        self.allocator,
+        DSP.Node.Group.create(group_name, member_indices[0..member_count]),
+    );
+    try self.dsp.addGroupEndpoints(self.allocator, group);
+
+    const group_position = self.space.findFreePosition(group, self.space.viewportCenter()) orelse
+        return error.InvalidVisualNodeLayout;
+    for (document.nodes, 0..) |json_node, slot| {
+        try self.space.addNode(self.allocator, member_indices[slot], .{
+            .x = group_position.x + json_node.x,
+            .y = group_position.y + json_node.y,
+        });
+    }
+    try self.space.addNode(self.allocator, group, group_position);
+    const group_state = self.dsp.nodes.items(.state)[group.idx].group;
+    for (0..DSP.max_outlets) |port| {
+        try self.space.addNode(self.allocator, group_state.input_nodes[port], group_position);
+        try self.space.addNode(self.allocator, group_state.output_nodes[port], group_position);
+    }
+
+    for (document.nodes, 0..) |json_node, target_slot| {
+        for (json_node.inputs) |connection| {
+            if (connection.group_input != null) continue;
+            const source_slot = connection.source_node orelse return error.InvalidGraphReference;
+            self.dsp.plug(
+                member_indices[source_slot],
+                @intCast(connection.source_port),
+                member_indices[target_slot],
+                @intCast(connection.input_port),
+            );
+        }
+        if (json_node.parameter_source) |source_slot| {
+            const linked = self.dsp.linkParameters(
+                member_indices[source_slot],
+                member_indices[target_slot],
+            );
+            std.debug.assert(linked);
+        }
+    }
+    for (document.group_inputs) |binding| {
+        const bound = self.dsp.bindGroupInput(
+            group,
+            @intCast(binding.group_port),
+            member_indices[binding.member_node],
+            @intCast(binding.member_port),
+        );
+        std.debug.assert(bound);
+    }
+    for (document.group_outputs) |binding| {
+        const bound = self.dsp.bindGroupOutput(
+            group,
+            @intCast(binding.group_port),
+            member_indices[binding.member_node],
+            @intCast(binding.member_port),
+        );
+        std.debug.assert(bound);
+    }
+
+    if (!try self.space.rebuildOccupancy(self.allocator))
+        return error.InvalidVisualNodeLayout;
+    try self.space.computePaths(self.allocator);
+    return group;
 }
 
 /// Loads a document, replacing the current graph and viewport while preserving play state.
@@ -1342,6 +1846,23 @@ test "synth save paths normalize to JSON" {
 
     try std.testing.expect(!isJsonPath("patch.zsynth"));
     try std.testing.expect(!isJsonPath("patch.json"));
+}
+
+test "template save paths normalize to JSON" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{ "voice", "voice.ztemplate.json" },
+        .{ "voice.ztemplate", "voice.ztemplate.json" },
+        .{ "voice.ztemplate.json", "voice.ztemplate.json" },
+    };
+    inline for (cases) |case| {
+        const normalized = try pathForTemplate(allocator, case[0]);
+        defer allocator.free(normalized);
+        try std.testing.expectEqualStrings(case[1], normalized);
+    }
+
+    try std.testing.expect(isTemplatePath("voice.ztemplate.json"));
+    try std.testing.expect(!isTemplatePath("voice.zsynth.json"));
 }
 
 test "JSON adapter round-trips repeated fields and parameter variants" {

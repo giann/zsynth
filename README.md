@@ -36,7 +36,6 @@ and effects to be composed into a real-time sound pipeline.
 - reverb
 - color theme
 - ungroup
-- save groups as reusable templates
 - undo/redo history
 - nested groups
 

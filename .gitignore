@@ -2,4 +2,5 @@
 zig-out/
 zig-pkg/
 imgui.ini
-*.zsynth
+*.zsynth.json
+*.ztemplate.json

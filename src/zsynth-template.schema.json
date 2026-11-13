@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth-template.schema.json",
+  "title": "ZSynth group template",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schema_version", "name", "nodes", "group_inputs", "group_outputs"],
+  "properties": {
+    "$schema": { "const": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth-template.schema.json" },
+    "schema_version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "nodes": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "$ref": "#/$defs/node" } },
+    "group_inputs": { "type": "array", "items": { "$ref": "#/$defs/binding" } },
+    "group_outputs": { "type": "array", "items": { "$ref": "#/$defs/binding" } }
+  },
+  "$defs": {
+    "uint32": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "int32": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_port"],
+      "properties": {
+        "input_port": { "$ref": "#/$defs/uint32" },
+        "source_node": { "$ref": "#/$defs/uint32" },
+        "source_port": { "$ref": "#/$defs/uint32" },
+        "group_input": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_port", "member_node", "member_port"],
+      "properties": {
+        "group_port": { "$ref": "#/$defs/uint32" },
+        "member_node": { "$ref": "#/$defs/uint32" },
+        "member_port": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "x", "y", "inputs"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "x": { "$ref": "#/$defs/int32" },
+        "y": { "$ref": "#/$defs/int32" },
+        "inputs": { "type": "array", "items": { "$ref": "#/$defs/connection" } },
+        "parameter_source": { "$ref": "#/$defs/uint32" },
+        "polyphony": { "$ref": "#/$defs/uint32" },
+        "parameters": { "type": "object" }
+      }
+    }
+  }
+}

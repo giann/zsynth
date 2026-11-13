@@ -17,6 +17,51 @@ const pa = @import("portaudio.zig");
 
 const Self = @This();
 
+/// Runtime owning the display, renderer, and audio engine used by this state.
+zsynth: *ZSynth,
+/// DSP graph constructed when the editor enters the state stack.
+dsp: DSP,
+space: Space,
+/// JSON serializer bound to the live graph and its visual layout.
+serializer: Serializer,
+/// Allocated path of the graph most recently saved or loaded.
+document_path: ?[]u8 = null,
+/// Allocated names entered for nodes created through the command palette.
+owned_node_names: std.ArrayList([]u8) = .empty,
+/// Output meter bound to the graph's audio output node.
+output_meter: OutputMeter = .{
+    .parameters = .{ .meter_cell_count = output_meter_cell_count },
+},
+/// Persistent waveform displayed beside the fixed playback meter.
+output_waveform: OutputWaveform = .{},
+/// One observer slot per output on the currently selected DSP node.
+selected_observers: [DSP.max_outlets]SelectedObserver = @splat(.none),
+/// Number of selected output ports with an active observer.
+selected_observer_count: u8 = 0,
+/// Width of the selected observer strip in display cells.
+selected_observer_width: u32 = 0,
+/// Height of the selected observer strip in display cells.
+selected_observer_height: u32 = 0,
+/// State used to edit scalar and enum properties in the selected pane.
+parameter_editor: ParameterEditor = .{},
+/// Temporary scoped layout used while a group view is active.
+group_space: ?Space = null,
+/// Group currently owning the temporary scoped layout, if any.
+active_group: ?DSP.Node.Index = null,
+
+/// State-stack callbacks used by the synth editor context.
+pub const vtable = StateStack.State.VTable{
+    .enter = enter,
+    .leave = leave,
+    .quit = quit,
+    .update = update,
+    .render = render,
+    .keyUpDown = keyUpDown,
+    .textInput = textInput,
+    .mouseMoved = mouseMoved,
+    .mouseButton = mouseButton,
+};
+
 /// Per-outlet observer selected from DSP output metadata.
 const SelectedObserver = union(enum) {
     /// No visualization is configured for the outlet.
@@ -119,51 +164,6 @@ const output_status_playing = "playing";
 const output_meter_cell_count: u32 = @intCast(
     output_status_label.len + output_status_playing.len - 1,
 );
-
-/// Runtime owning the display, renderer, and audio engine used by this state.
-zsynth: *ZSynth,
-/// DSP graph constructed when the editor enters the state stack.
-dsp: DSP,
-space: Space,
-/// JSON serializer bound to the live graph and its visual layout.
-serializer: Serializer,
-/// Allocated path of the graph most recently saved or loaded.
-document_path: ?[]u8 = null,
-/// Allocated names entered for nodes created through the command palette.
-owned_node_names: std.ArrayList([]u8) = .empty,
-/// Output meter bound to the graph's audio output node.
-output_meter: OutputMeter = .{
-    .parameters = .{ .meter_cell_count = output_meter_cell_count },
-},
-/// Persistent waveform displayed beside the fixed playback meter.
-output_waveform: OutputWaveform = .{},
-/// One observer slot per output on the currently selected DSP node.
-selected_observers: [DSP.max_outlets]SelectedObserver = @splat(.none),
-/// Number of selected output ports with an active observer.
-selected_observer_count: u8 = 0,
-/// Width of the selected observer strip in display cells.
-selected_observer_width: u32 = 0,
-/// Height of the selected observer strip in display cells.
-selected_observer_height: u32 = 0,
-/// State used to edit scalar and enum properties in the selected pane.
-parameter_editor: ParameterEditor = .{},
-/// Temporary scoped layout used while a group view is active.
-group_space: ?Space = null,
-/// Group currently owning the temporary scoped layout, if any.
-active_group: ?DSP.Node.Index = null,
-
-/// State-stack callbacks used by the synth editor context.
-pub const vtable = StateStack.State.VTable{
-    .enter = enter,
-    .leave = leave,
-    .quit = quit,
-    .update = update,
-    .render = render,
-    .keyUpDown = keyUpDown,
-    .textInput = textInput,
-    .mouseMoved = mouseMoved,
-    .mouseButton = mouseButton,
-};
 
 /// Returns the layout operated on by the active editor state.
 fn editorSpace(self: *Self) *Space {
@@ -561,6 +561,42 @@ fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
         null,
     );
     try self.rememberDocumentPath(gpa, path);
+}
+
+/// Saves the current root-scope selection as a reusable template.
+fn saveTemplateDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
+    if (self.active_group != null or self.editorSpace().selected_count == 0)
+        return;
+
+    if (self.editorSpace().selected_count == 1) {
+        const selected = self.editorSpace().selected_nodes[0];
+        const tag = std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]);
+        if (tag == .output or tag == .group_input or tag == .group_output)
+            return;
+        try self.serializer.saveTemplate(path, selected);
+        return;
+    }
+
+    if (self.editorSpace().selected_count > DSP.max_group_members)
+        return;
+    for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |selected| {
+        const tag = std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]);
+        if (tag == .output or tag == .group or tag == .group_input or tag == .group_output)
+            return;
+    }
+
+    // Reuse the editor's grouping operation so the saved template has the
+    // same internal-edge and parameter-link semantics as a normal group.
+    try self.createSelectedGroup(gpa);
+    const group = self.editorSpace().singleSelectedNode() orelse return;
+    try self.serializer.saveTemplate(path, group);
+}
+
+/// Inserts a reusable template into the root editor scope.
+fn addTemplateDocument(self: *Self, path: []const u8) !VisualNode.Index {
+    if (self.active_group != null)
+        return error.InvalidGroup;
+    return self.serializer.addTemplate(path);
 }
 
 /// Returns the document filename without its path or format suffix.
@@ -3078,6 +3114,8 @@ pub const CommandPalette = struct {
         addNode,
         save,
         load,
+        saveTemplate,
+        addTemplate,
         quit,
     };
 
@@ -3172,6 +3210,8 @@ pub const CommandPalette = struct {
             .addNode => if (self.selected_node_tag == null) "Add node:" else "Name:",
             .save => "Save:",
             .load => "Load:",
+            .saveTemplate => "Save template:",
+            .addTemplate => "Add template:",
             .quit => "Command:",
         } else "Command:";
         const field_width = inner_width - label.len;
@@ -3257,6 +3297,20 @@ pub const CommandPalette = struct {
                 if (self.text_field.inputSlice().len == 0) return;
                 self.editor.loadDocument(gpa, self.inputSlice()) catch return error.IoError;
                 self.editor.setNodeSelection(null);
+                self.editor.zsynth.cursor.dirty = true;
+                try self.editor.write(gpa);
+                try self.finish(state_stack, gpa);
+            },
+            .saveTemplate => {
+                if (self.text_field.inputSlice().len == 0) return;
+                self.editor.saveTemplateDocument(gpa, self.inputSlice()) catch return error.IoError;
+                try self.finish(state_stack, gpa);
+            },
+            .addTemplate => {
+                if (self.text_field.inputSlice().len == 0) return;
+                const group = self.editor.addTemplateDocument(self.inputSlice()) catch return error.IoError;
+                self.editor.setNodeSelection(group);
+                _ = self.editor.editorSpace().revealNode(group);
                 self.editor.zsynth.cursor.dirty = true;
                 try self.editor.write(gpa);
                 try self.finish(state_stack, gpa);
@@ -3414,6 +3468,8 @@ pub const CommandPalette = struct {
             .addNode => "addNode",
             .save => "save",
             .load => "load",
+            .saveTemplate => "saveTemplate",
+            .addTemplate => "addTemplate",
             .quit => "quit",
         };
     }
