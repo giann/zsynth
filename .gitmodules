@@ -13,3 +13,6 @@
 [submodule "vendors/portsmf"]
 	path = vendors/portsmf
 	url = https://github.com/rbdannenberg/portsmf.git
+[submodule "vendors/BUI"]
+	path = vendors/BUI
+	url = https://github.com/ppmpreetham/BUI.git
