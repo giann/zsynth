@@ -16,9 +16,9 @@ const pm = @import("portmidi.zig");
 const Self = @This();
 
 /// Logical width of the renderer and display in pixels.
-pub const screen_width = 640;
+pub const screen_width = 784;
 /// Logical height of the renderer and display in pixels.
-pub const screen_height = 360;
+pub const screen_height = 441;
 
 /// All state used to draw and update the software mouse cursor.
 pub const CursorState = struct {
