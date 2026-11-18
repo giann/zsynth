@@ -67,6 +67,7 @@
       "properties": {
         "kind": { "type": "string" },
         "name": { "type": "string" },
+        "color": { "$ref": "#/$defs/uint32" },
         "x": { "$ref": "#/$defs/int32" },
         "y": { "$ref": "#/$defs/int32" },
         "inputs": { "type": "array", "items": { "$ref": "#/$defs/connection" } },

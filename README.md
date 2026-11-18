@@ -25,7 +25,7 @@ and effects to be composed into a real-time sound pipeline.
 
 ## TODO
 
-- color picker for nodes
+- minimap
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for
   audio)

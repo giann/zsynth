@@ -1727,6 +1727,8 @@ pub const Node = struct {
     group_subgraph_hash: u64 = 0,
     /// Display name assigned by the graph owner.
     name: []const u8,
+    /// User-selected node color, falling back to static metadata when unset.
+    color: ?Display.Color = null,
     /// Connections feeding each input port.
     inputs: [max_outlets]Connection = @splat(.{}),
     /// Whether each output port is connected to a destination input.

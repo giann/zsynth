@@ -102,6 +102,8 @@ fn outputMetadata(
 
 /// Synthetic selected-pane field name used for editing a node's display name.
 const node_name_field_name = "name";
+/// Synthetic selected-pane field name used for editing a node's display color.
+const node_color_field_name = "color";
 
 /// Owns all state and reflection descriptors for selected-pane property edits.
 const ParameterEditor = struct {
@@ -874,6 +876,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
                 node_state.parameters
             else
                 struct {}{},
+            selected,
             self.dsp.nodes.items(.name)[selected.idx],
             available_height,
             graphic.width,
@@ -957,6 +960,7 @@ fn writeReflectedParameters(
     gpa: std.mem.Allocator,
     display: *Display,
     parameters: anytype,
+    node: DSP.Node.Index,
     node_name: []const u8,
     display_height: u32,
     display_width: u32,
@@ -969,8 +973,8 @@ fn writeReflectedParameters(
 ) !void {
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
     const reflected_item_count = comptime reflectedParameterItemCount(@TypeOf(parameters));
-    const max_item_count = reflected_item_count + 1;
-    const item_count = reflected_item_count + @as(usize, @intFromBool(polyphony != null));
+    const max_item_count = reflected_item_count + 2;
+    const item_count = reflected_item_count + 1 + @as(usize, @intFromBool(polyphony != null));
     var items: [max_item_count]Display.LabelValue = undefined;
     var value_buffers: [max_item_count][256]u8 = undefined;
     var value_widths: [max_item_count]u32 = undefined;
@@ -989,19 +993,31 @@ fn writeReflectedParameters(
     editable[0] = true;
     cell_array_indices[0] = null;
 
-    var reflected_item_index: usize = 1;
+    const node_color = self.dsp.nodes.items(.color)[node.idx] orelse
+        DSP.node_metadata.get(std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx])).color;
+    items[1] = .{
+        .label = "Color:",
+        .value = " ",
+        .value_color = node_color,
+    };
+    value_widths[1] = 1;
+    editable[1] = false;
+    cell_names[1] = node_color_field_name;
+    cell_array_indices[1] = null;
+
+    var reflected_item_index: usize = 2;
     if (polyphony) |voice_count| {
-        const formatted_value = formatParameterValue(&value_buffers[1], voice_count);
-        items[1] = .{
+        const formatted_value = formatParameterValue(&value_buffers[2], voice_count);
+        items[2] = .{
             .label = "polyphony",
             .value = formatted_value,
             .value_color = .golden_rod,
         };
-        value_widths[1] = @intCast(formatted_value.len);
-        editable[1] = true;
-        cell_names[1] = "polyphony";
-        cell_array_indices[1] = null;
-        reflected_item_index = 2;
+        value_widths[2] = @intCast(formatted_value.len);
+        editable[2] = true;
+        cell_names[2] = "polyphony";
+        cell_array_indices[2] = null;
+        reflected_item_index = 3;
     }
 
     inline for (field_names) |field_name| {
@@ -1252,14 +1268,25 @@ fn writeReflectedParameters(
                 .ebony,
                 .apple,
             );
-            try display.write(
-                gpa,
-                items[index].value,
-                value_x,
-                value_y,
-                .ebony,
-                items[index].value_color,
-            );
+            if (std.mem.eql(u8, cell.field_name, node_color_field_name)) {
+                try display.write(
+                    gpa,
+                    " ",
+                    value_x,
+                    value_y,
+                    node_color,
+                    node_color,
+                );
+            } else {
+                try display.write(
+                    gpa,
+                    items[index].value,
+                    value_x,
+                    value_y,
+                    .ebony,
+                    items[index].value_color,
+                );
+            }
         }
 
         item_index = column_end;
@@ -1286,6 +1313,100 @@ fn writeReflectedParameters(
                 }
             }
         }
+    }
+
+    self.writeSelectedColorPicker(node, node_color);
+}
+
+/// Draws the RGB color button and picker over the selected-pane color cell.
+fn writeSelectedColorPicker(self: *Self, node: DSP.Node.Index, node_color: Display.Color) void {
+    if (self.zsynth.ui_display.impl != .graphic) return;
+
+    var color_cell: ?ParameterEditor.ParameterCell = null;
+    for (self.parameter_editor.cells[0..self.parameter_editor.cell_count]) |cell| {
+        if (std.mem.eql(u8, cell.field_name, node_color_field_name)) {
+            color_cell = cell;
+            break;
+        }
+    }
+    const cell = color_cell orelse return;
+    const display = &self.zsynth.ui_display.impl.graphic;
+    const cell_width = display.cell_width * display.scale;
+    const cell_height = display.cell_height * display.scale;
+    var color_id_buffer: [64]u8 = undefined;
+    const color_id_text = std.fmt.bufPrint(
+        color_id_buffer[0 .. color_id_buffer.len - 1],
+        "##node-color-{d}",
+        .{node.idx},
+    ) catch return;
+    color_id_buffer[color_id_text.len] = 0;
+    const color_id: [:0]const u8 = color_id_buffer[0..color_id_text.len :0];
+
+    const position = .{
+        @as(f32, @floatFromInt(display.content_origin_x)) +
+            @as(f32, @floatFromInt(cell.value_x * cell_width)),
+        @as(f32, @floatFromInt(display.content_origin_y)) +
+            @as(f32, @floatFromInt(cell.value_y * cell_height)),
+    };
+    zgui.setNextWindowPos(.{ .x = position[0], .y = position[1], .cond = .always });
+    zgui.setNextWindowSize(.{
+        .w = @floatFromInt(cell_width),
+        .h = @floatFromInt(cell_height),
+        .cond = .always,
+    });
+    zgui.pushStyleColor4f(.{ .idx = .window_bg, .c = .{ 0, 0, 0, 0 } });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0, 0 } });
+    zgui.pushStyleVar1f(.{ .idx = .window_border_size, .v = 0 });
+    const window_visible = zgui.begin(color_id, .{
+        .flags = .{
+            .no_title_bar = true,
+            .no_resize = true,
+            .no_move = true,
+            .no_scrollbar = true,
+            .no_collapse = true,
+            .no_saved_settings = true,
+        },
+    });
+    defer {
+        zgui.end();
+        zgui.popStyleVar(.{ .count = 2 });
+        zgui.popStyleColor(.{});
+    }
+    if (!window_visible) return;
+
+    var rgb = [3]f32{
+        @as(f32, @floatFromInt(node_color.r())) / 255.0,
+        @as(f32, @floatFromInt(node_color.g())) / 255.0,
+        @as(f32, @floatFromInt(node_color.b())) / 255.0,
+    };
+    const picker_id = "##node-color-picker";
+    if (zgui.colorButton(color_id, .{
+        .col = .{ rgb[0], rgb[1], rgb[2], 1.0 },
+        .flags = .{ .no_picker = true, .no_tooltip = true, .no_border = true },
+        .w = @floatFromInt(cell_width),
+        .h = @floatFromInt(cell_height),
+    }))
+        zgui.openPopup(picker_id, .{});
+
+    if (zgui.beginPopup(picker_id, .{})) {
+        if (zgui.colorPicker3(picker_id, .{
+            .col = &rgb,
+            .flags = .{
+                .no_label = true,
+                .display_rgb = true,
+                .input_rgb = true,
+                .picker_hue_bar = true,
+            },
+        })) {
+            self.dsp.nodes.items(.color)[node.idx] = Display.Color.rgbaF32(.{
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                1.0,
+            });
+            self.zsynth.cursor.dirty = true;
+        }
+        zgui.endPopup();
     }
 }
 
@@ -1708,7 +1829,7 @@ fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
 /// Creates a fresh runtime node with the same user-facing state as a source.
 fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
     const source_name = self.dsp.nodes.items(.name)[source.idx];
-    return switch (self.dsp.nodes.items(.state)[source.idx]) {
+    var duplicate = switch (self.dsp.nodes.items(.state)[source.idx]) {
         .input, .midi => unreachable,
         .add => DSP.Node.Add.create(source_name),
         .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
@@ -1726,6 +1847,8 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .output => |value| DSP.Node.Output.create(source_name, value.parameters.device),
         .group, .group_input, .group_output => unreachable,
     };
+    duplicate.color = self.dsp.nodes.items(.color)[source.idx];
+    return duplicate;
 }
 
 /// Deep-copies a group, including its members, internal wiring, and bindings.
@@ -1779,6 +1902,8 @@ fn duplicateGroup(
         self.dsp.nodes.items(.name)[source.idx],
         new_members[0..member_count],
     ));
+    self.dsp.nodes.items(.color)[duplicate_group.idx] =
+        self.dsp.nodes.items(.color)[source.idx];
     try self.dsp.addGroupEndpoints(gpa, duplicate_group);
 
     for (new_members[0..member_count], 0..) |member, slot| {
@@ -2569,6 +2694,8 @@ fn mouseButton(
 ) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
+    if (zgui.io.getWantCaptureMouse()) return true;
+
     if (event.button == 3 and event.down) {
         if (self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y })) |cell| {
             const world = self.editorSpace().worldPositionAtDisplayCell(cell[0], cell[1]);
@@ -2603,6 +2730,15 @@ fn mouseButton(
                     keyboard_state[@backingInt(sdl.Scancode.rctrl)]);
             if (cell) |display_cell| {
                 if (self.parameterCellAt(display_cell)) |parameter| {
+                    if (std.mem.eql(u8, parameter.field_name, node_color_field_name)) {
+                        if (self.parameter_editor.active != null) {
+                            self.commitParameterEdit();
+                            self.cancelParameterEdit();
+                        }
+                        self.zsynth.cursor.left_mouse_down = false;
+                        self.zsynth.cursor.dirty = true;
+                        return true;
+                    }
                     if (parameter.editable) {
                         self.zsynth.cursor.left_mouse_down = false;
                         self.beginParameterEdit(parameter);

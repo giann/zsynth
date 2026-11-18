@@ -1358,7 +1358,7 @@ fn writePath(
 ) !void {
     if (path.points.len == 0) return;
 
-    const link_color = path.color;
+    const link_color = self.nodeColor(path.source);
 
     // Draw straight segments first. Point glyphs below then remain intact.
     for (path.points[0 .. path.points.len - 1], 0..) |from, index| {
@@ -1519,7 +1519,8 @@ fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Boun
 pub fn nodeColor(self: *Self, node: VisualNode.Index) Display.Color {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (!self.isOutputReachable(node)) return Display.Color.gray;
-    return DSP.node_metadata.get(std.meta.activeTag(state)).color;
+    return self.dsp.nodes.items(.color)[node.idx] orelse
+        DSP.node_metadata.get(std.meta.activeTag(state)).color;
 }
 
 fn outletYOffset(_: *const Self, footprint: Bound, outlet_count: u8, port: usize) i32 {

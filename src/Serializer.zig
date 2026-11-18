@@ -20,6 +20,7 @@ const Serialized = struct {
     pub const Node = struct {
         kind: []const u8 = &.{},
         name: []const u8 = &.{},
+        color: ?u32 = null,
         x: i32 = 0,
         y: i32 = 0,
         inputs: std.ArrayList(Connection) = .empty,
@@ -192,6 +193,7 @@ const JsonSynthDocument = struct {
 const JsonNode = struct {
     kind: []const u8 = "",
     name: []const u8 = "",
+    color: ?u32 = null,
     x: i32 = 0,
     y: i32 = 0,
     inputs: []const Serialized.Connection = &.{},
@@ -253,6 +255,7 @@ const JsonTemplateConnection = struct {
 const JsonTemplateNode = struct {
     kind: []const u8 = "",
     name: []const u8 = "",
+    color: ?u32 = null,
     x: i32 = 0,
     y: i32 = 0,
     inputs: []const JsonTemplateConnection = &.{},
@@ -293,6 +296,7 @@ fn templateNodeFromJson(
     var result = Serialized.Node{
         .kind = node.kind,
         .name = node.name,
+        .color = node.color,
         .x = node.x,
         .y = node.y,
         .parameter_source = if (node.parameter_source) |source|
@@ -622,6 +626,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
         var node = Serialized.Node{
             .kind = @tagName(std.meta.activeTag(state)),
             .name = self.dsp.nodes.items(.name)[index],
+            .color = if (self.dsp.nodes.items(.color)[index]) |color| color.color else null,
             .x = self.space.nodePosition(.{ .idx = index }).x,
             .y = self.space.nodePosition(.{ .idx = index }).y,
         };
@@ -746,6 +751,7 @@ pub fn saveTemplate(self: *Serializer, path: []const u8, source: DSP.Node.Index)
         var serialized = Serialized.Node{
             .kind = @tagName(tag),
             .name = self.dsp.nodes.items(.name)[member.idx],
+            .color = if (self.dsp.nodes.items(.color)[member.idx]) |color| color.color else null,
             .x = self.space.nodePosition(member).x - origin.x,
             .y = self.space.nodePosition(member).y - origin.y,
             .parameters = try parametersToSerialized(
@@ -800,6 +806,7 @@ pub fn saveTemplate(self: *Serializer, path: []const u8, source: DSP.Node.Index)
         json_nodes[slot] = .{
             .kind = serialized.kind,
             .name = serialized.name,
+            .color = serialized.color,
             .x = serialized.x,
             .y = serialized.y,
             .inputs = inputs.items,
@@ -1024,10 +1031,6 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         std.debug.assert(actual.idx == index);
         if (serialized.polyphony) |polyphony|
             try self.dsp.setNodePolyphony(self.allocator, actual, @intCast(polyphony));
-        try self.space.addNode(self.allocator, actual, .{
-            .x = serialized.x,
-            .y = serialized.y,
-        });
     }
 
     // Endpoint nodes may precede their owner after swap removal. Register them
@@ -1056,12 +1059,6 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         if (state != .group or !state.group.input_nodes[0].isNoop()) continue;
         const group = DSP.Node.Index{ .idx = endpoint_group_index };
         try self.dsp.addGroupEndpoints(self.allocator, group);
-        const position = self.space.nodePosition(group);
-        const endpoints = self.dsp.nodes.items(.state)[endpoint_group_index].group;
-        for (0..DSP.max_outlets) |port| {
-            try self.space.addNode(self.allocator, endpoints.input_nodes[port], position);
-            try self.space.addNode(self.allocator, endpoints.output_nodes[port], position);
-        }
     }
 
     // Saved endpoint nodes are added individually, so prepare their per-voice
@@ -1121,6 +1118,34 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         }
     }
 
+    // Delay visual insertion until group membership and port bindings are
+    // complete. Group members are hidden in the root scope, and group port
+    // bindings determine the wrapper footprint used for collision checks.
+    for (document.nodes.items[1..], 1..) |serialized, index| {
+        try self.space.addNode(self.allocator, .{ .idx = index }, .{
+            .x = serialized.x,
+            .y = serialized.y,
+        });
+    }
+
+    // Older group documents received endpoint nodes after their persisted
+    // nodes. Add their visual entries after the corresponding group exists in
+    // the space so the visual and DSP node arrays remain index-aligned.
+    var legacy_index = document.nodes.items.len;
+    while (legacy_index < self.dsp.nodes.len) : (legacy_index += 1) {
+        const state = self.dsp.nodes.items(.state)[legacy_index];
+        const owner = switch (state) {
+            .group_input => |endpoint| endpoint.group,
+            .group_output => |endpoint| endpoint.group,
+            else => unreachable,
+        };
+        try self.space.addNode(
+            self.allocator,
+            .{ .idx = legacy_index },
+            self.space.nodePosition(owner),
+        );
+    }
+
     if (!try self.space.rebuildOccupancy(self.allocator))
         return error.InvalidVisualNodeLayout;
     try self.space.computePaths(self.allocator);
@@ -1147,6 +1172,7 @@ fn nodeToJson(node: Serialized.Node) JsonNode {
     return .{
         .kind = node.kind,
         .name = node.name,
+        .color = node.color,
         .x = node.x,
         .y = node.y,
         .inputs = node.inputs.items,
@@ -1200,6 +1226,7 @@ fn documentFromJson(document: JsonSynthDocument, allocator: std.mem.Allocator) !
         var node = Serialized.Node{
             .kind = serialized.kind,
             .name = serialized.name,
+            .color = serialized.color,
             .x = serialized.x,
             .y = serialized.y,
             .parameter_source = serialized.parameter_source,
@@ -1385,9 +1412,9 @@ fn nodeFromSerialized(
     serialized: Serialized.Node,
     name: []const u8,
 ) !DSP.Node {
-    if (std.mem.eql(u8, serialized.kind, "add")) return DSP.Node.Add.create(name);
-    if (std.mem.eql(u8, serialized.kind, "duplicate")) return DSP.Node.Duplicate.create(name);
-    if (std.mem.eql(u8, serialized.kind, "multiply")) return DSP.Node.Multiply.create(name);
+    if (std.mem.eql(u8, serialized.kind, "add")) return nodeWithColor(DSP.Node.Add.create(name), serialized.color);
+    if (std.mem.eql(u8, serialized.kind, "duplicate")) return nodeWithColor(DSP.Node.Duplicate.create(name), serialized.color);
+    if (std.mem.eql(u8, serialized.kind, "multiply")) return nodeWithColor(DSP.Node.Multiply.create(name), serialized.color);
     if (std.mem.eql(u8, serialized.kind, "output")) {
         const default_device = pa.defaultDevice(self.dsp.devices) orelse self.dsp.devices[0].id;
         const device_id = if (serialized.parameters) |parameters| switch (parameters) {
@@ -1398,7 +1425,7 @@ fn nodeFromSerialized(
             ) orelse default_device,
             else => default_device,
         } else default_device;
-        return DSP.Node.Output.create(name, device_id);
+        return nodeWithColor(DSP.Node.Output.create(name, device_id), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "input")) {
         const default_device = pa.defaultInputDevice(self.dsp.input_devices) orelse pa.no_device;
@@ -1410,46 +1437,55 @@ fn nodeFromSerialized(
             ) orelse default_device,
             else => default_device,
         } else default_device;
-        return DSP.Node.Input.create(name, .{ .input = device_id });
+        return nodeWithColor(DSP.Node.Input.create(name, .{ .input = device_id }), serialized.color);
     }
-    if (std.mem.eql(u8, serialized.kind, "noop")) return DSP.Node.Noop.create(name);
+    if (std.mem.eql(u8, serialized.kind, "noop")) return nodeWithColor(DSP.Node.Noop.create(name), serialized.color);
     if (std.mem.eql(u8, serialized.kind, "group")) {
         var members: [DSP.max_group_members]DSP.Node.Index = undefined;
         if (serialized.group_members.items.len > members.len)
             return error.InvalidGraphReference;
         for (serialized.group_members.items, 0..) |member, index|
             members[index] = .{ .idx = @intCast(member) };
-        return DSP.Node.Group.create(name, members[0..serialized.group_members.items.len]);
+        return nodeWithColor(
+            DSP.Node.Group.create(name, members[0..serialized.group_members.items.len]),
+            serialized.color,
+        );
     }
     if (std.mem.eql(u8, serialized.kind, "group_input"))
-        return DSP.Node.GroupInput.create(name, .{ .idx = @intCast(serialized.group_owner orelse 0) }, @intCast(serialized.group_port orelse 0));
+        return nodeWithColor(
+            DSP.Node.GroupInput.create(name, .{ .idx = @intCast(serialized.group_owner orelse 0) }, @intCast(serialized.group_port orelse 0)),
+            serialized.color,
+        );
     if (std.mem.eql(u8, serialized.kind, "group_output"))
-        return DSP.Node.GroupOutput.create(name, .{ .idx = @intCast(serialized.group_owner orelse 0) }, @intCast(serialized.group_port orelse 0));
+        return nodeWithColor(
+            DSP.Node.GroupOutput.create(name, .{ .idx = @intCast(serialized.group_owner orelse 0) }, @intCast(serialized.group_port orelse 0)),
+            serialized.color,
+        );
 
     if (std.mem.eql(u8, serialized.kind, "constant")) {
         const value = try requiredParameters(serialized, .constant);
-        return DSP.Node.Constant.create(name, .{
+        return nodeWithColor(DSP.Node.Constant.create(name, .{
             .constant = value.constant orelse 0,
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "oscillator")) {
         const value = try requiredParameters(serialized, .oscillator);
-        return DSP.Node.Oscillator.create(name, .{
+        return nodeWithColor(DSP.Node.Oscillator.create(name, .{
             .waveform = try enumFromString(DSP.Node.Oscillator.Waveform, value.waveform orelse ""),
             .phase_offset = value.phase_offset orelse 0,
             .default_frequency = value.default_frequency orelse 0,
             .default_amplitude = value.default_amplitude orelse 0,
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "mixer")) {
         const value = try requiredParameters(serialized, .mixer);
         if (value.gains.items.len != DSP.max_outlets or value.pans.items.len != DSP.max_outlets)
             return error.InvalidNodeParameters;
-        return DSP.Node.Mixer.create(name, .{
+        return nodeWithColor(DSP.Node.Mixer.create(name, .{
             .gain = value.gain orelse 1,
             .gains = value.gains.items[0..DSP.max_outlets].*,
             .pans = value.pans.items[0..DSP.max_outlets].*,
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "monophonic_sequencer")) {
         const value = try requiredParameters(serialized, .sequencer);
@@ -1476,15 +1512,15 @@ fn nodeFromSerialized(
             self.allocator.free(notes);
             return err;
         };
-        return DSP.Node.MonophonicSequencer.create(name, .{
+        return nodeWithColor(DSP.Node.MonophonicSequencer.create(name, .{
             .bpm = @intCast(value.bpm orelse 120),
             .notes = owned_notes,
             .loop = value.loop orelse true,
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "adsr")) {
         const value = try requiredParameters(serialized, .adsr);
-        return DSP.Node.ADSR.create(name, .{
+        return nodeWithColor(DSP.Node.ADSR.create(name, .{
             .attack = value.attack orelse 0,
             .attack_curve = try enumFromString(DSP.Node.ADSR.Curve, value.attack_curve orelse "exponential"),
             .decay = value.decay orelse 0,
@@ -1492,24 +1528,24 @@ fn nodeFromSerialized(
             .sustain = value.sustain orelse 1,
             .release = value.release orelse 1,
             .release_curve = try enumFromString(DSP.Node.ADSR.Curve, value.release_curve orelse "exponential"),
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "multimode_filter")) {
         const value = try requiredParameters(serialized, .filter);
-        return DSP.Node.MultimodeFilter.create(name, .{
+        return nodeWithColor(DSP.Node.MultimodeFilter.create(name, .{
             .type = try enumFromString(DSP.Node.MultimodeFilter.Type, value.type orelse "low_pass"),
             .default_cutoff = value.default_cutoff orelse 0,
             .default_resonance = value.default_resonance orelse 0,
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "bit_crusher")) {
         const value = try requiredParameters(serialized, .bit_crusher);
         const bit_depth = value.bit_depth orelse 8;
         if (bit_depth > std.math.maxInt(u5)) return error.InvalidNodeParameters;
-        return DSP.Node.BitCrusher.create(name, .{
+        return nodeWithColor(DSP.Node.BitCrusher.create(name, .{
             .target_sample_rate = value.target_sample_rate orelse 8_000,
             .bit_depth = @intCast(bit_depth),
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "delay")) {
         const value = try requiredParameters(serialized, .delay);
@@ -1523,15 +1559,15 @@ fn nodeFromSerialized(
         };
         if (!DSP.Node.Delay.parametersAreValid(parameters))
             return error.InvalidNodeParameters;
-        return DSP.Node.Delay.create(name, parameters);
+        return nodeWithColor(DSP.Node.Delay.create(name, parameters), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "noise")) {
         const value = try requiredParameters(serialized, .noise);
-        return DSP.Node.Noise.create(name, .{
+        return nodeWithColor(DSP.Node.Noise.create(name, .{
             .seed = value.seed orelse 0,
             .type = try enumFromString(DSP.Node.Noise.Type, value.type orelse "white"),
             .amplitude = value.amplitude orelse 1,
-        });
+        }), serialized.color);
     }
     if (std.mem.eql(u8, serialized.kind, "midi")) {
         const value = try requiredParameters(serialized, .midi);
@@ -1551,14 +1587,22 @@ fn nodeFromSerialized(
             else
                 default_device;
         } else default_device;
-        return DSP.Node.MIDI.create(
+        return nodeWithColor(DSP.Node.MIDI.create(
             name,
             .{
                 .device = source,
             },
-        );
+        ), serialized.color);
     }
     return error.UnknownNodeKind;
+}
+
+/// Applies an optional persisted RGB override while keeping its alpha opaque.
+fn nodeWithColor(node: DSP.Node, color: ?u32) DSP.Node {
+    var result = node;
+    if (color) |value|
+        result.color = .{ .color = value | 0xff };
+    return result;
 }
 
 /// Extracts one required serialized oneof alternative.
@@ -1867,6 +1911,7 @@ test "JSON adapter round-trips repeated fields and parameter variants" {
     var mixer_node = Serialized.Node{
         .kind = "mixer",
         .name = "mix",
+        .color = 0x123456ff,
         .parameters = .{ .mixer = mixer },
     };
     try mixer_node.inputs.append(allocator, .{
@@ -1893,6 +1938,7 @@ test "JSON adapter round-trips repeated fields and parameter variants" {
     try std.testing.expectEqual(document.viewport_y, restored.viewport_y);
     try std.testing.expectEqual(document.nodes.items.len, restored.nodes.items.len);
     try std.testing.expectEqual(@as(usize, 1), restored.nodes.items[1].inputs.items.len);
+    try std.testing.expectEqual(@as(?u32, 0x123456ff), restored.nodes.items[1].color);
     try std.testing.expectEqual(@as(u32, 1), restored.nodes.items[1].inputs.items[0].input_port);
     switch (restored.nodes.items[1].parameters.?) {
         .mixer => |value| {
