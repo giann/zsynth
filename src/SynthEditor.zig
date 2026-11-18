@@ -245,7 +245,9 @@ fn enterGroupView(self: *Self, gpa: std.mem.Allocator, group: DSP.Node.Index) !v
             const left = std.meta.activeTag(self.dsp.nodes.items(.state)[index]) == .group_input;
             position = .{
                 .x = if (left) member_north_west.x - 20 else member_south_east.x + 4,
-                .y = member_center_y + @as(i32, @intCast(endpoint_port * 4)) - 14,
+                // Endpoint nodes are five cells high, so six-cell rows keep
+                // adjacent ports from colliding in the group layout.
+                .y = member_center_y + @as(i32, @intCast(endpoint_port * 6)) - 14,
             };
         }
         try scoped.addNode(gpa, node, position);

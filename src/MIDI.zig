@@ -104,6 +104,25 @@ pub const SharedState = struct {
 
         const physical = self.source(device_id);
         const virtual_target = self.virtual_target.load(.acquire);
+        var physical_active = false;
+        for (&physical.held) |*held|
+            physical_active = physical_active or held.gate.load(.acquire) != 0;
+        var virtual_active = false;
+        if (virtual_target == device_id) {
+            for (&self.virtual.held) |*held| {
+                virtual_active = virtual_active or held.gate.load(.acquire) != 0;
+            }
+        }
+
+        // Keep the source's stable voice index while it is the only source
+        // contributing notes. The ADSR state is indexed by this voice, so
+        // compacting released notes here would move a live note onto another
+        // envelope and discard its release tail.
+        if (!virtual_active)
+            return physical.snapshot(voice);
+        if (!physical_active)
+            return self.virtual.snapshot(voice);
+
         var active_voice: u8 = 0;
         for (&physical.held, 0..) |*held, index| {
             if (held.gate.load(.acquire) == 0) continue;

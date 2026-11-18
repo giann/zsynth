@@ -952,11 +952,17 @@ pub fn updateGraphBounds(self: *Self) void {
 
     for (self.nodes.items(.dsp_node), 0..) |node, node_index| {
         if (node.isNoop() or self.isHiddenNode(.{ .idx = node_index })) continue;
-        const position = self.nodes.items(.position)[node_index];
-        north_west.x = @min(north_west.x, position.x);
-        north_west.y = @min(north_west.y, position.y);
-        south_east.x = @max(south_east.x, position.x);
-        south_east.y = @max(south_east.y, position.y);
+        const footprint = self.nodeFootprint(.{ .idx = node_index });
+        north_west.x = @min(north_west.x, footprint.x);
+        north_west.y = @min(north_west.y, footprint.y);
+        south_east.x = @max(
+            south_east.x,
+            footprint.x + @as(i32, @intCast(footprint.width - 1)),
+        );
+        south_east.y = @max(
+            south_east.y,
+            footprint.y + @as(i32, @intCast(footprint.height - 1)),
+        );
         found_node = true;
     }
 
@@ -1060,32 +1066,35 @@ pub fn write(
     for (self.nodes.items(.dsp_node), 0..) |node, index| {
         if (node.isNoop() or !self.isGroup(.{ .idx = index }) or
             self.isHiddenNode(.{ .idx = index })) continue;
-        if (draw_paths) {
-            try self.writeNode(gpa, display, node);
-        } else {
-            try self.writeNodeBody(gpa, display, node, .black);
-        }
+        try self.writeNodeBody(gpa, display, node, .black);
     }
     for (self.nodes.items(.dsp_node), 0..) |node, index| {
         if (node.isNoop() or self.isGroup(.{ .idx = index }) or
             self.isHiddenNode(.{ .idx = index })) continue;
-        if (draw_paths) {
-            try self.writeNode(gpa, display, node);
-        } else {
-            try self.writeNodeBody(gpa, display, node, .black);
-        }
+        try self.writeNodeBody(gpa, display, node, .black);
     }
 
+    // Paint selection backgrounds before paths so a selected node cannot hide
+    // an incoming route when the node footprint is taller than before.
     for (self.selected_nodes[0..self.selected_count]) |node| {
         if (!node.isNoop() and !self.isHiddenNode(node)) {
             try self.writeNodeBody(gpa, display, node, .ebony);
-            if (draw_paths)
-                try self.writeOutgoingPaths(gpa, display, node, .ebony);
         }
     }
 
-    if (draw_paths)
+    // Draw routes after every node body so valid paths remain visible around
+    // expanded node footprints.
+    if (draw_paths) {
+        for (self.nodes.items(.dsp_node), 0..) |node, index| {
+            if (node.isNoop() or self.isHiddenNode(.{ .idx = index })) continue;
+            try self.writePaths(gpa, display, node, .black);
+        }
+        for (self.selected_nodes[0..self.selected_count]) |node| {
+            if (!node.isNoop() and !self.isHiddenNode(node))
+                try self.writeOutgoingPaths(gpa, display, node, .ebony);
+        }
         try self.writeOutputTail(gpa, display);
+    }
 }
 
 /// Draws the transient amber marquee used to select nodes in empty space.
@@ -1121,10 +1130,10 @@ fn writeOutputTail(self: *Self, gpa: std.mem.Allocator, display: *Display) !void
     if (output.isNoop()) return;
 
     const footprint = self.nodeFootprint(output);
-    const state = self.dsp.nodes.items(.state)[output.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    // The output node has no DSP output ports; its external tail continues
+    // from the single audio input shown on the left side of the node.
     const output_y = @as(i64, footprint.y) + @as(i64, @intCast(
-        self.outletYOffset(footprint, metadata.output_count, 0),
+        self.outletYOffset(footprint, self.displayedPortCount(output, .input), 0),
     )) - @as(i64, self.viewport.y);
     const tail_start_x = @as(i64, footprint.x) + @as(i64, @intCast(footprint.width)) -
         @as(i64, self.viewport.x);
@@ -1179,6 +1188,25 @@ fn writeNodeBody(
     const state = self.dsp.nodes.items(.state)[node.idx];
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
     const name = self.dsp.nodes.items(.name)[node.idx];
+    var endpoint_name: [4]u8 = undefined;
+    const displayed_node_name: []const u8 = switch (self.scope) {
+        .root => name,
+        .group => switch (state) {
+            // Scoped endpoint labels identify their port instead of repeating
+            // the generic persisted node name for every boundary node.
+            .group_input => |endpoint| std.fmt.bufPrint(
+                &endpoint_name,
+                "in{d}",
+                .{endpoint.port + 1},
+            ) catch unreachable,
+            .group_output => |endpoint| std.fmt.bufPrint(
+                &endpoint_name,
+                "out{d}",
+                .{endpoint.port + 1},
+            ) catch unreachable,
+            else => name,
+        },
+    };
     const content_width = footprint.width - 2;
     const node_color = self.nodeColor(node);
 
@@ -1217,11 +1245,13 @@ fn writeNodeBody(
     // Keep one header cell available for the parameter-source outlet.
     const displayed_metadata_name = metadata.short_name;
     const metadata_name_x = x + 1;
-    for (displayed_metadata_name, 0..) |character, index| {
-        const glyph = [_]u8{character};
-        const character_x = metadata_name_x + @as(i64, @intCast(index));
-        if (character_x >= 0 and y >= 0)
-            try display.write(gpa, &glyph, @intCast(character_x), @intCast(y), background, .white);
+    if (!self.isGroup(node)) {
+        for (displayed_metadata_name, 0..) |character, index| {
+            const glyph = [_]u8{character};
+            const character_x = metadata_name_x + @as(i64, @intCast(index));
+            if (character_x >= 0 and y >= 0)
+                try display.write(gpa, &glyph, @intCast(character_x), @intCast(y), background, .white);
+        }
     }
 
     const voice_count = self.dsp.polyphonyForDisplay(.{ .idx = node.idx });
@@ -1233,7 +1263,7 @@ fn writeNodeBody(
             try display.write(gpa, &voice_glyph, @intCast(marker_x), @intCast(y), background, .white);
     }
 
-    const displayed_name = name[0..@min(name.len, content_width)];
+    const displayed_name = displayed_node_name[0..@min(displayed_node_name.len, content_width)];
     const name_x = x + 1 + @as(i64, @intCast((content_width - displayed_name.len) / 2));
     const name_y = y + @as(i64, @intCast((footprint.height - 1) / 2));
     for (displayed_name, 0..) |character, index| {
@@ -1512,7 +1542,7 @@ fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Boun
         .x = position.x,
         .y = position.y,
         .width = @intCast(width),
-        .height = @as(u32, outlet_count) * 2 + 1,
+        .height = @max(@as(u32, 5), @as(u32, outlet_count) * 2 + 1),
     };
 }
 
