@@ -90,7 +90,6 @@
         { "$ref": "#/$defs/filterVariant" },
         { "$ref": "#/$defs/bitCrusherVariant" },
         { "$ref": "#/$defs/noiseVariant" },
-        { "$ref": "#/$defs/keyboardVariant" },
         { "$ref": "#/$defs/midiVariant" },
         { "$ref": "#/$defs/outputVariant" },
         { "$ref": "#/$defs/delayVariant" },
@@ -128,10 +127,6 @@
     "noiseVariant": {
       "type": "object", "additionalProperties": false, "required": ["noise"],
       "properties": { "noise": { "$ref": "#/$defs/noiseParameters" } }
-    },
-    "keyboardVariant": {
-      "type": "object", "additionalProperties": false, "required": ["keyboard"],
-      "properties": { "keyboard": { "$ref": "#/$defs/keyboardParameters" } }
     },
     "midiVariant": {
       "type": "object", "additionalProperties": false, "required": ["midi"],
@@ -232,10 +227,6 @@
         "type": { "type": "string" },
         "amplitude": { "$ref": "#/$defs/number" }
       }
-    },
-    "keyboardParameters": {
-      "type": "object", "additionalProperties": false,
-      "properties": { "octave": { "$ref": "#/$defs/int32" } }
     },
     "midiParameters": {
       "type": "object", "additionalProperties": false, "required": ["source"],

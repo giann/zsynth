@@ -55,6 +55,10 @@ devices: []const pa.Device,
 input_devices: []const pa.InputDevice,
 /// MIDI input devices cached by the application for this DSP's lifetime.
 midi_devices: []const pm.Device,
+/// Editor-owned MIDI snapshots read by MIDI nodes during rendering.
+midi_state: midi.SharedState = .{},
+/// Lazily opened PortMidi streams indexed like `midi_devices`.
+midi_streams: []?*pm.MidiStream = &.{},
 
 /// Node whose first output is copied to the audio device.
 output: Node.Index = .{ .idx = 1 },
@@ -91,11 +95,86 @@ pub fn init(
         .midi_devices = midi_devices,
     };
 
+    try self.initMidiState(gpa);
+
     // Install the sentinel node first so every default connection is valid.
     _ = try self.addNode(
         gpa,
         Node.Noop.create("noop"),
     );
+}
+
+/// Allocates stable shared MIDI snapshots and stream slots for this DSP.
+fn initMidiState(self: *DSP, gpa: std.mem.Allocator) !void {
+    self.midi_state.devices = try gpa.alloc(midi.SharedState.Device, self.midi_devices.len);
+    self.midi_streams = try gpa.alloc(?*pm.MidiStream, self.midi_devices.len);
+    for (self.midi_devices, 0..) |device, index| {
+        self.midi_state.devices[index] = .{ .id = device.id };
+        self.midi_streams[index] = null;
+    }
+}
+
+/// Closes lazy MIDI streams and releases DSP-owned MIDI state.
+fn deinitMidiState(self: *DSP, gpa: std.mem.Allocator) void {
+    for (self.midi_streams) |*stream_slot| {
+        if (stream_slot.*) |value| {
+            value.close() catch {};
+            stream_slot.* = null;
+        }
+    }
+    gpa.free(self.midi_streams);
+    gpa.free(self.midi_state.devices);
+    self.midi_streams = &.{};
+    self.midi_state = .{};
+}
+
+/// Selects the physical device that receives virtual input injection.
+pub fn setMidiVirtualTarget(self: *DSP, device_id: pm.DeviceId) void {
+    self.midi_state.virtual_target.store(device_id, .release);
+}
+
+/// Opens a physical MIDI stream the first time a source is selected.
+pub fn ensureMidiDeviceOpen(self: *DSP, device_id: pm.DeviceId) pm.Error!void {
+    if (device_id == pm.NoDevice) return;
+    for (self.midi_devices, 0..) |device, index| {
+        if (device.id != device_id) continue;
+        if (self.midi_streams[index] != null) return;
+        var midi_stream: *pm.MidiStream = undefined;
+        try pm.openInput(&midi_stream, device_id, block_size, null, null);
+        self.midi_streams[index] = midi_stream;
+        return;
+    }
+    return error.InvalidDeviceId;
+}
+
+/// Polls every currently opened MIDI stream and publishes its note events.
+pub fn pollMidiDevices(self: *DSP) void {
+    var events: [16]pm.Event = undefined;
+    for (self.midi_streams, 0..) |stream_slot, index| {
+        const midi_stream = stream_slot orelse continue;
+        var event_count: usize = 0;
+        while (event_count < 64 and midi_stream.poll() catch false) {
+            const count = midi_stream.read(events[0..]);
+            if (count == 0) break;
+            for (events[0..@intCast(count)]) |event| {
+                const message = midi.Message.init(event.message);
+                if (message != .data) continue;
+                switch (message.data.command) {
+                    .note_on => |note| self.midi_state.devices[index].source.noteOn(
+                        note.note,
+                        note.attack_velocity,
+                    ),
+                    .note_off => |note| self.midi_state.devices[index].source.noteOff(
+                        note.note,
+                        note.release_velocity,
+                    ),
+                    else => {},
+                }
+                event_count += 1;
+                if (event_count == 64) break;
+            }
+        }
+    }
 }
 
 /// Stops and releases every audio resource owned by the graph.
@@ -118,6 +197,7 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
         sample_tap.queue.deinit(gpa);
     // Release all node storage using the allocator supplied at init time.
     self.nodes.deinit(gpa);
+    self.deinitMidiState(gpa);
 }
 
 /// Removes every user node while retaining the no-op sentinel at index zero.
@@ -230,38 +310,15 @@ pub fn setOutputDevice(self: *DSP, node: Node.Index, device_id: pa.DeviceId) Aud
     };
 }
 
-/// Replaces a MIDI node's input stream with the selected cached device.
-pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) pm.Error!void {
+/// Changes a MIDI node's selected shared input device.
+pub fn setMidiDevice(self: *DSP, node: Node.Index, device_id: pm.DeviceId) void {
     assert(self.nodes.items(.state)[node.idx] == .midi);
     assert(device_id == pm.NoDevice or pm.deviceById(self.midi_devices, device_id) != null);
 
     self.lockGraph();
-    const current = &self.nodes.items(.state)[node.idx].midi;
-    const already_open = current.parameters.device == device_id and
-        (device_id == pm.NoDevice or current.stream != null);
-    self.unlockGraph();
-    if (already_open) return;
-
-    // Opening a PortMidi stream can block, so do it before taking the graph
-    // lock; the current stream remains usable if the replacement fails.
-    var next_stream: ?*pm.MidiStream = null;
-    if (device_id != pm.NoDevice) {
-        var opened: *pm.MidiStream = undefined;
-        try pm.openInput(&opened, device_id, block_size, null, null);
-        next_stream = opened;
-    }
-
-    self.lockGraph();
     const state = &self.nodes.items(.state)[node.idx].midi;
-    const previous_stream = state.stream;
-    state.stream = next_stream;
     state.parameters.device = device_id;
-    for (&state.held) |*held| held.gate = 0;
     self.unlockGraph();
-
-    // The callback can only have held the old pointer before the locked swap.
-    if (previous_stream) |old_stream|
-        old_stream.close() catch {};
 }
 
 /// Replaces an Input node's source and resumes capture when playback is active.
@@ -1287,30 +1344,6 @@ fn releaseCacheStorage(self: *DSP, node: Node.Index, gpa: std.mem.Allocator) voi
     }
 }
 
-/// Presses a key on a keyboard node using its atomic voice state.
-pub fn keyboardKeyDown(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
-    switch (self.nodes.items(.state)[node.idx]) {
-        .keyboard => |*keyboard| return keyboard.press(key),
-        else => return false,
-    }
-}
-
-/// Releases a key on a keyboard node using its atomic voice state.
-pub fn keyboardKeyUp(self: *DSP, node: Node.Index, key: sdl.Keycode) bool {
-    switch (self.nodes.items(.state)[node.idx]) {
-        .keyboard => |*keyboard| return keyboard.release(key),
-        else => return false,
-    }
-}
-
-/// Releases all keys held by a keyboard node using atomic stores.
-pub fn keyboardReleaseAll(self: *DSP, node: Node.Index) void {
-    switch (self.nodes.items(.state)[node.idx]) {
-        .keyboard => |*keyboard| keyboard.releaseAll(),
-        else => {},
-    }
-}
-
 /// Returns a node's SampleTap for immediate main-thread reads. The graph output
 /// sink publishes its final rendered signal as one tap despite having no outlet.
 ///
@@ -1725,7 +1758,6 @@ pub const Node = struct {
         bit_crusher,
         constant,
         duplicate,
-        keyboard,
         input,
         mixer,
         monophonic_sequencer,
@@ -1754,8 +1786,6 @@ pub const Node = struct {
         constant: Constant,
         /// One-input signal splitter state.
         duplicate: Duplicate,
-        /// Computer-keyboard note source state.
-        keyboard: Keyboard,
         /// PortAudio audio capture source state.
         input: Input,
         /// Multi-input mixer state.
@@ -1809,8 +1839,6 @@ pub const Node = struct {
         line_plot,
         /// Display recent audio samples as a filled stereo waveform.
         waveform,
-        /// Display held notes on a one-octave piano keyboard.
-        piano,
         /// Do not display an output observer.
         none,
     };
@@ -2489,174 +2517,6 @@ pub const Node = struct {
         }
     };
 
-    /// Emits up to eight simultaneously held keyboard notes as frequencies.
-    pub const Keyboard = struct {
-        /// Sentinel MIDI value used before a voice has played a note.
-        const empty_pitch: u8 = std.math.maxInt(u8);
-
-        /// Port metadata for the keyboard node.
-        pub const metadata = Node.Metadata{
-            .name = "Keyboard",
-            .short_name = "kbd",
-            .color = .feijoa,
-            .has_parameters = true,
-            .can_link_parameters = false,
-            .outputs = .{
-                .{ .name = "Frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
-                .{ .name = "Gate", .short_name = "gate", .color = .feijoa },
-                .{ .name = "Note", .short_name = "note", .color = .feijoa, .observer = .piano },
-                .{},
-                .{},
-                .{},
-                .{},
-                .{},
-            },
-            .input_count = 0,
-            .output_count = 3,
-        };
-
-        /// User-controlled octave of the lower keyboard row.
-        pub const Parameters = struct {
-            /// MIDI octave containing the lower row's C key.
-            octave: i8 = 4,
-        };
-
-        /// Configuration copied at creation time.
-        parameters: Parameters,
-        /// SDL keycode assigned to each voice, or unknown for an unused voice.
-        voice_keys: [max_polyphony]std.atomic.Value(u32) = @splat(.{ .raw = 0 }),
-        /// Last MIDI pitch assigned to each voice, or empty_pitch if unused.
-        voice_pitches: [max_polyphony]std.atomic.Value(u8) = @splat(.{ .raw = empty_pitch }),
-
-        /// Creates a keyboard node with all voices released.
-        pub fn create(name: []const u8, parameters: Parameters) Node {
-            return .{
-                .state = .{
-                    .keyboard = .{ .parameters = parameters },
-                },
-                .name = name,
-                .process = process,
-            };
-        }
-
-        /// Presses a mapped key into the first available voice slot.
-        pub fn press(self: *Keyboard, key: sdl.Keycode) bool {
-            const pitch = self.pitchForKey(key) orelse return false;
-            if (self.voiceForKey(key) != null) return true;
-
-            for (0..max_polyphony) |voice| {
-                if (self.voice_keys[voice].load(.acquire) == @backingInt(sdl.Keycode.unknown)) {
-                    self.voice_pitches[voice].store(@intCast(pitch), .release);
-                    self.voice_keys[voice].store(@backingInt(key), .release);
-                    return true;
-                }
-            }
-            return true;
-        }
-
-        /// Releases the voice currently assigned to a mapped key.
-        pub fn release(self: *Keyboard, key: sdl.Keycode) bool {
-            const voice = self.voiceForKey(key) orelse return self.pitchForKey(key) != null;
-            self.voice_keys[voice].store(@backingInt(sdl.Keycode.unknown), .release);
-            return true;
-        }
-
-        /// Releases every active keyboard voice.
-        pub fn releaseAll(self: *Keyboard) void {
-            for (&self.voice_keys) |*voice|
-                voice.store(@backingInt(sdl.Keycode.unknown), .release);
-        }
-
-        /// Releases held notes and clears their remembered pitches.
-        pub fn reset(self: *Keyboard, _: u8) void {
-            self.releaseAll();
-            for (&self.voice_pitches) |*pitch|
-                pitch.store(empty_pitch, .release);
-        }
-
-        /// Returns the voice assigned to a key, if it is currently held.
-        fn voiceForKey(self: *const Keyboard, key: sdl.Keycode) ?usize {
-            for (&self.voice_keys, 0..) |*voice_key, voice| {
-                if (voice_key.load(.acquire) == @backingInt(key)) return voice;
-            }
-            return null;
-        }
-
-        /// Converts a mapped key to its MIDI pitch under the configured octave.
-        fn pitchForKey(self: *const Keyboard, key: sdl.Keycode) ?u7 {
-            const offset: ?i16 = switch (key) {
-                .z => 0,
-                .s => 1,
-                .x => 2,
-                .d => 3,
-                .c => 4,
-                .v => 5,
-                .g => 6,
-                .b => 7,
-                .h => 8,
-                .n => 9,
-                .j => 10,
-                .m => 11,
-                .q => 12,
-                .@"2" => 13,
-                .w => 14,
-                .@"3" => 15,
-                .e => 16,
-                .r => 17,
-                .@"5" => 18,
-                .t => 19,
-                .@"6" => 20,
-                .y => 21,
-                .@"7" => 22,
-                .u => 23,
-                .i => 24,
-                else => null,
-            };
-            const pitch_offset = offset orelse return null;
-            const pitch = (@as(i16, self.parameters.octave) + 1) * 12 + pitch_offset;
-            if (pitch < 0 or pitch > std.math.maxInt(u7)) return null;
-            return @intCast(pitch);
-        }
-
-        /// Converts a MIDI pitch to its equal-tempered frequency in hertz.
-        fn frequency(pitch: u7) f32 {
-            return 440 * std.math.pow(
-                f32,
-                2,
-                @as(f32, @floatFromInt(@as(i16, @intCast(pitch)) - 69)) / 12,
-            );
-        }
-
-        /// Emits the frequency and gate belonging to the currently rendered voice.
-        fn process(
-            dsp: *DSP,
-            node: Index,
-            into: []const *Buffer,
-        ) ProcessError!void {
-            const state = &dsp.nodes.items(.state)[node.idx].keyboard;
-            const voice = dsp.render_voice;
-            const raw_key = state.voice_keys[voice].load(.acquire);
-            const raw_pitch = state.voice_pitches[voice].load(.acquire);
-            const pitch = if (raw_key != @backingInt(sdl.Keycode.unknown))
-                state.pitchForKey(@fromBackingInt(@intCast(raw_key))) orelse
-                    if (raw_pitch != empty_pitch) @as(u7, @intCast(raw_pitch)) else null
-            else if (raw_pitch != empty_pitch)
-                @as(u7, @intCast(raw_pitch))
-            else
-                null;
-            const sample = if (pitch) |value| frequency(value) else 0;
-            @memset(into[0].samples[0..into[0].sample_count], sample);
-            @memset(
-                into[1].samples[0..into[1].sample_count],
-                if (raw_key == @backingInt(sdl.Keycode.unknown)) 0 else 1,
-            );
-            @memset(
-                into[2].samples[0..into[2].sample_count],
-                if (pitch) |value| @floatFromInt(value) else 0,
-            );
-        }
-    };
-
     /// Captures one mono or stereo PortAudio input and fans it out to graph voices.
     pub const Input = struct {
         /// Input source configuration.
@@ -3156,7 +3016,7 @@ pub const Node = struct {
                 .{ .name = "frequency", .short_name = "freq", .unit = "Hz", .color = .feijoa },
                 .{ .name = "gate", .short_name = "gate", .color = .feijoa },
                 .{ .name = "velocity", .short_name = "vel", .color = .feijoa },
-                .{ .name = "note", .short_name = "note", .color = .feijoa, .observer = .piano },
+                .{ .name = "note", .short_name = "note", .color = .feijoa },
                 .{},
                 .{},
                 .{},
@@ -4275,16 +4135,6 @@ pub const Node = struct {
     };
 
     pub const MIDI = struct {
-        /// One note's controls, held in a stable voice slot until note-off.
-        pub const Held = struct {
-            /// Raw MIDI pitch for the held note.
-            note: u7 = 0,
-            /// Whether the note remains held.
-            gate: f32 = 0,
-            /// Normalized MIDI velocity for the held note.
-            velocity: f32 = 0,
-        };
-
         pub const metadata = Node.Metadata{
             .name = "MIDI",
             .short_name = "midi",
@@ -4298,7 +4148,7 @@ pub const Node = struct {
                 .{ .name = "Frequency", .short_name = "freq", .color = .carnation },
                 .{ .name = "Gate", .short_name = "gate", .color = .carnation },
                 .{ .name = "Velocity", .short_name = "vel", .color = .carnation },
-                .{ .name = "Note", .short_name = "note", .color = .carnation, .observer = .piano },
+                .{ .name = "Note", .short_name = "note", .color = .carnation },
                 .{}, // TODO: CC
                 .{}, // TODO: After touch
                 .{}, // TODO: Pitch bend (frequency offset)
@@ -4312,19 +4162,6 @@ pub const Node = struct {
         };
 
         parameters: Parameters,
-        /// Opened input stream, absent when the saved device is unavailable.
-        stream: ?*pm.MidiStream = null,
-        /// Active MIDI notes indexed by the voice slot sent to downstream nodes.
-        held: [max_polyphony]Held = @splat(.{}),
-        /// Generation in which this node last polled its input stream.
-        last_event_generation: u64 = std.math.maxInt(u64),
-
-        /// Clears held notes while keeping the open MIDI input stream.
-        pub fn reset(self: *MIDI, _: u8) void {
-            const parameters = self.parameters;
-            const midi_stream = self.stream;
-            self.* = .{ .parameters = parameters, .stream = midi_stream };
-        }
 
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -4333,44 +4170,7 @@ pub const Node = struct {
                 },
                 .name = name,
                 .process = process,
-                .initialize = initialize,
-                .deinitialize = deinitialize,
             };
-        }
-
-        fn initialize(dsp: *DSP, node: Index, voice: u8, _: std.mem.Allocator) InitializeError!void {
-            const state: *MIDI = &dsp.stateForVoice(node, voice).midi;
-            if (state.parameters.device < 0) return;
-
-            // Device indices can become stale between saving and loading a graph.
-            if (pm.deviceById(dsp.midi_devices, state.parameters.device) == null) {
-                state.parameters.device = pm.NoDevice;
-                return;
-            }
-
-            var midi_stream: *pm.MidiStream = undefined;
-            pm.openInput(
-                &midi_stream,
-                state.parameters.device,
-                block_size,
-                null,
-                null,
-            ) catch |err| {
-                if (err == error.InvalidDeviceId) {
-                    state.parameters.device = pm.NoDevice;
-                    return;
-                }
-                return err;
-            };
-            state.stream = midi_stream;
-        }
-
-        fn deinitialize(dsp: *DSP, node: Index, voice: u8, _: std.mem.Allocator) void {
-            const state: *MIDI = &dsp.stateForVoice(node, voice).midi;
-            if (state.stream) |midi_stream| {
-                midi_stream.close() catch {};
-                state.stream = null;
-            }
         }
 
         fn noteFrequency(note: u7) f32 {
@@ -4384,64 +4184,16 @@ pub const Node = struct {
             return concert_a_freq * std.math.pow(f32, 2.0, semitone_offset);
         }
 
-        /// Releases the first held voice matching a note and records its release velocity.
-        fn releaseHeldNote(state: *MIDI, note: u7, velocity: f32) void {
-            for (&state.held) |*held| {
-                if (held.gate == 0 or held.note != note) continue;
-                held.gate = 0;
-                held.velocity = velocity;
-                break;
-            }
-        }
-
         fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
-
-            // The renderer calls this once per voice. Poll once per block so
-            // each voice sees the same note event and held-note snapshot.
-            if (state.last_event_generation != dsp.render_generation) {
-                state.last_event_generation = dsp.render_generation;
-                if (state.parameters.device >= 0) {
-                    if (state.stream) |midi_stream| {
-                        if (try midi_stream.poll()) {
-                            var read = [1]pm.Event{undefined};
-                            if (midi_stream.read(read[0..]) > 0) {
-                                const msg = midi.Message.init(read[0].message);
-                                if (msg == .data) switch (msg.data.command) {
-                                    .note_on => |on| {
-                                        const velocity = @as(f32, @floatFromInt(on.attack_velocity)) / 127;
-                                        if (velocity > 0) {
-                                            for (&state.held) |*held| {
-                                                if (held.gate != 0) continue;
-                                                held.* = .{
-                                                    .note = on.note,
-                                                    .gate = 1,
-                                                    .velocity = velocity,
-                                                };
-                                                break;
-                                            }
-                                        } else {
-                                            // MIDI commonly encodes note-off as note-on with zero velocity.
-                                            releaseHeldNote(state, on.note, velocity);
-                                        }
-                                    },
-                                    .note_off => |off| {
-                                        const velocity = @as(f32, @floatFromInt(off.release_velocity)) / 127;
-                                        releaseHeldNote(state, off.note, velocity);
-                                    },
-                                    else => {},
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-
-            const held = state.held[dsp.render_voice];
-            @memset(into[0].samples[0..into[0].sample_count], noteFrequency(held.note));
-            @memset(into[1].samples[0..into[1].sample_count], held.gate);
-            @memset(into[2].samples[0..into[2].sample_count], held.velocity);
-            @memset(into[3].samples[0..into[3].sample_count], @floatFromInt(held.note));
+            const snapshot = dsp.midi_state.snapshot(state.parameters.device, dsp.render_voice);
+            const note: u7 = @intCast(snapshot.note);
+            const gate = @as(f32, @floatFromInt(snapshot.gate));
+            const velocity = @as(f32, @floatFromInt(snapshot.velocity)) / 127;
+            @memset(into[0].samples[0..into[0].sample_count], noteFrequency(note));
+            @memset(into[1].samples[0..into[1].sample_count], gate);
+            @memset(into[2].samples[0..into[2].sample_count], velocity);
+            @memset(into[3].samples[0..into[3].sample_count], @floatFromInt(note));
         }
     };
 };
@@ -4456,7 +4208,6 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .constant = Node.Constant.metadata,
         .duplicate = Node.Duplicate.metadata,
         .input = Node.Input.metadata,
-        .keyboard = Node.Keyboard.metadata,
         .mixer = Node.Mixer.metadata,
         .monophonic_sequencer = Node.MonophonicSequencer.metadata,
         .multimode_filter = Node.MultimodeFilter.metadata,

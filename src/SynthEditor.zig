@@ -11,6 +11,7 @@ const Space = @import("Space.zig");
 const Serializer = @import("Serializer.zig");
 const Display = @import("Display.zig");
 const zgui = @import("zgui");
+const midi = @import("MIDI.zig");
 const VisualNode = Space.VisualNode;
 const pm = @import("portmidi.zig");
 const pa = @import("portaudio.zig");
@@ -48,6 +49,8 @@ parameter_editor: ParameterEditor = .{},
 group_space: ?Space = null,
 /// Group currently owning the temporary scoped layout, if any.
 active_group: ?DSP.Node.Index = null,
+/// Global piano controls, display state, and virtual input ownership.
+piano: PianoState = .{},
 
 /// State-stack callbacks used by the synth editor context.
 pub const vtable = StateStack.State.VTable{
@@ -72,8 +75,6 @@ const SelectedObserver = union(enum) {
     line_plot: Self.OutputGraph,
     /// Waveform graph for an output marked as a waveform observer.
     waveform: Self.OutputWaveform,
-    /// Piano keyboard for an output marked as a piano observer.
-    piano: Self.OutputPiano,
 };
 
 /// Converts a logical pixel extent to the number of display cells it occupies.
@@ -150,6 +151,12 @@ const ParameterEditor = struct {
 
 /// Number of parameter rows available after applying the pane padding.
 const parameters_pane_padding: u32 = 1;
+/// Number of rows occupied by the global piano's key rows.
+const piano_height: u32 = 2;
+/// Number of rows occupied by the piano's device field and focus button.
+const piano_control_height: u32 = 1;
+/// Total bottom-screen space reserved for the piano and its controls.
+const piano_reserved_height: u32 = piano_height + piano_control_height;
 /// Reference pane height used to size graph and waveform observers.
 const parameters_pane_min_height: u32 = 7;
 /// Maximum selected-pane content height, excluding its two border cells.
@@ -164,6 +171,24 @@ const output_status_playing = "playing";
 const output_meter_cell_count: u32 = @intCast(
     output_status_label.len + output_status_playing.len - 1,
 );
+
+/// Owns the global piano's selected source, controls, and virtual notes.
+const PianoState = struct {
+    /// Device currently observed by the global piano.
+    device: pm.DeviceId = pm.NoDevice,
+    /// Computer-keyboard mapping and virtual note ownership.
+    virtual_keyboard: VirtualKeyboard = .{},
+    /// Global piano display and active-note state.
+    display: Piano = .{},
+    /// Editable device field rendered above the global piano.
+    device_field: TextField(*Self) = undefined,
+    /// Whether the piano device field currently receives text input.
+    device_field_active: bool = false,
+    /// Whether computer keyboard events are currently captured as notes.
+    focused: bool = false,
+    /// Piano key currently held by the mouse, if any.
+    mouse_pitch: ?u7 = null,
+};
 
 /// Returns the layout operated on by the active editor state.
 fn editorSpace(self: *Self) *Space {
@@ -263,6 +288,23 @@ fn enter(
         .io = self.zsynth.io,
     };
     self.editorSpace().dsp = &self.dsp;
+    self.piano.device = if (self.zsynth.midi_devices.len != 0)
+        self.zsynth.midi_devices[0].id
+    else
+        pm.NoDevice;
+    self.dsp.setMidiVirtualTarget(self.piano.device);
+    self.piano.device_field = TextField(*Self).init(
+        self,
+        .{
+            .width = self.midiDeviceLabelWidth(),
+            .completion = pianoDeviceCompletion,
+            .label = "",
+        },
+    );
+    self.piano.device_field.setInput(self.midiDeviceLabel(self.piano.device));
+    if (self.zsynth.display.impl == .graphic)
+        self.piano.display.configure(self.zsynth.display.impl.graphic.width);
+    self.dsp.ensureMidiDeviceOpen(self.piano.device) catch return error.AudioError;
     try addVisualNode(self, gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
     // Start with only the audio output at the center of the empty space.
     try self.newGraph(gpa);
@@ -295,11 +337,20 @@ fn newGraph(self: *Self, gpa: std.mem.Allocator) StateStack.State.Error!void {
 
     // DSP.reset() retains the runtime sentinel at index zero.
     try self.editorSpace().addNode(gpa, DSP.Node.Index.noop, .{ .x = 0, .y = 0 });
+    const center = self.editorSpace().viewportCenter();
     const output = try addNode(
         self,
         gpa,
         DSP.Node.Output.create("output", self.zsynth.default_audio_device),
-        self.editorSpace().viewportCenter(),
+        center,
+    );
+    _ = try addNode(
+        self,
+        gpa,
+        DSP.Node.MIDI.create("midi", .{
+            .device = pm.defaultInputDevice(self.zsynth.midi_devices) orelse pm.NoDevice,
+        }),
+        .{ .x = center.x - 24, .y = center.y },
     );
     self.dsp.output = output;
     self.dsp.setOutputDevice(output, self.zsynth.default_audio_device) catch
@@ -366,6 +417,8 @@ fn update(
     dt: u64,
 ) StateStack.State.Error!void {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    self.dsp.pollMidiDevices();
+    self.piano.display.update(&self.dsp.midi_state, self.piano.device);
     if (self.output_meter.output_count != 0)
         self.output_meter.update(&self.dsp, dt);
     self.output_waveform.update(&self.dsp);
@@ -384,10 +437,6 @@ fn update(
         .waveform => |*waveform| {
             assert(waveform.parameters.node.idx == selected_node.idx);
             waveform.update(&self.dsp);
-        },
-        .piano => |*piano| {
-            assert(piano.parameters.node.idx == selected_node.idx);
-            piano.update(&self.dsp);
         },
     };
 }
@@ -458,16 +507,6 @@ fn refreshSelectionUi(self: *Self) void {
                     ),
                 );
             },
-            .piano => {
-                var piano: OutputPiano = .{};
-                piano.configure(selected_node, port);
-                self.selected_observers[output_port] = .{ .piano = piano };
-                self.selected_observer_width += piano.width;
-                self.selected_observer_height = @max(
-                    self.selected_observer_height,
-                    OutputPiano.height,
-                );
-            },
         }
         self.selected_observer_count += 1;
         if (self.selected_observer_count > 1)
@@ -493,10 +532,7 @@ fn setNodeSelection(self: *Self, node: ?VisualNode.Index) void {
         (if (previous_single) |previous| previous.idx else null) != selected_idx;
 
     if (changed) {
-        for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |previous| {
-            if (std.meta.activeTag(self.dsp.nodes.items(.state)[previous.idx]) == .keyboard)
-                self.dsp.keyboardReleaseAll(.{ .idx = previous.idx });
-        }
+        self.piano.virtual_keyboard.releaseAll(&self.dsp.midi_state.virtual);
     }
 
     self.editorSpace().selectSingle(selected);
@@ -552,6 +588,10 @@ fn loadDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !void {
     if (self.group_space != null)
         self.leaveGroupView(gpa);
     try self.serializer.load(path);
+    for (self.dsp.nodes.items(.state)) |node_state| {
+        if (node_state == .midi)
+            self.dsp.ensureMidiDeviceOpen(node_state.midi.parameters.device) catch return error.AudioError;
+    }
     self.output_meter.configure(&self.dsp, self.dsp.output, 0);
     self.output_waveform = .{};
     self.output_waveform.configure(
@@ -596,7 +636,12 @@ fn saveTemplateDocument(self: *Self, gpa: std.mem.Allocator, path: []const u8) !
 fn addTemplateDocument(self: *Self, path: []const u8) !VisualNode.Index {
     if (self.active_group != null)
         return error.InvalidGroup;
-    return self.serializer.addTemplate(path);
+    const group = try self.serializer.addTemplate(path);
+    for (self.dsp.nodes.items(.state)) |node_state| {
+        if (node_state == .midi)
+            try self.dsp.ensureMidiDeviceOpen(node_state.midi.parameters.device);
+    }
+    return group;
 }
 
 /// Returns the document filename without its path or format suffix.
@@ -680,7 +725,9 @@ fn writeOutputStatus(self: *Self, gpa: std.mem.Allocator) !void {
         return;
 
     const box_x = display.width - box_width;
-    const box_y = display.height - box_height;
+    const available_height = display.height -| piano_reserved_height;
+    if (available_height < box_height) return;
+    const box_y = available_height - box_height;
     const waveform_panel_width = if (show_waveform) waveform_width + 1 else 0;
     const status_x = box_x + waveform_panel_width + 1;
     const status_y = box_y + 1;
@@ -738,6 +785,63 @@ fn writeOutputStatus(self: *Self, gpa: std.mem.Allocator) !void {
     }
 }
 
+/// Draws the global MIDI-device selector, focus button, and full-width piano.
+fn writePiano(self: *Self, gpa: std.mem.Allocator) !void {
+    if (self.zsynth.ui_display.impl != .graphic) return;
+    const display = &self.zsynth.ui_display.impl.graphic;
+    if (display.height < piano_reserved_height) return;
+    if (self.piano.display.width != display.width)
+        self.piano.display.configure(display.width);
+
+    const control_y = display.height - piano_reserved_height;
+    const button_text = if (self.piano.focused) "[focused]" else "[focus]";
+    const button_width: u32 = @intCast(button_text.len);
+    var lower_note_label_buffer: [16]u8 = undefined;
+    const lower_note_label = std.fmt.bufPrint(
+        &lower_note_label_buffer,
+        "C{d} ",
+        .{self.piano.display.first_octave},
+    ) catch unreachable;
+    const field_label = "Source: ";
+    const field_x: u32 = @intCast(lower_note_label.len + field_label.len);
+    const button_x = display.width -| button_width;
+    const field_width = @min(
+        self.midiDeviceLabelWidth(),
+        button_x -| field_x -| 1,
+    );
+    self.piano.device_field.parameters.width = field_width;
+    try display.fill(gpa, .ebony, .transparent, ' ', 0, control_y, display.width, 1);
+    _ = try display.write(gpa, lower_note_label, 0, control_y, .ebony, .white);
+    if (self.piano.device_field_active) {
+        self.piano.device_field.parameters.label = field_label;
+        try self.piano.device_field.write(
+            gpa,
+            &self.zsynth.ui_display,
+            @intCast(lower_note_label.len),
+            control_y,
+        );
+    } else {
+        _ = try display.write(
+            gpa,
+            field_label,
+            @intCast(lower_note_label.len),
+            control_y,
+            .ebony,
+            .curious_blue,
+        );
+        _ = try display.write(
+            gpa,
+            self.midiDeviceLabel(self.piano.device),
+            field_x,
+            control_y,
+            .mine_shaft,
+            .white,
+        );
+    }
+    _ = try display.write(gpa, button_text, button_x, control_y, .ebony, .amber);
+    try self.piano.display.write(gpa, &self.zsynth.ui_display, .{ 0, control_y + piano_control_height });
+}
+
 /// Draws the selected node's reflected parameters in the bottom UI pane.
 fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     self.parameter_editor.cell_count = 0;
@@ -748,7 +852,8 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
     const selected = self.editorSpace().singleSelectedNode() orelse return;
     if (selected.isNoop()) return;
 
-    if (graphic.height < 2 or graphic.width <= parameters_pane_padding * 2)
+    const available_height = graphic.height -| piano_reserved_height;
+    if (available_height < 2 or graphic.width <= parameters_pane_padding * 2)
         return;
 
     const parameter_node = self.dsp.nodes.items(.parameter_link)[selected.idx].source orelse selected;
@@ -770,7 +875,7 @@ fn writeSelectedParametersPane(self: *Self, gpa: std.mem.Allocator) !void {
             else
                 struct {}{},
             self.dsp.nodes.items(.name)[selected.idx],
-            graphic.height,
+            available_height,
             graphic.width,
             &self.selected_observers,
             self.selected_observer_count,
@@ -1101,13 +1206,6 @@ fn writeReflectedParameters(
                         graphic.cell_width * graphic.scale,
                     );
                 },
-                .piano => |*piano| {
-                    try piano.write(gpa, display, .{
-                        observer_x,
-                        pane_top + parameters_pane_padding,
-                    });
-                    observer_x += piano.width;
-                },
             }
             observers_drawn += 1;
             if (observers_drawn < observer_count)
@@ -1208,25 +1306,45 @@ fn keyUpDown(
 ) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
 
-    if (self.parameter_editor.active == null) {
-        if (self.editorSpace().singleSelectedNode()) |selected| {
-            if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard) {
-                const modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
-                const command_modifiers = sdl.Keymod.ctrl |
-                    sdl.Keymod.lgui |
-                    sdl.Keymod.rgui |
-                    sdl.Keymod.alt;
-                if ((modifiers & command_modifiers) == 0) {
-                    const handled = if (event.down)
-                        self.dsp.keyboardKeyDown(.{ .idx = selected.idx }, event.key)
-                    else
-                        self.dsp.keyboardKeyUp(.{ .idx = selected.idx }, event.key);
-                    if (handled) {
-                        return true;
-                    }
-                }
-            }
+    const event_modifiers = std.mem.bytesToValue(u16, std.mem.asBytes(&event.mod));
+    if (event.down and event.key == .k and (event_modifiers & sdl.Keymod.ctrl) != 0) {
+        self.piano.focused = !self.piano.focused;
+        self.zsynth.cursor.dirty = true;
+        return true;
+    }
+
+    if (self.piano.device_field_active) {
+        if (!event.down) return true;
+        switch (event.key) {
+            .escape => {
+                self.piano.device_field_active = false;
+                self.zsynth.cursor.dirty = true;
+            },
+            .@"return", .kp_enter => {
+                self.commitPianoDeviceEdit();
+                self.piano.device_field_active = false;
+                self.zsynth.cursor.dirty = true;
+            },
+            else => {
+                self.piano.device_field.textUpDown(event);
+                self.zsynth.cursor.dirty = true;
+            },
         }
+        return true;
+    }
+
+    if (self.piano.focused) {
+        if (event.key == .escape and event.down) {
+            self.piano.focused = false;
+            self.piano.virtual_keyboard.releaseAll(&self.dsp.midi_state.virtual);
+            self.zsynth.cursor.dirty = true;
+            return true;
+        }
+        const handled = if (event.down)
+            self.piano.virtual_keyboard.press(&self.dsp.midi_state.virtual, event.key)
+        else
+            self.piano.virtual_keyboard.release(&self.dsp.midi_state.virtual, event.key);
+        return handled or event.down;
     }
 
     if (!event.down) return self.parameter_editor.active != null;
@@ -1320,7 +1438,6 @@ fn keyUpDown(
                     .meter => |*meter| meter.reset(),
                     .line_plot => |*graph| graph.reset(),
                     .waveform => |*waveform| waveform.reset(),
-                    .piano => |*piano| piano.reset(),
                 };
                 self.output_waveform.reset();
                 try self.writeSelectedParametersPane(gpa);
@@ -1419,7 +1536,6 @@ fn createSelectedGroup(self: *Self, gpa: std.mem.Allocator) StateStack.State.Err
         };
     }
 
-    self.releaseSelectedKeyboards();
     self.editorSpace().selectSingle(group);
     const layout_valid = self.editorSpace().rebuildOccupancy(gpa) catch |err| return err;
     if (!layout_valid) {
@@ -1511,7 +1627,6 @@ fn duplicateSelectedNodes(self: *Self, gpa: std.mem.Allocator, link_parameters: 
         duplicate_count += 1;
     }
 
-    self.releaseSelectedKeyboards();
     self.editorSpace().selectSingle(duplicates[0]);
     for (duplicates[1..duplicate_count]) |duplicate|
         self.editorSpace().toggleSelection(duplicate);
@@ -1528,7 +1643,6 @@ fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
         const selected = self.editorSpace().selected_nodes[0];
         if (self.editorSpace().isGroup(selected)) {
             var group_index = selected.idx;
-            self.releaseSelectedKeyboards();
 
             // Endpoint indices are not stable while swapRemove is compacting
             // the graph.  Find one by its current owner before each removal.
@@ -1574,7 +1688,6 @@ fn removeSelectedNodes(self: *Self, gpa: std.mem.Allocator) !void {
     var nodes: [Space.max_selected_nodes]VisualNode.Index = undefined;
     const count = self.editorSpace().selected_count;
     @memcpy(nodes[0..count], self.editorSpace().selected_nodes[0..count]);
-    self.releaseSelectedKeyboards();
     var index = count;
     while (index > 0) {
         index -= 1;
@@ -1597,7 +1710,6 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .constant => |value| DSP.Node.Constant.create(source_name, value.parameters),
         .delay => |value| DSP.Node.Delay.create(source_name, value.parameters),
         .duplicate => DSP.Node.Duplicate.create(source_name),
-        .keyboard => |value| DSP.Node.Keyboard.create(source_name, value.parameters),
         .mixer => |value| DSP.Node.Mixer.create(source_name, value.parameters),
         .monophonic_sequencer => |value| DSP.Node.MonophonicSequencer.create(source_name, value.parameters),
         .multimode_filter => |value| DSP.Node.MultimodeFilter.create(source_name, value.parameters),
@@ -1833,6 +1945,11 @@ fn textInput(
     event: sdl.TextInputEvent,
 ) StateStack.State.Error!bool {
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
+    if (self.piano.device_field_active) {
+        self.piano.device_field.textInput(event);
+        self.zsynth.cursor.dirty = true;
+        return true;
+    }
     if (self.parameter_editor.active == null) return false;
     self.parameter_editor.text_field.textInput(event);
     self.zsynth.cursor.dirty = true;
@@ -1948,8 +2065,10 @@ fn commitParameterEdit(self: *Self) void {
         switch (self.dsp.nodes.items(.state)[active.node.idx]) {
             .output => if (self.deviceIdForLabel(label)) |device_id|
                 self.dsp.setOutputDevice(active.node, device_id) catch {},
-            .midi => if (self.midiDeviceIdForLabel(label)) |device_id|
-                self.dsp.setMidiDevice(active.node, device_id) catch {},
+            .midi => if (self.midiDeviceIdForLabel(label)) |device_id| {
+                self.dsp.ensureMidiDeviceOpen(device_id) catch return;
+                self.dsp.setMidiDevice(active.node, device_id);
+            },
             else => {},
         }
     } else if (std.mem.eql(u8, active.field_name, "input")) {
@@ -2141,6 +2260,34 @@ fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
     };
 }
 
+/// Returns a matching device label for the global piano selector.
+fn pianoDeviceCompletion(field: *const TextField(*Self)) []const u8 {
+    return field.context.midiDeviceCompletion(field.inputSlice());
+}
+
+/// Starts editing the device observed by the global piano.
+fn beginPianoDeviceEdit(self: *Self) void {
+    if (self.parameter_editor.active != null)
+        self.commitParameterEdit();
+    self.piano.device_field_active = true;
+    self.piano.device_field.setInput(self.midiDeviceLabel(self.piano.device));
+}
+
+/// Commits the global piano device selection and opens its stream lazily.
+fn commitPianoDeviceEdit(self: *Self) void {
+    const device_id = self.midiDeviceIdForLabel(self.piano.device_field.inputSlice()) orelse return;
+    self.dsp.ensureMidiDeviceOpen(device_id) catch return;
+    if (device_id != self.piano.device) {
+        self.piano.virtual_keyboard.releaseAll(&self.dsp.midi_state.virtual);
+        if (self.piano.mouse_pitch) |pitch|
+            self.dsp.midi_state.virtual.noteOff(pitch, 0);
+        self.piano.mouse_pitch = null;
+    }
+    self.piano.device = device_id;
+    self.dsp.setMidiVirtualTarget(device_id);
+    self.piano.device_field.setInput(self.midiDeviceLabel(device_id));
+}
+
 /// Returns the cached display label for a PortAudio device index.
 fn outputDeviceLabel(self: *const Self, device_id: pa.DeviceId) []const u8 {
     const device = pa.deviceById(self.zsynth.audio_devices, device_id) orelse return "unavailable";
@@ -2207,13 +2354,15 @@ fn inputDeviceIdForLabel(self: *const Self, label: []const u8) ?pa.DeviceId {
 
 /// Returns the cached display label for a PortMidi input device index.
 fn midiDeviceLabel(self: *const Self, device_id: pm.DeviceId) []const u8 {
+    if (device_id == pm.NoDevice) return "Computer keyboard";
     const device = pm.deviceById(self.zsynth.midi_devices, device_id) orelse return "unavailable";
     return device.label;
 }
 
 /// Returns the longest cached MIDI-device label for the selected-pane field.
 fn midiDeviceLabelWidth(self: *const Self) u32 {
-    var width: usize = "unavailable".len;
+    var width: usize = "Computer keyboard".len;
+    width = @max(width, "unavailable".len);
     for (self.zsynth.midi_devices) |device|
         width = @max(width, device.label.len);
     return @intCast(width);
@@ -2221,6 +2370,8 @@ fn midiDeviceLabelWidth(self: *const Self) u32 {
 
 /// Finds a MIDI-device label matching the current input prefix.
 fn midiDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
+    if (parameterStartsWithIgnoreCase("Computer keyboard", input))
+        return "Computer keyboard";
     for (self.zsynth.midi_devices) |device| {
         if (parameterStartsWithIgnoreCase(device.label, input))
             return device.label;
@@ -2230,6 +2381,7 @@ fn midiDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
 
 /// Resolves an exact completed MIDI-device label to its runtime ID.
 fn midiDeviceIdForLabel(self: *const Self, label: []const u8) ?pm.DeviceId {
+    if (std.ascii.eqlIgnoreCase("Computer keyboard", label)) return pm.NoDevice;
     for (self.zsynth.midi_devices) |device| {
         if (std.ascii.eqlIgnoreCase(device.label, label))
             return device.id;
@@ -2333,6 +2485,52 @@ fn assignReflectedScalar(value: anytype, input: []const u8) bool {
     return false;
 }
 
+/// Handles clicks on the global piano controls and keyboard cells.
+fn pianoMouseButton(self: *Self, cell: [2]u32, event: sdl.MouseButtonEvent) bool {
+    if (self.zsynth.ui_display.impl != .graphic) return false;
+    const display = &self.zsynth.ui_display.impl.graphic;
+    if (display.height < piano_reserved_height) return false;
+    const control_y = display.height - piano_reserved_height;
+    if (cell[1] == control_y) {
+        const button_text = if (self.piano.focused) "[focused]" else "[focus]";
+        const button_x = display.width -| @as(u32, @intCast(button_text.len));
+        if (cell[0] >= button_x) {
+            if (event.down) self.piano.focused = !self.piano.focused;
+            return true;
+        }
+        var lower_note_label_buffer: [16]u8 = undefined;
+        const lower_note_label = std.fmt.bufPrint(
+            &lower_note_label_buffer,
+            "C{d}",
+            .{self.piano.display.first_octave},
+        ) catch unreachable;
+        const field_x: u32 = @intCast(lower_note_label.len + "MIDI: ".len);
+        const field_start: u32 = @intCast(lower_note_label.len);
+        const field_width = @min(
+            self.midiDeviceLabelWidth(),
+            button_x -| field_x -| 1,
+        );
+        if (cell[0] >= field_start and cell[0] < field_start + "MIDI: ".len + field_width) {
+            if (event.down) self.beginPianoDeviceEdit();
+            return true;
+        }
+        return true;
+    }
+    if (cell[1] < control_y + piano_control_height or cell[1] >= display.height)
+        return false;
+    if (event.down) {
+        if (self.piano.mouse_pitch) |previous|
+            self.dsp.midi_state.virtual.noteOff(previous, 0);
+        self.piano.mouse_pitch = self.piano.display.pitchAt(cell[0]);
+        if (self.piano.mouse_pitch) |pitch|
+            self.dsp.midi_state.virtual.noteOn(pitch, 127);
+    } else if (self.piano.mouse_pitch) |pitch| {
+        self.dsp.midi_state.virtual.noteOff(pitch, 0);
+        self.piano.mouse_pitch = null;
+    }
+    return true;
+}
+
 /// Returns whether `candidate` begins with the case-insensitive prefix.
 fn parameterStartsWithIgnoreCase(candidate: []const u8, prefix: []const u8) bool {
     return prefix.len <= candidate.len and
@@ -2358,6 +2556,19 @@ fn mouseButton(
     }
 
     if (event.button == 1) {
+        if (!event.down and self.piano.mouse_pitch != null) {
+            if (self.piano.mouse_pitch) |pitch| self.dsp.midi_state.virtual.noteOff(pitch, 0);
+            self.piano.mouse_pitch = null;
+            return true;
+        }
+        const cell = self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
+        if (cell) |display_cell| {
+            if (self.pianoMouseButton(display_cell, event)) {
+                self.zsynth.cursor.left_mouse_down = false;
+                self.zsynth.cursor.dirty = true;
+                return true;
+            }
+        }
         if (event.down) {
             self.zsynth.cursor.left_mouse_down = true;
             self.zsynth.cursor.left_mouse_moved = false;
@@ -2367,7 +2578,6 @@ fn mouseButton(
                 keyboard_state[@backingInt(sdl.Scancode.lctrl)]) or
                 (keyboard_state.len > @backingInt(sdl.Scancode.rctrl) and
                     keyboard_state[@backingInt(sdl.Scancode.rctrl)]);
-            const cell = self.zsynth.displayCellAtWindowPosition(.{ event.x, event.y });
             if (cell) |display_cell| {
                 if (self.parameterCellAt(display_cell)) |parameter| {
                     if (parameter.editable) {
@@ -2418,7 +2628,6 @@ fn mouseButton(
                     self.zsynth.cursor.left_mouse_down = false;
                     return true;
                 } else if (control) {
-                    self.releaseSelectedKeyboards();
                     self.editorSpace().toggleSelection(selected);
                     self.refreshSelectionUi();
                     self.zsynth.cursor.left_mouse_down = false;
@@ -2502,14 +2711,6 @@ fn finishLeftMouseDrag(self: *Self, gpa: std.mem.Allocator) !void {
         try self.write(gpa);
     } else {
         cursor.left_mouse_moved = false;
-    }
-}
-
-/// Releases keyboard notes before a mouse selection replaces the current set.
-fn releaseSelectedKeyboards(self: *Self) void {
-    for (self.editorSpace().selected_nodes[0..self.editorSpace().selected_count]) |selected| {
-        if (std.meta.activeTag(self.dsp.nodes.items(.state)[selected.idx]) == .keyboard)
-            self.dsp.keyboardReleaseAll(.{ .idx = selected.idx });
     }
 }
 
@@ -2749,6 +2950,8 @@ fn render(
     try self.writeGroupTitle(gpa);
     // Draw the fixed output HUD above all graph and parameter-pane content.
     try self.writeOutputStatus(gpa);
+    // Draw the always-visible global piano above the display's lower edge.
+    try self.writePiano(gpa);
     // Draw outlet labels before the runtime adds the generic cursor glyph.
     if (self.zsynth.cursor.visible and self.zsynth.ui_display.impl == .graphic) {
         if (self.zsynth.displayCellAtWindowPosition(self.zsynth.cursor.position)) |cell| {
@@ -2833,6 +3036,9 @@ fn addNode(
     node: DSP.Node,
     position: Space.Position,
 ) StateStack.State.Error!DSP.Node.Index {
+    if (node.state == .midi)
+        self.dsp.ensureMidiDeviceOpen(node.state.midi.parameters.device) catch
+            return error.AudioError;
     const index = self.dsp.addNode(allocator, node) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.AudioError,
@@ -3493,7 +3699,6 @@ pub const CommandPalette = struct {
             .add => DSP.Node.Add.create(name),
             .multiply => DSP.Node.Multiply.create(name),
             .constant => DSP.Node.Constant.create(name, .{}),
-            .keyboard => DSP.Node.Keyboard.create(name, .{}),
             .oscillator => DSP.Node.Oscillator.create(name, .{
                 .waveform = .sine,
                 .default_frequency = 440,
@@ -4546,179 +4751,191 @@ pub const OutputWaveform = struct {
     }
 };
 
-/// Displays the held notes from a Keyboard or MIDI node on a moving piano range.
-pub const OutputPiano = struct {
-    /// Node whose held-note state supplies the highlighted keys.
-    parameters: Parameters = .{},
-    /// Highlight state for the semitones in the displayed piano range.
+/// Maps computer keyboard keys to note events in the editor-owned virtual source.
+const VirtualKeyboard = struct {
+    /// MIDI octave containing the lower row's C key.
+    octave: i8 = 4,
+    /// SDL keycode assigned to each virtual voice.
+    voice_keys: [midi.max_polyphony]std.atomic.Value(u32) = @splat(.{ .raw = 0 }),
+    /// MIDI pitch assigned to each virtual voice.
+    voice_pitches: [midi.max_polyphony]std.atomic.Value(u8) = @splat(.{ .raw = std.math.maxInt(u8) }),
+
+    /// Presses a mapped computer key into the virtual source.
+    fn press(self: *VirtualKeyboard, source: *midi.Source, key: sdl.Keycode) bool {
+        const pitch = self.pitchForKey(key) orelse return false;
+        if (self.voiceForKey(key) != null) return true;
+        for (0..midi.max_polyphony) |voice| {
+            if (self.voice_keys[voice].load(.acquire) != @backingInt(sdl.Keycode.unknown)) continue;
+            self.voice_pitches[voice].store(pitch, .monotonic);
+            self.voice_keys[voice].store(@backingInt(key), .release);
+            source.noteOn(pitch, 127);
+            return true;
+        }
+        return true;
+    }
+
+    /// Releases the virtual voice assigned to a computer key.
+    fn release(self: *VirtualKeyboard, source: *midi.Source, key: sdl.Keycode) bool {
+        const voice = self.voiceForKey(key) orelse return self.pitchForKey(key) != null;
+        const pitch = self.voice_pitches[voice].load(.monotonic);
+        self.voice_keys[voice].store(@backingInt(sdl.Keycode.unknown), .release);
+        if (pitch != std.math.maxInt(u8)) source.noteOff(@intCast(pitch), 0);
+        return true;
+    }
+
+    /// Releases every virtual computer-keyboard voice.
+    fn releaseAll(self: *VirtualKeyboard, source: *midi.Source) void {
+        for (&self.voice_keys, 0..) |*key, voice| {
+            if (key.load(.acquire) == @backingInt(sdl.Keycode.unknown)) continue;
+            const pitch = self.voice_pitches[voice].load(.monotonic);
+            key.store(@backingInt(sdl.Keycode.unknown), .release);
+            if (pitch != std.math.maxInt(u8)) source.noteOff(@intCast(pitch), 0);
+        }
+    }
+
+    /// Returns the voice assigned to a computer key.
+    fn voiceForKey(self: *const VirtualKeyboard, key: sdl.Keycode) ?usize {
+        for (&self.voice_keys, 0..) |*voice_key, voice|
+            if (voice_key.load(.acquire) == @backingInt(key)) return voice;
+        return null;
+    }
+
+    /// Converts a mapped computer key to a MIDI pitch.
+    fn pitchForKey(self: *const VirtualKeyboard, key: sdl.Keycode) ?u7 {
+        const offset: ?i16 = switch (key) {
+            .z => 0,
+            .s => 1,
+            .x => 2,
+            .d => 3,
+            .c => 4,
+            .v => 5,
+            .g => 6,
+            .b => 7,
+            .h => 8,
+            .n => 9,
+            .j => 10,
+            .m => 11,
+            .q => 12,
+            .@"2" => 13,
+            .w => 14,
+            .@"3" => 15,
+            .e => 16,
+            .r => 17,
+            .@"5" => 18,
+            .t => 19,
+            .@"6" => 20,
+            .y => 21,
+            .@"7" => 22,
+            .u => 23,
+            .i => 24,
+            else => null,
+        };
+        const pitch_offset = offset orelse return null;
+        const pitch = (@as(i16, self.octave) + 1) * 12 + pitch_offset;
+        if (pitch < 0 or pitch > std.math.maxInt(u7)) return null;
+        return @intCast(pitch);
+    }
+};
+
+/// Displays notes from the editor-selected MIDI source across the full screen width.
+const Piano = struct {
+    /// Highlight state for every displayed semitone cell.
     active: [max_key_count]bool = @splat(false),
-    /// Width of the rendered piano in display cells.
-    width: u32 = key_count * 2,
-    /// MIDI octave of the lowest C currently shown by the piano.
+    /// Number of semitone cells currently visible.
+    width: u32 = 0,
+    /// MIDI octave of the lowest C currently shown.
     first_octave: i8 = 2,
 
     /// Number of semitones in one octave.
     pub const key_count: u32 = 12;
-    /// Maximum number of semitones retained by the fixed observer buffer.
-    pub const max_key_count: u32 = 128;
-    /// Height of the piano observer in display cells, including its label.
-    pub const height: u32 = 3;
+    /// Maximum number of semitones retained by the fixed display buffer.
+    pub const max_key_count: u32 = 256;
 
-    /// Node and octave used by one piano observer.
-    pub const Parameters = struct {
-        /// Node whose held notes are displayed.
-        node: DSP.Node.Index = undefined,
-        /// Number of octaves displayed by the piano.
-        octave: u8 = 2,
-    };
-
-    /// Arguments passed through the graph lock while collecting held notes.
-    const UpdateContext = struct {
-        /// Observer receiving the active-note snapshot.
-        observer: *OutputPiano,
-        /// DSP graph containing the selected node.
-        dsp: *DSP,
-    };
-
-    /// Binds the piano to a node and clears its current highlighted notes.
-    pub fn configure(self: *OutputPiano, node: DSP.Node.Index, _: u8) void {
-        self.parameters.node = node;
-        assert(self.parameters.octave > 0);
-        assert(@as(u32, self.parameters.octave) * key_count <= max_key_count);
-        self.width = @as(u32, self.parameters.octave) * key_count;
-        self.first_octave = 2;
-        self.reset();
-    }
-
-    /// Clears all highlighted keys.
-    pub fn reset(self: *OutputPiano) void {
+    /// Updates the visible piano width and clears its note highlights.
+    fn configure(self: *Piano, width: u32) void {
+        assert(width <= max_key_count);
+        self.width = width;
         self.active = @splat(false);
     }
 
-    /// Takes a synchronized snapshot of the node's currently held notes.
-    pub fn update(self: *OutputPiano, dsp: *DSP) void {
-        var context = UpdateContext{ .observer = self, .dsp = dsp };
-        dsp.withGraphLock(*UpdateContext, &context, updateLocked);
+    /// Clears all highlighted notes.
+    fn reset(self: *Piano) void {
+        self.active = @splat(false);
     }
 
-    /// Collects Keyboard and MIDI notes while the DSP graph is quiescent.
-    fn updateLocked(context: *UpdateContext) void {
-        const self = context.observer;
+    /// Reads the selected shared source and updates highlighted keys.
+    fn update(self: *Piano, state: *const midi.SharedState, device: pm.DeviceId) void {
         self.reset();
-
-        var notes: [DSP.max_polyphony]u7 = undefined;
+        var notes: [midi.max_polyphony]u7 = undefined;
         var note_count: usize = 0;
-        var keyboard_octave: ?i8 = null;
-        const state = &context.dsp.nodes.items(.state)[self.parameters.node.idx];
-        switch (state.*) {
-            .keyboard => |*keyboard| {
-                keyboard_octave = keyboard.parameters.octave;
-                for (&keyboard.voice_keys, 0..) |*key, voice| {
-                    if (key.load(.acquire) == @backingInt(sdl.Keycode.unknown))
-                        continue;
-                    const pitch = keyboard.voice_pitches[voice].load(.acquire);
-                    if (pitch == std.math.maxInt(u8))
-                        continue;
-                    notes[note_count] = @intCast(pitch);
-                    note_count += 1;
-                }
-            },
-            .midi => |*midi| {
-                for (midi.held) |held| {
-                    if (held.gate == 0)
-                        continue;
-                    notes[note_count] = held.note;
-                    note_count += 1;
-                }
-            },
-            else => {},
+        for (0..midi.max_polyphony) |voice| {
+            const snapshot = state.snapshot(device, @intCast(voice));
+            if (snapshot.gate == 0) continue;
+            notes[note_count] = @intCast(snapshot.note);
+            note_count += 1;
         }
-
-        if (note_count != 0)
-            self.first_octave = self.selectWindow(notes[0..note_count])
-        else if (keyboard_octave) |octave|
-            self.first_octave = octave;
-
-        for (notes[0..note_count]) |pitch|
-            self.markPitch(pitch);
+        if (note_count != 0) self.adaptWindow(notes[0..note_count]);
+        for (notes[0..note_count]) |pitch| self.markPitch(pitch);
     }
 
-    /// Selects the C-based display window containing the most held notes.
-    fn selectWindow(self: *const OutputPiano, notes: []const u7) i8 {
+    /// Returns the MIDI pitch represented by a piano cell, if valid.
+    fn pitchAt(self: *const Piano, x: u32) ?u7 {
+        if (x >= self.width) return null;
+        const pitch = (@as(i16, self.first_octave) + 1) * 12 + @as(i16, @intCast(x));
+        if (pitch < 0 or pitch > std.math.maxInt(u7)) return null;
+        return @intCast(pitch);
+    }
+
+    /// Keeps the current full-width frame until a held note leaves it.
+    fn adaptWindow(self: *Piano, notes: []const u7) void {
         assert(notes.len != 0);
-
-        var minimum_octave: i16 = 127;
-        var maximum_octave: i16 = -128;
+        var minimum_pitch: i16 = std.math.maxInt(i16);
+        var maximum_pitch: i16 = std.math.minInt(i16);
         for (notes) |pitch| {
-            const octave = @divTrunc(@as(i16, pitch), 12) - 1;
-            minimum_octave = @min(minimum_octave, octave);
-            maximum_octave = @max(maximum_octave, octave);
+            minimum_pitch = @min(minimum_pitch, @as(i16, pitch));
+            maximum_pitch = @max(maximum_pitch, @as(i16, pitch));
+        }
+        const displayed_key_count: i16 = @intCast(self.width);
+        var first_pitch = (@as(i16, self.first_octave) + 1) * 12;
+        if (minimum_pitch >= first_pitch and maximum_pitch < first_pitch + displayed_key_count)
+            return;
+
+        const note_span = maximum_pitch - minimum_pitch;
+        if (note_span >= displayed_key_count) {
+            first_pitch = minimum_pitch;
+        } else if (minimum_pitch < first_pitch) {
+            first_pitch = minimum_pitch;
+        } else {
+            first_pitch = maximum_pitch - displayed_key_count + 1;
         }
 
-        const displayed_key_count: i16 = @intCast(
-            @as(u32, self.parameters.octave) * key_count,
-        );
-        var best_octave = minimum_octave;
-        var best_count: usize = 0;
-        var candidate = minimum_octave;
-        while (candidate <= maximum_octave) : (candidate += 1) {
-            const first_pitch = (candidate + 1) * 12;
-            var count: usize = 0;
-            for (notes) |pitch| {
-                const offset = @as(i16, pitch) - first_pitch;
-                if (offset >= 0 and offset < displayed_key_count)
-                    count += 1;
-            }
-            if (count > best_count) {
-                best_count = count;
-                best_octave = candidate;
-            }
-        }
-        return @intCast(best_octave);
+        const first_octave = @divFloor(first_pitch, 12) - 1;
+        self.first_octave = @intCast(@max(@as(i16, -1), first_octave));
     }
 
-    /// Marks a pitch when it belongs to the current displayed octave range.
-    fn markPitch(self: *OutputPiano, pitch: u7) void {
+    /// Marks a pitch when it belongs to the visible piano range.
+    fn markPitch(self: *Piano, pitch: u7) void {
         const first_pitch = (@as(i16, self.first_octave) + 1) * 12;
         const offset = @as(i16, pitch) - first_pitch;
-        const displayed_key_count: i16 = @intCast(
-            @as(u32, self.parameters.octave) * key_count,
-        );
-        if (offset >= 0 and offset < displayed_key_count)
+        if (offset >= 0 and offset < @as(i16, @intCast(self.width)))
             self.active[@intCast(offset)] = true;
     }
 
-    /// Writes the piano keyboard and its lowest-note label at the supplied origin.
-    pub fn write(
-        self: *const OutputPiano,
-        gpa: std.mem.Allocator,
-        display: *Display,
-        position: [2]u32,
-    ) !void {
-        const black_keys = [_]bool{
-            false, true,  false, true,  false, false,
-            true,  false, true,  false, true,  false,
-        };
+    /// Writes the full-width piano at the supplied display origin.
+    fn write(self: *const Piano, gpa: std.mem.Allocator, display: *Display, position: [2]u32) !void {
+        const black_keys = [_]bool{ false, true, false, true, false, false, true, false, true, false, true, false };
         const filled = [_]u8{0xDD};
         const blank = [_]u8{' '};
-
-        assert(self.width <= max_key_count);
         for (0..self.width) |key| {
             const x = position[0] + @as(u32, @intCast(key));
-            const semitone = key % key_count;
-            const is_black = black_keys[semitone];
+            const is_black = black_keys[key % key_count];
             const top_glyph = if (is_black) filled else blank;
             const top_fg = if (self.active[key]) Display.Color.gray_chateau else Display.Color.black;
             try display.write(gpa, top_glyph[0..], x, position[1], .white, top_fg);
-
             const bottom_glyph = if (self.active[key] and !is_black) filled else blank;
             const bottom_fg = if (self.active[key]) Display.Color.gray_chateau else Display.Color.black;
             try display.write(gpa, bottom_glyph[0..], x, position[1] + 1, .white, bottom_fg);
         }
-
-        var label: [16]u8 = undefined;
-        const label_text = std.fmt.bufPrint(&label, "C{d}", .{self.first_octave}) catch unreachable;
-        try display.write(gpa, label_text, position[0], position[1] + 2, .ebony, .white);
     }
 };
 

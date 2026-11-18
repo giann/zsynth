@@ -42,7 +42,6 @@ const Serialized = struct {
             filter,
             bit_crusher,
             noise,
-            keyboard,
             midi,
             output,
             delay,
@@ -59,7 +58,6 @@ const Serialized = struct {
             filter: FilterParameters,
             bit_crusher: BitCrusherParameters,
             noise: NoiseParameters,
-            keyboard: KeyboardParameters,
             midi: MIDIParameterse,
             output: OutputParameters,
             delay: DelayParameters,
@@ -161,9 +159,6 @@ const Serialized = struct {
         amplitude: ?f32 = null,
     };
 
-    /// Persisted keyboard parameters.
-    pub const KeyboardParameters = struct { octave: ?i32 = null };
-
     /// Persisted output device identity.
     pub const OutputParameters = struct {
         host_api_name: ?[]const u8 = null,
@@ -220,7 +215,6 @@ const JsonParameters = union(enum) {
     filter: Serialized.FilterParameters,
     bit_crusher: Serialized.BitCrusherParameters,
     noise: Serialized.NoiseParameters,
-    keyboard: Serialized.KeyboardParameters,
     midi: Serialized.MIDIParameterse,
     output: Serialized.OutputParameters,
     delay: Serialized.DelayParameters,
@@ -1187,7 +1181,6 @@ fn parametersToJson(parameters: ?Serialized.Node.parameters_union) ?JsonParamete
         .filter => |item| .{ .filter = item },
         .bit_crusher => |item| .{ .bit_crusher = item },
         .noise => |item| .{ .noise = item },
-        .keyboard => |item| .{ .keyboard = item },
         .midi => |item| .{ .midi = item },
         .output => |item| .{ .output = item },
         .delay => |item| .{ .delay = item },
@@ -1251,7 +1244,6 @@ fn parametersFromJson(
         .filter => |item| .{ .filter = item },
         .bit_crusher => |item| .{ .bit_crusher = item },
         .noise => |item| .{ .noise = item },
-        .keyboard => |item| .{ .keyboard = item },
         .midi => |item| .{ .midi = item },
         .output => |item| .{ .output = item },
         .delay => |item| .{ .delay = item },
@@ -1324,9 +1316,6 @@ fn parametersToSerialized(
                 },
             };
         },
-        .keyboard => |value| .{ .keyboard = .{
-            .octave = value.parameters.octave,
-        } },
         .constant => |value| .{ .constant = .{ .constant = value.parameters.constant } },
         .oscillator => |value| .{ .oscillator = .{
             .waveform = @tagName(value.parameters.waveform),
@@ -1544,15 +1533,6 @@ fn nodeFromSerialized(
             .amplitude = value.amplitude orelse 1,
         });
     }
-    if (std.mem.eql(u8, serialized.kind, "keyboard")) {
-        const value = try requiredParameters(serialized, .keyboard);
-        const octave = value.octave orelse 4;
-        if (octave < std.math.minInt(i8) or octave > std.math.maxInt(i8))
-            return error.InvalidNodeParameters;
-        return DSP.Node.Keyboard.create(name, .{
-            .octave = @intCast(octave),
-        });
-    }
     if (std.mem.eql(u8, serialized.kind, "midi")) {
         const value = try requiredParameters(serialized, .midi);
         const default_device = pm.defaultInputDevice(self.dsp.midi_devices) orelse pm.NoDevice;
@@ -1573,7 +1553,9 @@ fn nodeFromSerialized(
         } else default_device;
         return DSP.Node.MIDI.create(
             name,
-            .{ .device = source },
+            .{
+                .device = source,
+            },
         );
     }
     return error.UnknownNodeKind;
@@ -1631,7 +1613,6 @@ fn validateDocument(document: Serialized.SynthDocument) !void {
                 .multiply,
                 .output,
                 .constant,
-                .keyboard,
                 .oscillator,
                 .mixer,
                 .monophonic_sequencer,
@@ -1763,7 +1744,6 @@ fn validateGroupBinding(
 fn validateNodeParameters(node: Serialized.Node, tag: DSP.Node.Tag) !void {
     switch (tag) {
         .constant => _ = try requiredParameters(node, .constant),
-        .midi => _ = try requiredParameters(node, .midi),
         .input => _ = try requiredParameters(node, .input),
         .oscillator => {
             const value = try requiredParameters(node, .oscillator);
@@ -1817,12 +1797,7 @@ fn validateNodeParameters(node: Serialized.Node, tag: DSP.Node.Tag) !void {
             const value = try requiredParameters(node, .noise);
             _ = try enumFromString(DSP.Node.Noise.Type, value.type orelse "white");
         },
-        .keyboard => {
-            const value = try requiredParameters(node, .keyboard);
-            const octave = value.octave orelse 4;
-            if (octave < std.math.minInt(i8) or octave > std.math.maxInt(i8))
-                return error.InvalidNodeParameters;
-        },
+        .midi => _ = try requiredParameters(node, .midi),
         .output => if (node.parameters) |parameters| switch (parameters) {
             .output => {},
             else => return error.InvalidNodeParameters,
