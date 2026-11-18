@@ -1321,6 +1321,7 @@ fn keyUpDown(
                 self.zsynth.cursor.dirty = true;
             },
             .@"return", .kp_enter => {
+                _ = self.piano.device_field.acceptCompletion();
                 self.commitPianoDeviceEdit();
                 self.piano.device_field_active = false;
                 self.zsynth.cursor.dirty = true;
@@ -1359,18 +1360,23 @@ fn keyUpDown(
                 self.zsynth.cursor.dirty = true;
             },
             .@"return", .kp_enter => {
+                _ = self.parameter_editor.text_field.acceptCompletion();
                 self.commitParameterEdit();
                 self.cancelParameterEdit();
                 self.zsynth.cursor.dirty = true;
             },
             .up => {
-                self.commitParameterEdit();
-                self.moveParameterEdit(-1);
+                if (!self.parameter_editor.text_field.selectCompletion(-1)) {
+                    self.commitParameterEdit();
+                    self.moveParameterEdit(-1);
+                }
                 self.zsynth.cursor.dirty = true;
             },
             .down => {
-                self.commitParameterEdit();
-                self.moveParameterEdit(1);
+                if (!self.parameter_editor.text_field.selectCompletion(1)) {
+                    self.commitParameterEdit();
+                    self.moveParameterEdit(1);
+                }
                 self.zsynth.cursor.dirty = true;
             },
             else => {
@@ -2232,20 +2238,20 @@ fn formatReflectedParameter(
     return "";
 }
 
-/// Returns an enum tag completing the active selected-pane input.
-fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
+/// Returns the indexed completion for the active selected-pane input.
+fn parameterCompletion(field: *const TextField(*Self), index: usize) ?[]const u8 {
     const self = field.context;
-    const active = self.parameter_editor.active orelse return "";
+    const active = self.parameter_editor.active orelse return null;
 
     const state = self.dsp.nodes.items(.state)[active.node.idx];
     if (std.mem.eql(u8, active.field_name, "input")) return switch (state) {
-        .input => self.inputDeviceCompletion(field.inputSlice()),
-        else => "",
+        .input => self.inputDeviceCompletion(field.inputSlice(), index),
+        else => null,
     };
     if (std.mem.eql(u8, active.field_name, "device")) return switch (state) {
-        .output => self.outputDeviceCompletion(field.inputSlice()),
-        .midi => self.midiDeviceCompletion(field.inputSlice()),
-        else => "",
+        .output => self.outputDeviceCompletion(field.inputSlice(), index),
+        .midi => self.midiDeviceCompletion(field.inputSlice(), index),
+        else => null,
     };
     return switch (state) {
         inline else => |node_state| if (@hasField(@TypeOf(node_state), "parameters"))
@@ -2254,15 +2260,16 @@ fn parameterCompletion(field: *const TextField(*Self)) []const u8 {
                 active.field_name,
                 active.array_index,
                 field.inputSlice(),
+                index,
             )
         else
-            "",
+            null,
     };
 }
 
-/// Returns a matching device label for the global piano selector.
-fn pianoDeviceCompletion(field: *const TextField(*Self)) []const u8 {
-    return field.context.midiDeviceCompletion(field.inputSlice());
+/// Returns the indexed matching device label for the global piano selector.
+fn pianoDeviceCompletion(field: *const TextField(*Self), index: usize) ?[]const u8 {
+    return field.context.midiDeviceCompletion(field.inputSlice(), index);
 }
 
 /// Starts editing the device observed by the global piano.
@@ -2302,13 +2309,15 @@ fn outputDeviceLabelWidth(self: *const Self) u32 {
     return @intCast(width);
 }
 
-/// Finds the first output-device label matching the current input prefix.
-fn outputDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
+/// Returns the indexed output-device label matching the current input prefix.
+fn outputDeviceCompletion(self: *const Self, input: []const u8, index: usize) ?[]const u8 {
+    var match_index: usize = 0;
     for (self.zsynth.audio_devices) |device| {
-        if (parameterStartsWithIgnoreCase(device.label, input))
-            return device.label;
+        if (!parameterStartsWithIgnoreCase(device.label, input)) continue;
+        if (match_index == index) return device.label;
+        match_index += 1;
     }
-    return "";
+    return null;
 }
 
 /// Resolves an exact completed output-device label to its runtime ID.
@@ -2334,13 +2343,15 @@ fn inputDeviceLabelWidth(self: *const Self) u32 {
     return @intCast(width);
 }
 
-/// Finds the first PortAudio input-device label matching the current prefix.
-fn inputDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
+/// Returns the indexed PortAudio input-device label matching the current prefix.
+fn inputDeviceCompletion(self: *const Self, input: []const u8, index: usize) ?[]const u8 {
+    var match_index: usize = 0;
     for (self.zsynth.input_devices) |device| {
-        if (parameterStartsWithIgnoreCase(device.label, input))
-            return device.label;
+        if (!parameterStartsWithIgnoreCase(device.label, input)) continue;
+        if (match_index == index) return device.label;
+        match_index += 1;
     }
-    return "";
+    return null;
 }
 
 /// Resolves an exact completed input-device label to its runtime ID.
@@ -2368,15 +2379,19 @@ fn midiDeviceLabelWidth(self: *const Self) u32 {
     return @intCast(width);
 }
 
-/// Finds a MIDI-device label matching the current input prefix.
-fn midiDeviceCompletion(self: *const Self, input: []const u8) []const u8 {
-    if (parameterStartsWithIgnoreCase("Computer keyboard", input))
-        return "Computer keyboard";
-    for (self.zsynth.midi_devices) |device| {
-        if (parameterStartsWithIgnoreCase(device.label, input))
-            return device.label;
+/// Returns the indexed MIDI-device label matching the current input prefix.
+fn midiDeviceCompletion(self: *const Self, input: []const u8, index: usize) ?[]const u8 {
+    var match_index: usize = 0;
+    if (parameterStartsWithIgnoreCase("Computer keyboard", input)) {
+        if (match_index == index) return "Computer keyboard";
+        match_index += 1;
     }
-    return "";
+    for (self.zsynth.midi_devices) |device| {
+        if (!parameterStartsWithIgnoreCase(device.label, input)) continue;
+        if (match_index == index) return device.label;
+        match_index += 1;
+    }
+    return null;
 }
 
 /// Resolves an exact completed MIDI-device label to its runtime ID.
@@ -2395,26 +2410,34 @@ fn reflectedEnumCompletion(
     field_name: []const u8,
     array_index: ?usize,
     input: []const u8,
-) []const u8 {
+    index: usize,
+) ?[]const u8 {
+    var match_index: usize = 0;
     const field_names = @typeInfo(@TypeOf(parameters)).@"struct".field_names;
     inline for (field_names) |name| {
         if (std.mem.eql(u8, name, field_name)) {
             const value = @field(parameters, name);
             switch (@typeInfo(@TypeOf(value))) {
                 .@"enum" => {
-                    if (array_index != null) return "";
-                    inline for (std.meta.tags(@TypeOf(value))) |tag|
-                        if (parameterStartsWithIgnoreCase(@tagName(tag), input))
-                            return @tagName(tag);
+                    if (array_index != null) return null;
+                    inline for (std.meta.tags(@TypeOf(value))) |tag| {
+                        if (parameterStartsWithIgnoreCase(@tagName(tag), input)) {
+                            if (match_index == index) return @tagName(tag);
+                            match_index += 1;
+                        }
+                    }
                 },
                 .array => |array| {
-                    const index = array_index orelse return "";
-                    if (index >= array.len) return "";
-                    const element = value[index];
+                    const element_index = array_index orelse return null;
+                    if (element_index >= array.len) return null;
+                    const element = value[element_index];
                     switch (@typeInfo(@TypeOf(element))) {
-                        .@"enum" => inline for (std.meta.tags(@TypeOf(element))) |tag|
-                            if (parameterStartsWithIgnoreCase(@tagName(tag), input))
-                                return @tagName(tag),
+                        .@"enum" => inline for (std.meta.tags(@TypeOf(element))) |tag| {
+                            if (parameterStartsWithIgnoreCase(@tagName(tag), input)) {
+                                if (match_index == index) return @tagName(tag);
+                                match_index += 1;
+                            }
+                        },
                         else => {},
                     }
                 },
@@ -2422,7 +2445,7 @@ fn reflectedEnumCompletion(
             }
         }
     }
-    return "";
+    return null;
 }
 
 /// Parses and assigns one supported reflected scalar or fixed-array element.
@@ -3381,6 +3404,7 @@ pub const CommandPalette = struct {
             self.editor.zsynth.cursor.dirty = true;
             try state_stack.pop(gpa, &self.editor.zsynth.renderer);
         } else if (event.key == .@"return" or event.key == .kp_enter) {
+            _ = self.text_field.acceptCompletion();
             try self.activate(state_stack, gpa);
         } else {
             self.text_field.textUpDown(event);
@@ -3640,26 +3664,30 @@ pub const CommandPalette = struct {
         return null;
     }
 
-    /// Returns the full completion candidate for the field's current palette phase.
-    fn completion(field: *const TextField(*CommandPalette)) []const u8 {
+    /// Returns the indexed completion candidate for the field's current palette phase.
+    fn completion(field: *const TextField(*CommandPalette), index: usize) ?[]const u8 {
         const self = field.context;
         const input = field.inputSlice();
-        if (input.len == 0) return "";
+        var match_index: usize = 0;
 
         if (self.selected_command == null) {
             inline for (std.meta.tags(Command)) |command| {
                 const name = commandName(command);
-                if (startsWithIgnoreCase(name, input))
-                    return name;
+                if (startsWithIgnoreCase(name, input)) {
+                    if (match_index == index) return name;
+                    match_index += 1;
+                }
             }
         } else if (self.selected_command.? == .addNode and self.selected_node_tag == null) {
             inline for (std.meta.tags(DSP.Node.Tag)) |tag| {
                 const name = nodeName(tag);
-                if (name.len != 0 and startsWithIgnoreCase(name, input))
-                    return name;
+                if (name.len != 0 and startsWithIgnoreCase(name, input)) {
+                    if (match_index == index) return name;
+                    match_index += 1;
+                }
             }
         }
-        return "";
+        return null;
     }
 
     /// Returns whether `candidate` begins with the case-insensitive prefix.
@@ -4951,14 +4979,14 @@ pub fn TextField(comptime Context: type) type {
         /// Concrete text-field type produced for the supplied context type.
         const Field = @This();
 
-        /// Supplies the full completion value for the current field contents.
-        pub const Completion = *const fn (field: *const Field) []const u8;
+        /// Supplies the matching completion at `index`, or null after the list.
+        pub const Completion = *const fn (field: *const Field, index: usize) ?[]const u8;
 
         /// Configures the visible field width, completion provider, and label.
         pub const Parameters = struct {
             /// Number of display cells available for the editable value.
             width: u32,
-            /// Returns one complete value that may complete the current input.
+            /// Returns matching complete values for the current input by index.
             completion: Completion,
             /// Text rendered immediately before the editable value.
             label: []const u8,
@@ -4974,6 +5002,8 @@ pub fn TextField(comptime Context: type) type {
         input_len: usize = 0,
         /// Byte offset of the insertion cursor.
         cursor: usize = 0,
+        /// Index of the completion currently highlighted in the popup list.
+        completion_index: usize = 0,
 
         /// Constructs a text field with its owning context and parameters.
         pub fn init(context: Context, parameters: Parameters) Field {
@@ -4993,6 +5023,7 @@ pub fn TextField(comptime Context: type) type {
             self.input = @splat(0);
             self.input_len = 0;
             self.cursor = 0;
+            self.completion_index = 0;
         }
 
         /// Replaces the field contents and places the cursor at the end.
@@ -5002,6 +5033,7 @@ pub fn TextField(comptime Context: type) type {
             @memcpy(self.input[0..copy_len], value[0..copy_len]);
             self.input_len = copy_len;
             self.cursor = copy_len;
+            self.completion_index = 0;
         }
 
         /// Handles SDL Unicode text input by inserting it at the cursor.
@@ -5018,6 +5050,7 @@ pub fn TextField(comptime Context: type) type {
                 );
                 self.input_len += insert_len;
                 self.cursor += insert_len;
+                if (insert_len != 0) self.completion_index = 0;
             }
         }
 
@@ -5054,11 +5087,14 @@ pub fn TextField(comptime Context: type) type {
                     if (control) self.cursor = self.input_len;
                 },
                 .tab => self.complete(),
+                .up => _ = self.selectCompletion(-1),
+                .down => _ = self.selectCompletion(1),
                 .k => {
                     if (control) {
                         self.input_len = self.cursor;
                         if (self.input_len < self.input.len)
                             self.input[self.input_len] = 0;
+                        self.completion_index = 0;
                     }
                 },
                 .backspace => self.eraseLeft(),
@@ -5067,7 +5103,7 @@ pub fn TextField(comptime Context: type) type {
             }
         }
 
-        /// Draws the label, editable area, input, completion, and caret.
+        /// Draws the label, editable area, input, completion, caret, and popup list.
         pub fn write(
             self: *const Field,
             gpa: std.mem.Allocator,
@@ -5130,6 +5166,45 @@ pub fn TextField(comptime Context: type) type {
                     );
                 }
             }
+
+            const completion_count = self.completionCount();
+            if (completion_count < 2 or display.impl != .graphic) return;
+
+            const graphic = &display.impl.graphic;
+            const max_visible_rows: usize = 5;
+            const below_rows = graphic.height -| (y + 1);
+            const above_rows = @min(y, graphic.height);
+            const available_rows = @max(below_rows, above_rows);
+            const visible_rows = @min(completion_count, @min(max_visible_rows, @as(usize, @intCast(available_rows))));
+            if (visible_rows == 0) return;
+
+            const first_index = if (self.completion_index >= visible_rows)
+                self.completion_index - visible_rows + 1
+            else
+                0;
+            const popup_y = if (below_rows >= above_rows)
+                y + 1
+            else
+                y - @as(u32, @intCast(visible_rows));
+            const popup_width = self.parameters.width;
+            var row: usize = 0;
+            while (row < visible_rows) : (row += 1) {
+                const item_index = first_index + row;
+                const item = self.completionAt(item_index) orelse continue;
+                const row_y = popup_y + @as(u32, @intCast(row));
+                const selected = item_index == self.completion_index;
+                const bg = if (selected) Display.Color.selected_bg else Display.Color.mine_shaft;
+                const fg = if (selected) Display.Color.black else Display.Color.white;
+                try display.fill(gpa, bg, fg, ' ', field_x, row_y, popup_width, 1);
+                try display.write(
+                    gpa,
+                    item[0..@min(item.len, @as(usize, @intCast(popup_width)))],
+                    field_x,
+                    row_y,
+                    bg,
+                    fg,
+                );
+            }
         }
 
         /// Replaces the entire field with its current completion candidate.
@@ -5142,6 +5217,34 @@ pub fn TextField(comptime Context: type) type {
             @memcpy(self.input[0..copy_len], candidate[0..copy_len]);
             self.input_len = copy_len;
             self.cursor = self.input_len;
+            self.completion_index = 0;
+        }
+
+        /// Accepts the currently highlighted completion, if one exists.
+        pub fn acceptCompletion(self: *Field) bool {
+            const candidate = self.completionSlice();
+            if (candidate.len == 0) return false;
+            self.complete();
+            return true;
+        }
+
+        /// Moves the completion highlight and wraps around the matching list.
+        pub fn selectCompletion(self: *Field, direction: i2) bool {
+            const count = self.completionCount();
+            if (count < 2) return false;
+
+            if (direction < 0) {
+                self.completion_index = if (self.completion_index == 0)
+                    count - 1
+                else
+                    self.completion_index - 1;
+            } else if (direction > 0) {
+                self.completion_index = if (self.completion_index + 1 == count)
+                    0
+                else
+                    self.completion_index + 1;
+            }
+            return true;
         }
 
         /// Deletes the byte immediately before the cursor.
@@ -5154,15 +5257,64 @@ pub fn TextField(comptime Context: type) type {
             self.input_len -= 1;
             self.cursor -= 1;
             self.input[self.input_len] = 0;
+            self.completion_index = 0;
         }
 
-        /// Returns a valid full completion, or an empty string when none exists.
-        /// Returns the full completion matching the current input prefix.
-        pub fn completionSlice(self: *const Field) []const u8 {
-            const candidate = (self.parameters.completion)(self);
-            if (self.input_len == 0 or candidate.len < self.input_len) return "";
-            if (!std.ascii.eqlIgnoreCase(candidate[0..self.input_len], self.inputSlice())) return "";
+        /// Returns the completion at `index` when it matches the current prefix.
+        fn completionAt(self: *const Field, index: usize) ?[]const u8 {
+            const candidate = (self.parameters.completion)(self, index) orelse return null;
+            if (candidate.len < self.input_len) return null;
+            if (!std.ascii.eqlIgnoreCase(candidate[0..self.input_len], self.inputSlice())) return null;
             return candidate;
         }
+
+        /// Counts all completions matching the current input prefix.
+        pub fn completionCount(self: *const Field) usize {
+            var count: usize = 0;
+            while (self.completionAt(count) != null) : (count += 1) {}
+            return count;
+        }
+
+        /// Returns the highlighted full completion, or an empty string when none exists.
+        pub fn completionSlice(self: *const Field) []const u8 {
+            return self.completionAt(self.completion_index) orelse "";
+        }
     };
+}
+
+/// Supplies stable test completions for the generic text-field behavior test.
+fn testTextFieldCompletion(field: *const TextField(void), index: usize) ?[]const u8 {
+    _ = field;
+    return switch (index) {
+        0 => "alpha",
+        1 => "alpine",
+        2 => "alps",
+        else => null,
+    };
+}
+
+test "text field completion selection wraps and accepts" {
+    const Field = TextField(void);
+    var field = Field.init({}, .{
+        .width = 12,
+        .completion = testTextFieldCompletion,
+        .label = "",
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), field.completionCount());
+    try std.testing.expectEqualStrings("alpha", field.completionSlice());
+    field.setInput("al");
+
+    try std.testing.expectEqual(@as(usize, 3), field.completionCount());
+    try std.testing.expectEqualStrings("alpha", field.completionSlice());
+    try std.testing.expect(field.selectCompletion(1));
+    try std.testing.expectEqualStrings("alpine", field.completionSlice());
+    try std.testing.expect(field.selectCompletion(1));
+    try std.testing.expectEqualStrings("alps", field.completionSlice());
+    try std.testing.expect(field.selectCompletion(1));
+    try std.testing.expectEqualStrings("alpha", field.completionSlice());
+    try std.testing.expect(field.selectCompletion(-1));
+    try std.testing.expectEqualStrings("alps", field.completionSlice());
+    try std.testing.expect(field.acceptCompletion());
+    try std.testing.expectEqualStrings("alps", field.inputSlice());
 }
