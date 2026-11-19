@@ -32,12 +32,13 @@ and effects to be composed into a real-time sound pipeline.
 - pitch shifter
 - resampler
 - cleanup command that reorganize graph to optimize paths for better readability
-- chorus
 - reverb
 - color theme
 - ungroup
 - undo/redo history
 - nested groups
+- compressor
+- distortion
 
 ### Controls and UI elements
 

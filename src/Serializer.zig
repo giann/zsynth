@@ -42,6 +42,7 @@ const Serialized = struct {
             adsr,
             filter,
             bit_crusher,
+            compressor,
             noise,
             midi,
             output,
@@ -58,6 +59,7 @@ const Serialized = struct {
             adsr: AdsrParameters,
             filter: FilterParameters,
             bit_crusher: BitCrusherParameters,
+            compressor: CompressorParameters,
             noise: NoiseParameters,
             midi: MIDIParameterse,
             output: OutputParameters,
@@ -145,6 +147,17 @@ const Serialized = struct {
         bit_depth: ?u32 = null,
     };
 
+    /// Persisted compressor parameters.
+    pub const CompressorParameters = struct {
+        method: ?[]const u8 = null,
+        threshold: ?f32 = null,
+        attack: ?f32 = null,
+        release: ?f32 = null,
+        ratio: ?f32 = null,
+        knee: ?f32 = null,
+        makeup_gain: ?f32 = null,
+    };
+
     /// Persisted delay parameters.
     pub const DelayParameters = struct {
         delay_ms: ?f32 = null,
@@ -216,6 +229,7 @@ const JsonParameters = union(enum) {
     adsr: Serialized.AdsrParameters,
     filter: Serialized.FilterParameters,
     bit_crusher: Serialized.BitCrusherParameters,
+    compressor: Serialized.CompressorParameters,
     noise: Serialized.NoiseParameters,
     midi: Serialized.MIDIParameterse,
     output: Serialized.OutputParameters,
@@ -1206,6 +1220,7 @@ fn parametersToJson(parameters: ?Serialized.Node.parameters_union) ?JsonParamete
         .adsr => |item| .{ .adsr = item },
         .filter => |item| .{ .filter = item },
         .bit_crusher => |item| .{ .bit_crusher = item },
+        .compressor => |item| .{ .compressor = item },
         .noise => |item| .{ .noise = item },
         .midi => |item| .{ .midi = item },
         .output => |item| .{ .output = item },
@@ -1270,6 +1285,7 @@ fn parametersFromJson(
         .adsr => |item| .{ .adsr = item },
         .filter => |item| .{ .filter = item },
         .bit_crusher => |item| .{ .bit_crusher = item },
+        .compressor => |item| .{ .compressor = item },
         .noise => |item| .{ .noise = item },
         .midi => |item| .{ .midi = item },
         .output => |item| .{ .output = item },
@@ -1391,6 +1407,15 @@ fn parametersToSerialized(
         .bit_crusher => |value| .{ .bit_crusher = .{
             .target_sample_rate = value.parameters.target_sample_rate,
             .bit_depth = value.parameters.bit_depth,
+        } },
+        .compressor => |value| .{ .compressor = .{
+            .method = @tagName(value.parameters.method),
+            .threshold = value.parameters.threshold,
+            .attack = value.parameters.attack,
+            .release = value.parameters.release,
+            .ratio = value.parameters.ratio,
+            .knee = value.parameters.knee,
+            .makeup_gain = value.parameters.makeup_gain,
         } },
         .delay => |value| .{ .delay = .{
             .delay_ms = value.parameters.delay,
@@ -1547,6 +1572,18 @@ fn nodeFromSerialized(
             .bit_depth = @intCast(bit_depth),
         }), serialized.color);
     }
+    if (std.mem.eql(u8, serialized.kind, "compressor")) {
+        const value = try requiredParameters(serialized, .compressor);
+        return nodeWithColor(DSP.Node.Compressor.create(name, .{
+            .method = try enumFromString(DSP.Node.Compressor.Method, value.method orelse "rms"),
+            .threshold = value.threshold orelse -24,
+            .attack = value.attack orelse 0.01,
+            .release = value.release orelse 0.1,
+            .ratio = value.ratio orelse 4,
+            .knee = value.knee orelse 6,
+            .makeup_gain = value.makeup_gain orelse 0,
+        }), serialized.color);
+    }
     if (std.mem.eql(u8, serialized.kind, "delay")) {
         const value = try requiredParameters(serialized, .delay);
         const feedback = value.feedback orelse 4;
@@ -1663,6 +1700,7 @@ fn validateDocument(document: Serialized.SynthDocument) !void {
                 .adsr,
                 .multimode_filter,
                 .bit_crusher,
+                .compressor,
                 .delay,
                 .noise,
                 .midi,
@@ -1824,6 +1862,10 @@ fn validateNodeParameters(node: Serialized.Node, tag: DSP.Node.Tag) !void {
             if ((value.bit_depth orelse 8) > std.math.maxInt(u5))
                 return error.InvalidNodeParameters;
         },
+        .compressor => {
+            const value = try requiredParameters(node, .compressor);
+            _ = try enumFromString(DSP.Node.Compressor.Method, value.method orelse "rms");
+        },
         .delay => {
             const value = try requiredParameters(node, .delay);
             const feedback = value.feedback orelse 4;
@@ -1925,6 +1967,19 @@ test "JSON adapter round-trips repeated fields and parameter variants" {
         .name = "sequence",
         .parameters = .{ .sequencer = sequencer },
     });
+    try document.nodes.append(allocator, .{
+        .kind = "compressor",
+        .name = "compressor",
+        .parameters = .{ .compressor = .{
+            .method = "peak",
+            .threshold = -18,
+            .attack = 0.005,
+            .release = 0.2,
+            .ratio = 6,
+            .knee = 3,
+            .makeup_gain = 2,
+        } },
+    });
 
     const json_document = try documentToJson(document, allocator);
     const contents = try std.json.Stringify.valueAlloc(allocator, json_document, .{});
@@ -1952,6 +2007,18 @@ test "JSON adapter round-trips repeated fields and parameter variants" {
             try std.testing.expectEqual(@as(u32, 96), value.bpm.?);
             try std.testing.expectEqual(@as(usize, 1), value.notes.items.len);
             try std.testing.expectEqual(@as(u64, 128), value.notes.items[0].start_tick.?);
+        },
+        else => return error.UnexpectedParameterVariant,
+    }
+    switch (restored.nodes.items[3].parameters.?) {
+        .compressor => |value| {
+            try std.testing.expectEqualStrings("peak", value.method.?);
+            try std.testing.expectEqual(@as(f32, -18), value.threshold.?);
+            try std.testing.expectEqual(@as(f32, 0.005), value.attack.?);
+            try std.testing.expectEqual(@as(f32, 0.2), value.release.?);
+            try std.testing.expectEqual(@as(f32, 6), value.ratio.?);
+            try std.testing.expectEqual(@as(f32, 3), value.knee.?);
+            try std.testing.expectEqual(@as(f32, 2), value.makeup_gain.?);
         },
         else => return error.UnexpectedParameterVariant,
     }
