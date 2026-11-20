@@ -25,6 +25,8 @@ and effects to be composed into a real-time sound pipeline.
 
 ## TODO
 
+- compiled audio plan to avoid discovering graph while playing
+- shared pool of resuable audio blocks instead of per-node storage
 - minimap
 - sampler
 - granular (play tiny amount of samples, seems like a particle system but for

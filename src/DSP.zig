@@ -1,6 +1,7 @@
 //! Graph-based small DSP
 const std = @import("std");
 const assert = std.debug.assert;
+const build_options = @import("build_options");
 const pa = @import("portaudio.zig");
 const sdl = @import("zsdl3");
 const Display = @import("Display.zig");
@@ -29,6 +30,107 @@ pub const max_group_members = 16;
 pub const GroupEndpointError = error{ OutOfMemory, InvalidGroup };
 /// Number of rendered blocks retained by each node's SampleTap.
 pub const sample_tap_capacity = 64;
+
+/// Aggregate timing information for one repeatedly measured operation.
+const TimingStats = struct {
+    /// Number of completed measurements.
+    count: u64 = 0,
+    /// Sum of all measured durations in nanoseconds.
+    total_ns: u64 = 0,
+    /// Shortest measured duration in nanoseconds.
+    min_ns: u64 = std.math.maxInt(u64),
+    /// Longest measured duration in nanoseconds.
+    max_ns: u64 = 0,
+
+    /// Adds one duration to the aggregate without allocating or synchronizing.
+    fn record(self: *TimingStats, duration_ns: u64) void {
+        self.count +|= 1;
+        self.total_ns +|= duration_ns;
+        self.min_ns = @min(self.min_ns, duration_ns);
+        self.max_ns = @max(self.max_ns, duration_ns);
+    }
+
+    /// Converts the aggregate mean to microseconds for the shutdown report.
+    fn meanMicroseconds(self: *const TimingStats) f64 {
+        assert(self.count != 0);
+        return @as(f64, @floatFromInt(self.total_ns)) /
+            @as(f64, @floatFromInt(self.count * std.time.ns_per_us));
+    }
+
+    /// Converts a nanosecond duration to microseconds for the shutdown report.
+    fn microseconds(duration_ns: u64) f64 {
+        return @as(f64, @floatFromInt(duration_ns)) /
+            @as(f64, std.time.ns_per_us);
+    }
+};
+
+/// One populated node timing row prepared for slowest-first reporting.
+const PerformanceReportEntry = struct {
+    /// Node kind represented by this row.
+    tag: Node.Tag,
+    /// Timing aggregate copied from the audio-thread-owned statistics.
+    timing: TimingStats,
+
+    /// Orders rows by descending mean duration, then by node kind.
+    fn lessThan(_: void, lhs: PerformanceReportEntry, rhs: PerformanceReportEntry) bool {
+        const lhs_mean = lhs.timing.meanMicroseconds();
+        const rhs_mean = rhs.timing.meanMicroseconds();
+        return lhs_mean > rhs_mean or
+            (lhs_mean == rhs_mean and @backingInt(lhs.tag) < @backingInt(rhs.tag));
+    }
+};
+
+/// Fixed-size timing aggregates owned and updated by the audio thread.
+const PerformanceStats = struct {
+    /// Timing aggregates indexed by concrete DSP node kind.
+    nodes: std.EnumArray(Node.Tag, TimingStats) = std.EnumArray(Node.Tag, TimingStats).initFill(.{}),
+    /// Timing aggregate for the PortAudio output callback.
+    callback: TimingStats = .{},
+
+    /// Prints completed timing aggregates after the audio stream has stopped.
+    fn report(self: *const PerformanceStats) void {
+        std.debug.print("Performance (microseconds):\n", .{});
+        if (self.callback.count != 0) {
+            std.debug.print(
+                "  PortAudio callback: mean={d:.3} µs min={d:.3} µs max={d:.3} µs count={d}\n",
+                .{
+                    self.callback.meanMicroseconds(),
+                    TimingStats.microseconds(self.callback.min_ns),
+                    TimingStats.microseconds(self.callback.max_ns),
+                    self.callback.count,
+                },
+            );
+        }
+
+        var entries: [std.meta.tags(Node.Tag).len]PerformanceReportEntry = undefined;
+        var entry_count: usize = 0;
+        inline for (std.meta.tags(Node.Tag)) |tag| {
+            const timing = self.nodes.get(tag);
+            if (timing.count != 0) {
+                entries[entry_count] = .{ .tag = tag, .timing = timing };
+                entry_count += 1;
+            }
+        }
+        std.mem.sort(
+            PerformanceReportEntry,
+            entries[0..entry_count],
+            {},
+            PerformanceReportEntry.lessThan,
+        );
+        for (entries[0..entry_count]) |entry| {
+            std.debug.print(
+                "  {s}: mean={d:.3} µs min={d:.3} µs max={d:.3} µs count={d}\n",
+                .{
+                    node_metadata.get(entry.tag).name,
+                    entry.timing.meanMicroseconds(),
+                    TimingStats.microseconds(entry.timing.min_ns),
+                    TimingStats.microseconds(entry.timing.max_ns),
+                    entry.timing.count,
+                },
+            );
+        }
+    }
+};
 
 /// Per-node, audio-thread-safe history of rendered signal blocks.
 pub const SampleTap = struct {
@@ -78,6 +180,10 @@ audio_stream: ?*pa.Stream = null,
 stream_device: pa.DeviceId = pa.no_device,
 /// Whether the PortAudio stream is currently running.
 playing: bool = false,
+/// Timing aggregates enabled by `-Dshow-perf`, otherwise zero-sized state.
+performance: if (build_options.show_perf) PerformanceStats else void = if (build_options.show_perf) .{} else {},
+/// Stack-like pointer used to subtract nested render calls from node timings.
+performance_child_time: if (build_options.show_perf) ?*u64 else void = if (build_options.show_perf) null else {},
 
 /// Initializes graph storage and retains the application's supported devices.
 pub fn init(
@@ -184,6 +290,8 @@ pub fn deinit(self: *DSP, gpa: std.mem.Allocator) void {
         pa.closeStream(pa_stream) catch {};
         self.audio_stream = null;
     }
+    if (build_options.show_perf)
+        self.performance.report();
     self.lockGraph();
     defer self.unlockGraph();
     // Release node-owned device streams before freeing their node state.
@@ -411,6 +519,9 @@ fn onAudioCallback(
 ) callconv(.c) c_int {
     const destination = output orelse return 2;
     const self: *DSP = @ptrCast(@alignCast(user_data.?));
+    const performance_start = if (build_options.show_perf) sdl.getTicksNS() else 0;
+    defer if (build_options.show_perf)
+        self.performance.callback.record(sdl.getTicksNS() - performance_start);
     const samples: [*]f32 = @ptrCast(@alignCast(destination));
     var remaining_frames: usize = @intCast(frame_count);
     var offset_samples: usize = 0;
@@ -1474,6 +1585,20 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
     assert(voice < self.effectiveVoiceCount(node));
     const cache = self.cacheForVoice(node, voice);
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    var render_child_time_ns: u64 = 0;
+    const parent_child_time = if (build_options.show_perf)
+        self.performance_child_time
+    else
+        null;
+    const render_start = if (build_options.show_perf) sdl.getTicksNS() else 0;
+    if (build_options.show_perf)
+        self.performance_child_time = &render_child_time_ns;
+    defer if (build_options.show_perf) {
+        const render_elapsed = sdl.getTicksNS() - render_start;
+        self.performance_child_time = parent_child_time;
+        if (parent_child_time) |parent|
+            parent.* +|= render_elapsed;
+    };
     const output_count = if (node.idx == self.output.idx)
         1
     else
@@ -1527,6 +1652,22 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
     const previous_voice = self.render_voice;
     self.render_voice = voice;
     defer self.render_voice = previous_voice;
+    var process_child_time_ns: u64 = 0;
+    const process_parent_child_time = if (build_options.show_perf)
+        self.performance_child_time
+    else
+        null;
+    const process_start = if (build_options.show_perf) sdl.getTicksNS() else 0;
+    if (build_options.show_perf)
+        self.performance_child_time = &process_child_time_ns;
+    defer if (build_options.show_perf) {
+        const process_elapsed = sdl.getTicksNS() - process_start;
+        self.performance_child_time = process_parent_child_time;
+        assert(process_elapsed >= process_child_time_ns);
+        self.performance.nodes.getPtr(source_tag).record(
+            process_elapsed - process_child_time_ns,
+        );
+    };
     try self.nodes.items(.process)[node.idx](
         self,
         node,

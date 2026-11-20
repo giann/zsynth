@@ -8,8 +8,14 @@ pub fn build(b: *std.Build) void {
         "debug",
         "Enable renderer debug features regardless of build OptimizeMode",
     ) orelse (optimize == .debug);
+    const show_perf = b.option(
+        bool,
+        "show-perf",
+        "Print DSP and PortAudio timing statistics when the application exits",
+    ) orelse false;
     const build_options = b.addOptions();
     build_options.addOption(bool, "debug", debug);
+    build_options.addOption(bool, "show_perf", show_perf);
 
     const mimalloc = buildMimalloc(b, target, optimize);
     const portmidi = buildPortMidi(b, target, optimize);
@@ -43,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_module.addOptions("build_options", build_options);
     const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run zsynth unit tests");
