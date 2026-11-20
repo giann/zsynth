@@ -39,6 +39,8 @@ output_waveform: OutputWaveform = .{},
 selected_observers: [DSP.max_outlets]SelectedObserver = @splat(.none),
 /// Number of selected output ports with an active observer.
 selected_observer_count: u8 = 0,
+/// Node whose SampleTap is enabled for the selected observer pane.
+selected_observer_node: ?DSP.Node.Index = null,
 /// Width of the selected observer strip in display cells.
 selected_observer_width: u32 = 0,
 /// Height of the selected observer strip in display cells.
@@ -516,10 +518,18 @@ fn refreshSelectionUi(self: *Self) void {
         if (self.selected_observer_count > 1)
             self.selected_observer_width += 1;
     }
+
+    if (self.selected_observer_count != 0) {
+        self.dsp.setSampleTapEnabled(selected_node, true);
+        self.selected_observer_node = selected_node;
+    }
 }
 
 /// Clears selected observer state without disturbing the fixed playback meter.
 fn clearSelectedObservers(self: *Self) void {
+    if (self.selected_observer_node) |node|
+        self.dsp.setSampleTapEnabled(node, false);
+    self.selected_observer_node = null;
     self.selected_observers = @splat(.none);
     self.selected_observer_count = 0;
     self.selected_observer_width = 0;
@@ -3126,6 +3136,8 @@ fn render(
 
 /// Removes a DSP node and its synchronized visual representation.
 fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
+    // Clear observer publication before DSP swap-removal can invalidate node indices.
+    self.clearSelectedObservers();
     if (self.editorSpace().isGroupEndpoint(node)) {
         const group = self.editorSpace().endpointGroup(node) orelse return;
         const port = self.editorSpace().endpointPort(node) orelse return;

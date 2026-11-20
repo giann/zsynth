@@ -147,6 +147,8 @@ pub const SampleTap = struct {
     /// Queue type used to publish blocks to independent main-thread readers.
     pub const Queue = SpmcQueue(Block);
 
+    /// Whether a non-output node currently has an active UI observer.
+    enabled: std.atomic.Value(bool) = .{ .raw = false },
     /// Queue descriptor owning its heap-allocated ring storage.
     queue: Queue = undefined,
 };
@@ -324,6 +326,7 @@ pub fn reset(self: *DSP, gpa: std.mem.Allocator) void {
     }
     self.output = .noop;
     self.render_generation = 0;
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Opens and starts the selected output device.
@@ -585,6 +588,7 @@ pub fn plug(
         self.syncGroupInputLocked(destination, destination_port);
     self.refreshMemberGroupHashLocked(source);
     self.refreshMemberGroupHashLocked(destination);
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Disconnects the edge feeding one input port.
@@ -604,6 +608,7 @@ pub fn disconnectInput(self: *DSP, destination: Node.Index, destination_port: u8
     if (std.meta.activeTag(self.nodes.items(.state)[destination.idx]) == .group)
         self.syncGroupInputLocked(destination, destination_port);
     self.refreshMemberGroupHashLocked(destination);
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Disconnects every edge leaving one output port.
@@ -627,6 +632,7 @@ pub fn disconnectOutput(self: *DSP, source: Node.Index, source_output_port: u8) 
     }
     self.nodes.items(.output_connected)[source.idx][source_output_port] = false;
     self.refreshMemberGroupHashLocked(source);
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Returns whether an index identifies a group.
@@ -835,6 +841,7 @@ pub fn bindGroupInput(
     };
     self.syncGroupInputLocked(group, group_port);
     self.rebuildGroupSubgraphHashLocked(group);
+    self.rebuildVoiceRoutingLocked();
     return true;
 }
 
@@ -873,6 +880,7 @@ pub fn bindGroupOutput(
         self.nodes.items(.output_connected)[member.idx][member_port] = true;
     }
     self.rebuildGroupSubgraphHashLocked(group);
+    self.rebuildVoiceRoutingLocked();
     return true;
 }
 
@@ -883,6 +891,7 @@ pub fn unbindGroupInput(self: *DSP, group: Node.Index, group_port: u8) void {
     if (!self.isGroupLocked(group)) return;
     self.clearGroupInputBindingLocked(group, group_port);
     self.rebuildGroupSubgraphHashLocked(group);
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Removes a group output binding while leaving its external group connection intact.
@@ -900,6 +909,7 @@ pub fn unbindGroupOutput(self: *DSP, group: Node.Index, group_port: u8) void {
     }
     group_state.output_bindings[group_port] = null;
     self.rebuildGroupSubgraphHashLocked(group);
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Returns the child port metadata currently exposed by a group port.
@@ -1127,6 +1137,7 @@ pub fn remove(self: *DSP, gpa: std.mem.Allocator, node: Node.Index) void {
         }
     }
     self.rebuildAllGroupSubgraphHashesLocked();
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Appends the sixteen fixed boundary endpoint nodes owned by a group.
@@ -1141,14 +1152,20 @@ pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) 
     var output_nodes: [max_outlets]Node.Index = @splat(.noop);
     const group_voice_capacity = self.groupVoiceCapacity(group);
     for (0..max_outlets) |port| {
-        try self.nodes.append(gpa, Node.GroupInput.create("group input", group, @intCast(port)));
+        try self.nodes.append(
+            gpa,
+            prepareNode(Node.GroupInput.create("group input", group, @intCast(port))),
+        );
         const input_index = self.nodes.len - 1;
         self.nodes.items(.sample_tap)[input_index].queue =
             try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
         try self.ensureCacheCapacity(gpa, .{ .idx = input_index }, group_voice_capacity);
         input_nodes[port] = .{ .idx = input_index };
 
-        try self.nodes.append(gpa, Node.GroupOutput.create("group output", group, @intCast(port)));
+        try self.nodes.append(
+            gpa,
+            prepareNode(Node.GroupOutput.create("group output", group, @intCast(port))),
+        );
         const output_index = self.nodes.len - 1;
         self.nodes.items(.sample_tap)[output_index].queue =
             try SampleTap.Queue.initCapacity(gpa, sample_tap_capacity);
@@ -1157,6 +1174,7 @@ pub fn addGroupEndpoints(self: *DSP, gpa: std.mem.Allocator, group: Node.Index) 
     }
     self.nodes.items(.state)[group.idx].group.input_nodes = input_nodes;
     self.nodes.items(.state)[group.idx].group.output_nodes = output_nodes;
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Adds one ordinary node to a non-nested group's member table.
@@ -1192,6 +1210,7 @@ pub fn addGroupMember(
     state.members[state.member_count] = member;
     state.member_count += 1;
     self.rebuildGroupSubgraphHashLocked(group);
+    self.rebuildVoiceRoutingLocked();
     return true;
 }
 
@@ -1217,12 +1236,27 @@ pub fn prepareGroupVoiceStorage(
             try self.ensureCacheCapacity(gpa, endpoint, capacity);
 }
 
+/// Fills the immutable render metadata derived from a node's concrete kind.
+fn prepareNode(node: Node) Node {
+    var prepared = node;
+    const tag = std.meta.activeTag(prepared.state);
+    const metadata = node_metadata.get(tag);
+    prepared.render_output_count = switch (tag) {
+        .output, .group_output => 1,
+        else => metadata.output_count,
+    };
+    prepared.tap_output_count = if (tag == .output) 1 else metadata.output_count;
+    return prepared;
+}
+
 /// Appends a node and returns its index in the graph.
 pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
     self.lockGraph();
     defer self.unlockGraph();
 
-    try self.nodes.append(gpa, node);
+    const prepared_node = prepareNode(node);
+
+    try self.nodes.append(gpa, prepared_node);
     const new_index = self.nodes.len - 1;
 
     self.nodes.items(.sample_tap)[new_index].queue =
@@ -1232,13 +1266,15 @@ pub fn addNode(self: *DSP, gpa: std.mem.Allocator, node: Node) !Node.Index {
 
     const index = Node.Index{ .idx = new_index };
 
-    if (node.initialize) |initialize|
+    if (prepared_node.initialize) |initialize|
         try initialize(self, index, 0, gpa);
 
     if (std.meta.activeTag(self.nodes.items(.state)[new_index]) == .group)
         try self.ensureCacheCapacity(gpa, index, self.groupVoiceCapacity(index))
-    else if (node.polyphony > 1)
-        try self.ensureVoiceStorage(gpa, index, node.polyphony);
+    else if (prepared_node.polyphony > 1)
+        try self.ensureVoiceStorage(gpa, index, prepared_node.polyphony);
+
+    self.rebuildVoiceRoutingLocked();
 
     return index;
 }
@@ -1294,6 +1330,7 @@ pub fn setNodePolyphony(
             for (states[0 .. count - 1], 1..) |*state, voice|
                 state.reset(@intCast(voice));
         }
+        self.rebuildVoiceRoutingLocked();
         return;
     }
 
@@ -1304,6 +1341,7 @@ pub fn setNodePolyphony(
         self.releaseAdditionalVoiceStates(node, count - 1, gpa);
     }
     self.refreshGroupStorageAfterShrink(gpa);
+    self.rebuildVoiceRoutingLocked();
 }
 
 /// Returns the displayed voice count for an ordinary node or a group wrapper.
@@ -1464,6 +1502,11 @@ pub fn sampleTap(self: *DSP, node: Node.Index) *SampleTap {
     return &self.nodes.items(.sample_tap)[node.idx];
 }
 
+/// Enables or disables SampleTap publication for one non-output node.
+pub fn setSampleTapEnabled(self: *DSP, node: Node.Index, enabled: bool) void {
+    self.sampleTap(node).enabled.store(enabled, .release);
+}
+
 /// Renders one interleaved stereo block into the audio callback buffer.
 fn stream(self: *DSP, into: []f32) void {
     if (!self.graph_mutex.tryLock()) {
@@ -1534,57 +1577,90 @@ fn processingState(self: *DSP, node: Node.Index) *Node.State {
 
 /// Returns the voice count available from one node output port.
 fn outputVoiceCount(self: *DSP, node: Node.Index, port: u8) u8 {
-    const state = self.nodes.items(.state)[node.idx];
-    if (state == .group) {
-        const binding = state.group.output_bindings[port] orelse return 1;
-        return self.effectiveVoiceCount(binding.node);
-    }
-    return self.effectiveVoiceCount(node);
+    return self.nodes.items(.output_voice_counts)[node.idx][port];
 }
 
-/// Returns the configured and input-limited voice count for one node.
-fn effectiveVoiceCount(self: *DSP, node: Node.Index) u8 {
+/// Rebuilds voice routing metadata after a graph mutation.
+fn rebuildVoiceRoutingLocked(self: *DSP) void {
+    for (self.nodes.items(.effective_voice_count), self.nodes.items(.output_voice_counts)) |*effective, *outputs| {
+        effective.* = 0;
+        outputs.* = @splat(0);
+    }
+
+    for (0..self.nodes.len) |node_index| {
+        const node = Node.Index{ .idx = node_index };
+        _ = self.computeEffectiveVoiceCount(node);
+        for (0..max_outlets) |port|
+            _ = self.computeOutputVoiceCount(node, @intCast(port));
+    }
+}
+
+/// Returns and memoizes the voice count available from one node output port.
+fn computeOutputVoiceCount(self: *DSP, node: Node.Index, port: u8) u8 {
+    const output_counts = self.nodes.items(.output_voice_counts);
+    if (output_counts[node.idx][port] != 0)
+        return output_counts[node.idx][port];
+
     const state = self.nodes.items(.state)[node.idx];
-    switch (state) {
-        .output => {
-            return 1;
-        },
-        .group => {
+    const count = if (state == .group) blk: {
+        const binding = state.group.output_bindings[port] orelse break :blk 1;
+        break :blk self.computeEffectiveVoiceCount(binding.node);
+    } else self.computeEffectiveVoiceCount(node);
+    output_counts[node.idx][port] = count;
+    return count;
+}
+
+/// Returns and memoizes the configured and input-limited voice count for one node.
+fn computeEffectiveVoiceCount(self: *DSP, node: Node.Index) u8 {
+    const effective_counts = self.nodes.items(.effective_voice_count);
+    if (effective_counts[node.idx] != 0)
+        return effective_counts[node.idx];
+
+    const state = self.nodes.items(.state)[node.idx];
+    const count = switch (state) {
+        .output => 1,
+        .group => blk: {
             var count: u8 = 1;
             for (state.group.output_bindings) |binding| {
                 if (binding) |value|
-                    count = @max(count, self.effectiveVoiceCount(value.node));
+                    count = @max(count, self.computeEffectiveVoiceCount(value.node));
             }
-            return count;
+            break :blk count;
         },
-        .group_input => {
+        .group_input => blk: {
             const endpoint = state.group_input;
             const input = self.nodes.items(.inputs)[endpoint.group.idx][endpoint.port];
             // An unconnected group input supplies silence, but must not cap
             // the voices of another connected input on the same child node.
-            return if (input.isNoop()) max_polyphony else self.outputVoiceCount(input.node, input.output_port);
+            break :blk if (input.isNoop()) max_polyphony else self.computeOutputVoiceCount(input.node, input.output_port);
         },
-        .group_output => {
+        .group_output => blk: {
             const input = self.nodes.items(.inputs)[node.idx][0];
-            return if (input.isNoop()) 1 else self.outputVoiceCount(input.node, input.output_port);
+            break :blk if (input.isNoop()) 1 else self.computeOutputVoiceCount(input.node, input.output_port);
         },
-        else => {},
-    }
+        else => blk: {
+            const metadata = node_metadata.get(std.meta.activeTag(state));
+            var count = self.nodes.items(.polyphony)[node.idx];
+            for (self.nodes.items(.inputs)[node.idx][0..metadata.input_count]) |input| {
+                if (input.isNoop()) continue;
+                count = @min(count, self.computeOutputVoiceCount(input.node, input.output_port));
+            }
+            break :blk count;
+        },
+    };
 
-    const metadata = node_metadata.get(std.meta.activeTag(state));
-    var count = self.nodes.items(.polyphony)[node.idx];
-    for (self.nodes.items(.inputs)[node.idx][0..metadata.input_count]) |input| {
-        if (input.isNoop()) continue;
-        count = @min(count, self.outputVoiceCount(input.node, input.output_port));
-    }
+    effective_counts[node.idx] = count;
     return count;
 }
 
 /// Evaluates one node voice and its matching input voices for the requested block.
 fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void {
-    assert(voice < self.effectiveVoiceCount(node));
+    assert(voice < self.nodes.items(.effective_voice_count)[node.idx]);
     const cache = self.cacheForVoice(node, voice);
     const source_tag = std.meta.activeTag(self.nodes.items(.state)[node.idx]);
+    const metadata = node_metadata.get(source_tag);
+    const render_output_count = self.nodes.items(.render_output_count)[node.idx];
+    const tap_output_count = self.nodes.items(.tap_output_count)[node.idx];
     var render_child_time_ns: u64 = 0;
     const parent_child_time = if (build_options.show_perf)
         self.performance_child_time
@@ -1599,11 +1675,6 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
         if (parent_child_time) |parent|
             parent.* +|= render_elapsed;
     };
-    const output_count = if (node.idx == self.output.idx)
-        1
-    else
-        node_metadata.get(source_tag).output_count;
-
     // Reuse a result already rendered during this generation and block size.
     if (cache.generation == self.render_generation and
         cache.sample_count == sample_count)
@@ -1611,15 +1682,10 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
 
     // Clear every output so partially written ports cannot expose stale audio.
     const active_sample_count: usize = @intCast(sample_count);
-    for (&cache.outputs) |*output| {
+    const process_outputs = cache.outputs[0..render_output_count];
+    for (process_outputs) |*output| {
         output.sample_count = sample_count;
         @memset(output.samples[0..active_sample_count], 0);
-    }
-
-    // Adapt inline cache storage to the process callback's slice interface.
-    var outputs: [max_outlets]*Buffer = undefined;
-    for (&cache.outputs, 0..) |*output, i| {
-        outputs[i] = output;
     }
 
     // If has parameter link, copy parameters from source
@@ -1645,7 +1711,7 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
 
     // Parameters are shared by voices; copy them into this voice's runtime
     // state after parameter links have updated the node's primary state.
-    if (voice > 0 and node_metadata.get(source_tag).has_per_voice_state)
+    if (voice > 0 and metadata.has_per_voice_state)
         self.copyVoiceParameters(node, voice);
 
     // The node recursively requests any connected inputs during processing.
@@ -1671,7 +1737,7 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
     try self.nodes.items(.process)[node.idx](
         self,
         node,
-        outputs[0..],
+        process_outputs,
     );
 
     // Publish the completed cache only after processing succeeds.
@@ -1680,7 +1746,13 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
 
     // Each node has one SampleTap; publish its primary voice after rendering.
     if (voice == 0)
-        self.publishSampleTap(node, voice, outputs[0..], active_sample_count, output_count);
+        self.publishSampleTap(
+            node,
+            voice,
+            cache.outputs[0..tap_output_count],
+            active_sample_count,
+            tap_output_count,
+        );
 }
 
 /// Publishes one primary-voice cache to the node's non-blocking sample queue.
@@ -1688,12 +1760,14 @@ fn publishSampleTap(
     self: *DSP,
     node: Node.Index,
     voice: u8,
-    outputs: []const *Buffer,
+    outputs: []const Buffer,
     sample_count: usize,
     output_count: u8,
 ) void {
     assert(voice == 0);
     const sample_tap = &self.nodes.items(.sample_tap)[node.idx];
+    if (node.idx != self.output.idx and !sample_tap.enabled.load(.acquire)) return;
+    if (output_count == 0) return;
     var block: SampleTap.Block = .{
         .samples = undefined,
         .sample_count = sample_count,
@@ -1876,6 +1950,14 @@ pub const Node = struct {
     output_connected: [max_outlets]bool = @splat(false),
     /// Configured voice limit for this node; group and output wrappers derive theirs.
     polyphony: u8 = 1,
+    /// Effective voice count cached after graph mutation.
+    effective_voice_count: u8 = 1,
+    /// Effective voice count available from each output port.
+    output_voice_counts: [max_outlets]u8 = @splat(1),
+    /// Number of buffers required by the node's process function.
+    render_output_count: u8 = 0,
+    /// Number of outputs copied into SampleTap blocks.
+    tap_output_count: u8 = 0,
     /// Per-generation output cache.
     cache: Cache = .{},
     /// Lazily allocated caches for voices after the inline first voice.
@@ -2067,7 +2149,7 @@ pub const Node = struct {
     pub const Process = *const fn (
         dsp: *DSP,
         node: Index,
-        outputs: []const *Buffer,
+        outputs: []Buffer,
     ) ProcessError!void;
     pub const InitializeError = error{OutOfMemory} || pm.Error || pa.Error;
     /// Initializes node-level resources when the node is added to the graph.
@@ -2125,7 +2207,7 @@ pub const Node = struct {
         fn process(
             _: *DSP,
             _: Index,
-            _: []const *Buffer,
+            _: []Buffer,
         ) ProcessError!void {}
     };
 
@@ -2185,7 +2267,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             // Read the one input connection assigned to the output node.
             const input = dsp.nodes.items(.inputs)[node.idx][0];
@@ -2254,7 +2336,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             const voice = dsp.render_voice;
             const cache = dsp.cacheForVoice(node, voice);
@@ -2319,7 +2401,7 @@ pub const Node = struct {
         }
 
         /// Copies the owning group's materialized input buffer.
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             const state = dsp.nodes.items(.state)[node.idx].group_input;
             const source = &dsp.cacheForVoice(state.group, dsp.render_voice).input_buffers[state.port];
             @memcpy(into[0].samples[0..source.sample_count], source.samples[0..source.sample_count]);
@@ -2350,7 +2432,7 @@ pub const Node = struct {
         }
 
         /// Forwards the member signal into the endpoint cache.
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             const input = dsp.nodes.items(.inputs)[node.idx][0];
             if (input.isNoop()) return;
             const source = try dsp.getOutput(input, into[0].sample_count);
@@ -2404,10 +2486,10 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
-            const output = into[0];
+            const output = &into[0];
 
             // Resolve every connected input before entering the sample loop.
             var inputs: [max_outlets]*Buffer = undefined;
@@ -2491,7 +2573,7 @@ pub const Node = struct {
         }
 
         /// Copies the input buffer only to output ports with graph connections.
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             const input = dsp.nodes.items(.inputs)[node.idx][0];
             if (input.isNoop()) return;
 
@@ -2562,10 +2644,10 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
-            const output = into[0];
+            const output = &into[0];
 
             // Resolve every connected input before entering the sample loop.
             var inputs: [max_outlets]*Buffer = undefined;
@@ -2651,7 +2733,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             @memset(
                 into[0].samples[0..],
@@ -2810,7 +2892,7 @@ pub const Node = struct {
         }
 
         /// Copies one captured block to every requested voice without blocking rendering.
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].input;
             const sample_count: usize = @intCast(into[0].sample_count);
             assert(sample_count <= state.last_block.len and sample_count % 2 == 0);
@@ -2937,7 +3019,7 @@ pub const Node = struct {
         }
 
         /// Renders one stereo block, applying optional per-sample modulation.
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             // Load graph connections and persistent oscillator state.
             const state = &dsp.processingState(node).oscillator;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
@@ -3068,11 +3150,11 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].mixer;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
-            const output = into[0];
+            const output = &into[0];
             const parameters = state.parameters;
 
             // Resolve connected inputs and precompute their channel gains.
@@ -3226,7 +3308,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             const state = &dsp.processingState(node).monophonic_sequencer;
             const parameters = state.parameters;
@@ -3428,7 +3510,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             // Resolve persistent state and the two control inputs.
             const state = &dsp.processingState(node).adsr;
@@ -3684,7 +3766,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             // Resolve persistent filter state and the three possible inputs.
             const state = &dsp.processingState(node).multimode_filter;
@@ -3914,13 +3996,13 @@ pub const Node = struct {
         }
 
         /// Renders a dry/wet blend from the input and its requested delayed copies.
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             const state = &dsp.processingState(node).delay;
             const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             if (input_outlets[0].isNoop()) return;
 
-            const output = into[0];
+            const output = &into[0];
             const dry = try dsp.getOutput(input_outlets[0], output.sample_count);
             const wetness = if (!input_outlets[1].isNoop())
                 try dsp.getOutput(input_outlets[1], output.sample_count)
@@ -4083,10 +4165,10 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             // Derive quantization and frame-hold settings from the configuration.
-            const output = into[0];
+            const output = &into[0];
             const state = &dsp.processingState(node).bit_crusher;
             const parameters = state.parameters;
             const levels: f32 = @floatFromInt((@as(u32, 1) << parameters.bit_depth) - 1);
@@ -4217,7 +4299,7 @@ pub const Node = struct {
         fn process(
             dsp: *DSP,
             node: Index,
-            into: []const *Buffer,
+            into: []Buffer,
         ) ProcessError!void {
             // Resolve persistent generator/filter state and the optional amplitude input.
             const state = &dsp.processingState(node).noise;
@@ -4327,7 +4409,7 @@ pub const Node = struct {
             return concert_a_freq * std.math.pow(f32, 2.0, semitone_offset);
         }
 
-        fn process(dsp: *DSP, node: Index, into: []const *Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
             const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
             const snapshot = dsp.midi_state.snapshot(state.parameters.device, dsp.render_voice);
             const note: u7 = @intCast(snapshot.note);
