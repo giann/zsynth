@@ -40,6 +40,7 @@ and effects to be composed into a real-time sound pipeline.
 - ungroup
 - undo/redo history
 - nested groups
+- compressor
 
 ### Controls and UI elements
 

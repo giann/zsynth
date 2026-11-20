@@ -90,6 +90,7 @@
         { "$ref": "#/$defs/adsrVariant" },
         { "$ref": "#/$defs/filterVariant" },
         { "$ref": "#/$defs/bitCrusherVariant" },
+        { "$ref": "#/$defs/compressorVariant" },
         { "$ref": "#/$defs/noiseVariant" },
         { "$ref": "#/$defs/midiVariant" },
         { "$ref": "#/$defs/outputVariant" },
@@ -124,6 +125,10 @@
     "bitCrusherVariant": {
       "type": "object", "additionalProperties": false, "required": ["bit_crusher"],
       "properties": { "bit_crusher": { "$ref": "#/$defs/bitCrusherParameters" } }
+    },
+    "compressorVariant": {
+      "type": "object", "additionalProperties": false, "required": ["compressor"],
+      "properties": { "compressor": { "$ref": "#/$defs/compressorParameters" } }
     },
     "noiseVariant": {
       "type": "object", "additionalProperties": false, "required": ["noise"],
@@ -210,6 +215,18 @@
       "properties": {
         "target_sample_rate": { "$ref": "#/$defs/uint32" },
         "bit_depth": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "compressorParameters": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string" },
+        "threshold": { "$ref": "#/$defs/number" },
+        "attack": { "$ref": "#/$defs/number" },
+        "release": { "$ref": "#/$defs/number" },
+        "ratio": { "$ref": "#/$defs/number" },
+        "knee": { "$ref": "#/$defs/number" },
+        "makeup_gain": { "$ref": "#/$defs/number" }
       }
     },
     "delayParameters": {

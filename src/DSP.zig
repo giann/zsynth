@@ -1997,6 +1997,7 @@ pub const Node = struct {
         group_input,
         group_output,
         midi,
+        compressor,
     };
 
     /// Tagged union containing the concrete state for each node kind.
@@ -2036,6 +2037,8 @@ pub const Node = struct {
         group_input: GroupInput,
         group_output: GroupOutput,
         midi: MIDI,
+        /// Dynamics compression state.
+        compressor: Compressor,
 
         /// Resets the active node payload while preserving its configuration.
         pub fn reset(self: *State, voice: u8) void {
@@ -4209,6 +4212,189 @@ pub const Node = struct {
         }
     };
 
+    /// Applies stereo-linked peak or RMS dynamics compression.
+    pub const Compressor = struct {
+        /// Configuration copied at creation time.
+        parameters: Parameters,
+        /// Smoothed stereo-linked detector level in the linear domain.
+        envelope: f32 = 0,
+
+        /// Port metadata for the compressor node.
+        pub const metadata = Node.Metadata{
+            .name = "Compressor",
+            .short_name = "cmp",
+            .color = .havelock_blue,
+            .has_parameters = true,
+            .can_link_parameters = false,
+            .inputs = .{
+                .{ .name = "audio", .short_name = "in", .color = .havelock_blue },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+            .outputs = .{
+                .{ .name = "audio", .short_name = "out", .color = .havelock_blue, .observer = .waveform },
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+                .{},
+            },
+        };
+
+        /// Detector used to estimate the linked stereo signal level.
+        pub const Method = enum {
+            /// Detects the louder absolute sample in each stereo frame.
+            peak,
+            /// Detects the root mean square level of each stereo frame.
+            rms,
+        };
+
+        /// User-controlled compression settings.
+        pub const Parameters = struct {
+            /// Detector mode used for the stereo-linked level estimate.
+            method: Method = .rms,
+            /// Level above which compression begins, in dBFS.
+            threshold: f32 = -24,
+            /// Time for gain reduction to reach the detected level, in seconds.
+            attack: f32 = 0.01,
+            /// Time for gain reduction to return toward unity, in seconds.
+            release: f32 = 0.1,
+            /// Compression ratio applied above the threshold.
+            ratio: f32 = 4,
+            /// Width of the soft-knee transition, in decibels.
+            knee: f32 = 6,
+            /// Gain applied after compression, in decibels.
+            makeup_gain: f32 = 0,
+        };
+
+        /// Clears the detector envelope while retaining the compression settings.
+        pub fn reset(self: *Compressor, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
+
+        /// Creates a compressor with an empty detector envelope.
+        pub fn create(name: []const u8, parameters: Parameters) Node {
+            return .{
+                .state = .{
+                    .compressor = .{ .parameters = parameters },
+                },
+                .name = name,
+                .process = process,
+            };
+        }
+
+        /// Converts a linear amplitude to a finite dBFS value.
+        fn levelDb(level: f32) f32 {
+            return 20 * std.math.log10(@max(level, 0.000001));
+        }
+
+        /// Calculates gain reduction for one detected level using a soft knee.
+        fn gainReductionDb(level: f32, threshold: f32, ratio: f32, knee: f32) f32 {
+            const factor = 1 - 1 / ratio;
+            if (knee <= 0)
+                return if (level > threshold) -(level - threshold) * factor else 0;
+
+            const lower = threshold - knee * 0.5;
+            const upper = threshold + knee * 0.5;
+            if (level <= lower) return 0;
+            if (level >= upper) return -(level - threshold) * factor;
+
+            const distance = level - lower;
+            return -factor * distance * distance / (2 * knee);
+        }
+
+        /// Processes one allocation-free interleaved stereo audio block.
+        fn process(
+            dsp: *DSP,
+            node: Index,
+            into: []Buffer,
+        ) ProcessError!void {
+            const output = &into[0];
+            const state = &dsp.processingState(node).compressor;
+            const parameters = state.parameters;
+            const input = dsp.nodes.items(.inputs)[node.idx][0];
+            if (input.isNoop()) return;
+
+            // This is a bus effect: source voices must be summed before one
+            // detector envelope computes gain reduction. The graph may ask
+            // for the same bus once per voice, so only voice zero renders it.
+            if (dsp.render_voice != 0) return;
+            @memset(output.samples[0..output.sample_count], 0);
+            const input_voice_count = dsp.outputVoiceCount(input.node, input.output_port);
+            for (0..input_voice_count) |voice| {
+                try dsp.renderNode(input.node, @intCast(voice), output.sample_count);
+                const source = &dsp.cacheForVoice(input.node, @intCast(voice)).outputs[
+                    @intCast(input.output_port)
+                ];
+                for (
+                    output.samples[0..output.sample_count],
+                    source.samples[0..source.sample_count],
+                ) |*sample, source_sample| sample.* += source_sample;
+            }
+
+            const threshold = if (std.math.isFinite(parameters.threshold))
+                @max(-120.0, @min(0.0, parameters.threshold))
+            else
+                -24.0;
+            const attack = if (std.math.isFinite(parameters.attack))
+                @max(0.0, parameters.attack)
+            else
+                0.01;
+            const release = if (std.math.isFinite(parameters.release))
+                @max(0.0, parameters.release)
+            else
+                0.1;
+            const ratio = if (std.math.isFinite(parameters.ratio))
+                @max(1.0, parameters.ratio)
+            else
+                4.0;
+            const knee = if (std.math.isFinite(parameters.knee))
+                @max(0.0, parameters.knee)
+            else
+                6.0;
+            const makeup_gain = if (std.math.isFinite(parameters.makeup_gain))
+                @max(-120.0, @min(120.0, parameters.makeup_gain))
+            else
+                0.0;
+            const attack_coefficient = if (attack == 0) 0 else @exp(-1 / (attack * sample_rate));
+            const release_coefficient = if (release == 0) 0 else @exp(-1 / (release * sample_rate));
+            assert(output.sample_count % 2 == 0);
+            var sample: usize = 0;
+            while (sample < output.sample_count) : (sample += 2) {
+                const left = output.samples[sample];
+                const right = output.samples[sample + 1];
+                const raw_detector = switch (parameters.method) {
+                    .peak => @max(@abs(left), @abs(right)),
+                    .rms => @sqrt((left * left + right * right) * 0.5),
+                };
+                const detector = if (std.math.isFinite(raw_detector)) raw_detector else 0;
+                const coefficient = if (detector > state.envelope)
+                    attack_coefficient
+                else
+                    release_coefficient;
+                state.envelope = detector + coefficient * (state.envelope - detector);
+
+                const reduction = gainReductionDb(
+                    levelDb(state.envelope),
+                    threshold,
+                    ratio,
+                    knee,
+                );
+                const gain = std.math.pow(f32, 10, (makeup_gain + reduction) / 20);
+                output.samples[sample] = left * gain;
+                output.samples[sample + 1] = right * gain;
+            }
+        }
+    };
+
     /// Generates white, pink, or brown stereo noise with amplitude modulation.
     pub const Noise = struct {
         /// Port metadata for the noise node.
@@ -4430,6 +4616,7 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .add = Node.Add.metadata,
         .adsr = Node.ADSR.metadata,
         .bit_crusher = Node.BitCrusher.metadata,
+        .compressor = Node.Compressor.metadata,
         .constant = Node.Constant.metadata,
         .duplicate = Node.Duplicate.metadata,
         .input = Node.Input.metadata,
@@ -4448,3 +4635,78 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .midi = Node.MIDI.metadata,
     },
 );
+
+// Verify the hard-knee static compression curve.
+test "compressor applies ratio above threshold" {
+    try std.testing.expectEqual(@as(f32, 0), Node.Compressor.gainReductionDb(-12, -10, 4, 0));
+    try std.testing.expectApproxEqAbs(
+        @as(f32, -6),
+        Node.Compressor.gainReductionDb(-2, -10, 4, 0),
+        0.0001,
+    );
+}
+
+// Verify that the soft knee reaches the hard-knee curve at its boundaries.
+test "compressor soft knee transitions smoothly" {
+    try std.testing.expectApproxEqAbs(
+        @as(f32, -2.25),
+        Node.Compressor.gainReductionDb(-7, -10, 4, 6),
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, -0.5625),
+        Node.Compressor.gainReductionDb(-10, -10, 4, 6),
+        0.0001,
+    );
+}
+
+// Verify that reset clears only runtime detector state.
+test "compressor reset preserves parameters" {
+    const parameters = Node.Compressor.Parameters{ .method = .peak, .threshold = -12 };
+    var compressor = Node.Compressor{ .parameters = parameters, .envelope = 0.75 };
+    compressor.reset(0);
+    try std.testing.expectEqual(@as(f32, 0), compressor.envelope);
+    try std.testing.expectEqual(parameters, compressor.parameters);
+}
+
+// Verify that a polyphonic compressor processes the summed source bus once.
+test "compressor aggregates polyphonic input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const device = pa.Device{
+        .id = 0,
+        .host_api_name = &.{},
+        .name = &.{},
+        .label = &.{},
+        .low_output_latency = 0,
+    };
+    var dsp: DSP = undefined;
+    try dsp.init(&.{device}, &.{}, &.{}, allocator);
+
+    const source = try dsp.addNode(allocator, Node.Constant.create("source", .{ .constant = 0.5 }));
+    const compressor = try dsp.addNode(allocator, Node.Compressor.create("compressor", .{
+        .method = .peak,
+        .threshold = -6,
+        .attack = 0,
+        .release = 0,
+        .ratio = 4,
+        .knee = 0,
+    }));
+    const output = try dsp.addNode(allocator, Node.Output.create("output", 0));
+    dsp.output = output;
+    try dsp.setNodePolyphony(allocator, source, 2);
+    try dsp.setNodePolyphony(allocator, compressor, 2);
+    dsp.plug(source, 0, compressor, 0);
+    dsp.plug(compressor, 0, output, 0);
+
+    var reader = dsp.sampleTap(compressor).queue.reader();
+    var rendered = [_]f32{ 0, 0, 0, 0 };
+    dsp.stream(&rendered);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.595662), rendered[0], 0.0001);
+    try std.testing.expectEqual(rendered[0], rendered[1]);
+
+    const block = dsp.sampleTap(compressor).queue.front(&reader);
+    try std.testing.expect(block != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.595662), block.?.samples[0][0], 0.0001);
+}

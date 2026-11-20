@@ -1846,6 +1846,7 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .add => DSP.Node.Add.create(source_name),
         .adsr => |value| DSP.Node.ADSR.create(source_name, value.parameters),
         .bit_crusher => |value| DSP.Node.BitCrusher.create(source_name, value.parameters),
+        .compressor => |value| DSP.Node.Compressor.create(source_name, value.parameters),
         .constant => |value| DSP.Node.Constant.create(source_name, value.parameters),
         .delay => |value| DSP.Node.Delay.create(source_name, value.parameters),
         .duplicate => DSP.Node.Duplicate.create(source_name),
@@ -3893,6 +3894,7 @@ pub const CommandPalette = struct {
                 .default_resonance = 0,
             }),
             .bit_crusher => DSP.Node.BitCrusher.create(name, .{}),
+            .compressor => DSP.Node.Compressor.create(name, .{}),
             .delay => DSP.Node.Delay.create(name, .{}),
             .duplicate => DSP.Node.Duplicate.create(name),
             .noise => DSP.Node.Noise.create(name, .{
