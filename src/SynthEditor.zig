@@ -3157,44 +3157,6 @@ fn remove(self: *Self, gpa: std.mem.Allocator, node: VisualNode.Index) !void {
     try self.write(gpa);
 }
 
-/// Notes used by the melodic demonstration sequencer.
-const sequencer_notes = [_]DSP.Note{
-    .{ // A4
-        .pitch = DSP.Note.Pitch.a.pitch(.natural, 4),
-        .start_tick = 0,
-        .duration_ticks = DSP.Node.MonophonicSequencer.quarter_note_ticks * 4,
-    },
-    .{ // B4
-        .pitch = DSP.Note.Pitch.b.pitch(.natural, 4),
-        .start_tick = DSP.Node.MonophonicSequencer.quarter_note_ticks * 4,
-        .duration_ticks = DSP.Node.MonophonicSequencer.quarter_note_ticks * 2,
-    },
-    .{ // C4
-        .pitch = DSP.Note.Pitch.c.pitch(.natural, 4),
-        .start_tick = DSP.Node.MonophonicSequencer.quarter_note_ticks * 4 * 2,
-        .duration_ticks = DSP.Node.MonophonicSequencer.quarter_note_ticks * 4,
-    },
-};
-
-/// Notes used to trigger the demonstration percussion voice.
-const beat_notes = [_]DSP.Note{ // Fed into a Noise node so we dont care about the pitch
-    .{
-        .pitch = DSP.Note.Pitch.a.pitch(.natural, 4),
-        .start_tick = 0,
-        .duration_ticks = DSP.Node.MonophonicSequencer.quarter_note_ticks / 2,
-    },
-    .{
-        .pitch = DSP.Note.Pitch.a.pitch(.natural, 4),
-        .start_tick = DSP.Node.MonophonicSequencer.quarter_note_ticks,
-        .duration_ticks = DSP.Node.MonophonicSequencer.quarter_note_ticks / 2,
-    },
-    .{
-        .pitch = DSP.Note.Pitch.a.pitch(.natural, 4),
-        .start_tick = DSP.Node.MonophonicSequencer.quarter_note_ticks * 2,
-        .duration_ticks = DSP.Node.MonophonicSequencer.quarter_note_ticks,
-    },
-};
-
 fn addVisualNode(
     self: *Self,
     allocator: std.mem.Allocator,
@@ -3221,269 +3183,6 @@ fn addNode(
     return index;
 }
 
-/// Create a simple DSP with a square waveform, modulation, sequencing, and effects.
-fn simpleDSP(self: *Self, allocator: std.mem.Allocator) !void {
-    const dsp = &self.dsp;
-
-    // Create the three pitched voices used by the demo.
-    // First voice
-    const voice1 = try addNode(
-        self,
-        allocator,
-        DSP.Node.Oscillator.create(
-            "voice1",
-            .{
-                .waveform = .square,
-                .default_frequency = 440,
-                .default_amplitude = 0.5,
-            },
-        ),
-        .{ .x = 5, .y = -12 },
-    );
-
-    // Second voice
-    const voice2 = try addNode(
-        self,
-        allocator,
-        DSP.Node.Oscillator.create(
-            "voice2",
-            .{
-                .waveform = .square,
-                .default_frequency = 587.33,
-                .default_amplitude = 0.5,
-            },
-        ),
-        .{ .x = 5, .y = -5 },
-    );
-
-    // Third voice
-    const voice3 = try addNode(
-        self,
-        allocator,
-        DSP.Node.Oscillator.create(
-            "voice3",
-            .{
-                .waveform = .triangle,
-                .default_frequency = 440,
-                .default_amplitude = 0.6,
-            },
-        ),
-        .{ .x = 5, .y = 7 },
-    );
-
-    // Create two low-frequency modulators.
-    // LFO
-    const lfo = try addNode(
-        self,
-        allocator,
-        DSP.Node.Oscillator.create(
-            "lfo",
-            .{
-                .waveform = .sine,
-                .default_frequency = 5,
-                .default_amplitude = 5,
-            },
-        ),
-        .{ .x = -25, .y = -14 },
-    );
-
-    // Create the second LFO used as an amplitude modulation source.
-    const lfo2 = try addNode(
-        self,
-        allocator,
-        DSP.Node.Oscillator.create(
-            "lfo2",
-            .{
-                .waveform = .sine,
-                .default_frequency = 3,
-                .default_amplitude = 3,
-            },
-        ),
-        .{ .x = 25, .y = 17 },
-    );
-
-    // Combine the second LFO with the filtered third voice.
-    const multiply = try addNode(
-        self,
-        allocator,
-        DSP.Node.Multiply.create("multiply"),
-        .{ .x = 50, .y = 7 },
-    );
-
-    // Create the constant and adder used to offset the first voice's pitch.
-    // Emit single 440 value
-    const constant = try addNode(
-        self,
-        allocator,
-        DSP.Node.Constant.create("constant", .{ .constant = 440 }),
-        .{ .x = -25, .y = -5 },
-    );
-
-    // Add so LFO modulates voice frequency instead of replace it
-    // Add the LFO signal to the base 440 Hz frequency.
-    const add = try addNode(
-        self,
-        allocator,
-        DSP.Node.Add.create("add"),
-        .{ .x = -8, .y = -10 },
-    );
-
-    // Create the mixer that combines melodic and percussion voices.
-    // Mixer for 2 voices
-    const mixer = try addNode(
-        self,
-        allocator,
-        DSP.Node.Mixer.create(
-            "mixer",
-            .{
-                .gain = 0.3,
-                // Both voice at 0.5 gain and first voice 0.5 to the left and second 0.5 to the right
-                .gains = [_]f32{ 0.1, 0.1, 0.6, 0.3, 0, 0, 0, 0 },
-                .pans = [_]f32{ -0.7, 0.7, 0.0, 0.0, 0, 0, 0, 0 },
-            },
-        ),
-        .{ .x = 68, .y = 5 },
-    );
-
-    // Create the melodic sequencer and its shaping effects.
-    // Sequencer
-    const sequencer = try addNode(
-        self,
-        allocator,
-        DSP.Node.MonophonicSequencer.create(
-            "sequencer",
-            .{
-                .notes = &sequencer_notes,
-            },
-        ),
-        .{ .x = -25, .y = 7 },
-    );
-
-    // Add the filter, envelope, and bit crusher for the third voice.
-    // High pass filter
-    // Filter the third voice before its second modulation stage.
-    const notch_filter = try addNode(
-        self,
-        allocator,
-        DSP.Node.MultimodeFilter.create(
-            "notch_filter",
-            .{
-                .type = .notch,
-                .default_cutoff = 400,
-                .default_resonance = 0.75,
-            },
-        ),
-        .{ .x = 25, .y = 7 },
-    );
-
-    // ADSR
-    // Shape the sequenced voice with an envelope.
-    const adsr = try addNode(
-        self,
-        allocator,
-        DSP.Node.ADSR.create(
-            "adsr",
-            .{
-                .attack = 0.3,
-                .attack_curve = .linear,
-                .decay = 0.4,
-                .sustain = 0.7,
-                .release = 0.5,
-            },
-        ),
-        .{ .x = -8, .y = 7 },
-    );
-
-    // BitCrusher (to get a 8bit/chip feel)
-    // Reduce the mixed signal to give the demo an 8-bit character.
-    const crusher = try addNode(
-        self,
-        allocator,
-        DSP.Node.BitCrusher.create("crusher", .{}),
-        .{ .x = 82, .y = 5 },
-    );
-
-    // Create the beat sequencer and noise generator.
-    // Sequencer for beat, will be fed into Noise node
-    const beat = try addNode(
-        self,
-        allocator,
-        DSP.Node.MonophonicSequencer.create(
-            "beat",
-            .{
-                .notes = &beat_notes,
-            },
-        ),
-        .{ .x = -25, .y = 17 },
-    );
-
-    // Noise
-    const noise = try addNode(
-        self,
-        allocator,
-        DSP.Node.Noise.create(
-            "noise",
-            .{
-                .seed = 0,
-                .type = .pink,
-            },
-        ),
-        .{ .x = -8, .y = 17 },
-    );
-
-    // Create the final output node and make it the DSP destination.
-    // Final output to audio device
-    const output = try addNode(
-        self,
-        allocator,
-        DSP.Node.Output.create("output", self.zsynth.default_audio_device),
-        .{ .x = 96, .y = 5 },
-    );
-    dsp.output = output;
-    dsp.setOutputDevice(output, self.zsynth.default_audio_device) catch
-        return error.AudioError;
-
-    // Connect modulation, sequencing, voices, effects, and output.
-    // Plug everything together
-
-    // LFO -> Add
-    dsp.plug(lfo, 0, add, 0);
-    // 440 -> Add
-    dsp.plug(constant, 0, add, 1);
-    // Add -> Voice1
-    dsp.plug(add, 0, voice1, 0);
-    // Sequencer.frequency -> Voice3.frequency
-    dsp.plug(sequencer, 0, voice3, 0);
-    // Sequencer.gate -> ADSR.gate
-    dsp.plug(sequencer, 1, adsr, 0);
-    // Sequencer.velocity -> ADSR.velocity
-    dsp.plug(sequencer, 2, adsr, 1);
-    // ADSR -> Voice3.amplitude
-    dsp.plug(adsr, 0, voice3, 1);
-    // Voice3 -> High pass filter
-    dsp.plug(voice3, 0, notch_filter, 0);
-    // High pass filter x LFO2
-    dsp.plug(notch_filter, 0, multiply, 0);
-    dsp.plug(lfo2, 0, multiply, 1);
-    // Beat.gate -> Noise.amplitude
-    dsp.plug(beat, 1, noise, 0);
-    // Voice1, Voice2, Multiply, Noise -> Mixer
-    dsp.plug(voice1, 0, mixer, 0);
-    dsp.plug(voice2, 0, mixer, 1);
-    dsp.plug(multiply, 0, mixer, 2);
-    dsp.plug(noise, 0, mixer, 3);
-    // Mixer -> BitCrusher
-    dsp.plug(mixer, 0, crusher, 0);
-    // Crusher -> Output
-    dsp.plug(crusher, 0, output, 0);
-
-    if (!try self.editorSpace().rebuildOccupancy(allocator))
-        return error.InvalidVisualNodeLayout;
-
-    // Compute link paths after the complete graph and all visual nodes exist.
-    try self.editorSpace().computePaths(allocator);
-}
-
 pub const CommandPalette = struct {
     editor: *Self,
     text_field: TextField(*CommandPalette) = undefined,
@@ -3501,8 +3200,6 @@ pub const CommandPalette = struct {
 
     pub const vtable = StateStack.State.VTable{
         .enter = CommandPalette.enter,
-        .leave = CommandPalette.leave,
-        .quit = CommandPalette.quit,
         .keyUpDown = CommandPalette.keyUpDown,
         .textInput = CommandPalette.textInput,
         .render = CommandPalette.render,
@@ -3521,26 +3218,6 @@ pub const CommandPalette = struct {
         });
         self.editor.zsynth.cursor.dirty = true;
         try self.write(gpa);
-    }
-
-    /// Releases the palette state when it is temporarily removed.
-    fn leave(
-        state_stack: *StateStack,
-        _: std.mem.Allocator,
-        _: *Renderer,
-        _: StateStack.State.Index,
-    ) StateStack.State.Error!void {
-        _ = state_stack;
-    }
-
-    /// Releases the palette state while the application state stack is shutting down.
-    fn quit(
-        state_stack: *StateStack,
-        _: std.mem.Allocator,
-        _: *Renderer,
-        _: StateStack.State.Index,
-    ) StateStack.State.Error!void {
-        _ = state_stack;
     }
 
     fn keyUpDown(
@@ -3750,7 +3427,10 @@ pub const CommandPalette = struct {
         ) orelse return error.InvalidVisualNodeLayout;
 
         if (self.editor.active_group) |_| {
-            const root_position = self.editor.space.findFreePosition(index, self.editor.space.viewportCenter()) orelse
+            const root_position = self.editor.space.findFreePosition(
+                index,
+                self.editor.space.viewportCenter(),
+            ) orelse
                 return error.InvalidVisualNodeLayout;
             try self.editor.space.addNode(gpa, index, root_position);
             errdefer self.editor.space.remove(gpa, index) catch {};
@@ -3878,21 +3558,30 @@ pub const CommandPalette = struct {
             .add => DSP.Node.Add.create(name),
             .multiply => DSP.Node.Multiply.create(name),
             .constant => DSP.Node.Constant.create(name, .{}),
-            .oscillator => DSP.Node.Oscillator.create(name, .{
-                .waveform = .sine,
-                .default_frequency = 440,
-                .default_amplitude = 1,
-            }),
+            .oscillator => DSP.Node.Oscillator.create(
+                name,
+                .{
+                    .waveform = .sine,
+                    .default_frequency = 440,
+                    .default_amplitude = 1,
+                },
+            ),
             .mixer => DSP.Node.Mixer.create(name, .{}),
-            .monophonic_sequencer => DSP.Node.MonophonicSequencer.create(name, .{
-                .notes = &.{},
-            }),
+            .monophonic_sequencer => DSP.Node.MonophonicSequencer.create(
+                name,
+                .{
+                    .notes = &.{},
+                },
+            ),
             .adsr => DSP.Node.ADSR.create(name, .{}),
-            .multimode_filter => DSP.Node.MultimodeFilter.create(name, .{
-                .type = .low_pass,
-                .default_cutoff = 1_000,
-                .default_resonance = 0,
-            }),
+            .multimode_filter => DSP.Node.MultimodeFilter.create(
+                name,
+                .{
+                    .type = .low_pass,
+                    .default_cutoff = 1_000,
+                    .default_resonance = 0,
+                },
+            ),
             .bit_crusher => DSP.Node.BitCrusher.create(name, .{}),
             .compressor => DSP.Node.Compressor.create(name, .{}),
             .delay => DSP.Node.Delay.create(name, .{}),

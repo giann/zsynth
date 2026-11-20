@@ -16,6 +16,7 @@ and effects to be composed into a real-time sound pipeline.
 - MultimodeFilter: high pass, low pass, band pass and notch
 - ADSR
 - BitCrusher
+- Compressor
 - Noise: white, pink and brown
 - Utility nodes: Add, Multiply, Constant, Duplicate
 - MIDI input
@@ -34,13 +35,12 @@ and effects to be composed into a real-time sound pipeline.
 - pitch shifter
 - resampler
 - cleanup command that reorganize graph to optimize paths for better readability
-- chorus
+- distortion
 - reverb
 - color theme
 - ungroup
 - undo/redo history
 - nested groups
-- compressor
 
 ### Controls and UI elements
 

@@ -4227,7 +4227,11 @@ pub const Node = struct {
             .has_parameters = true,
             .can_link_parameters = false,
             .inputs = .{
-                .{ .name = "audio", .short_name = "in", .color = .havelock_blue },
+                .{
+                    .name = "audio",
+                    .short_name = "in",
+                    .color = .havelock_blue,
+                },
                 .{},
                 .{},
                 .{},
@@ -4237,7 +4241,12 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "audio", .short_name = "out", .color = .havelock_blue, .observer = .waveform },
+                .{
+                    .name = "audio",
+                    .short_name = "out",
+                    .color = .havelock_blue,
+                    .observer = .waveform,
+                },
                 .{},
                 .{},
                 .{},
