@@ -12,6 +12,8 @@ pub const Held = struct {
     gate: std.atomic.Value(u8) = .{ .raw = 0 },
     /// MIDI velocity normalized to the 0..127 range.
     velocity: std.atomic.Value(u8) = .{ .raw = 0 },
+    /// Monotonically increasing note-on generation assigned to this voice.
+    trigger: std.atomic.Value(u64) = .{ .raw = 0 },
 };
 
 /// A MIDI source's lock-free note snapshot shared with the audio renderer.
@@ -29,6 +31,7 @@ pub const Source = struct {
             if (held.gate.load(.acquire) != 0) continue;
             held.note.store(note, .monotonic);
             held.velocity.store(velocity, .monotonic);
+            _ = held.trigger.fetchAdd(1, .monotonic);
             held.gate.store(1, .release);
             return;
         }
@@ -58,6 +61,7 @@ pub const Source = struct {
             .note = held.note.load(.monotonic),
             .gate = held.gate.load(.acquire),
             .velocity = held.velocity.load(.monotonic),
+            .trigger = held.trigger.load(.monotonic),
         };
     }
 };
@@ -70,6 +74,8 @@ pub const Snapshot = struct {
     gate: u8,
     /// MIDI velocity in the 0..127 range.
     velocity: u8,
+    /// Note-on generation for the assigned voice.
+    trigger: u64,
 };
 
 /// Device-indexed MIDI snapshots owned by the synth editor.
@@ -136,7 +142,7 @@ pub const SharedState = struct {
                 active_voice += 1;
             }
         }
-        return .{ .note = 0, .gate = 0, .velocity = 0 };
+        return .{ .note = 0, .gate = 0, .velocity = 0, .trigger = 0 };
     }
 
     /// Empty source returned when a node refers to an unavailable device.

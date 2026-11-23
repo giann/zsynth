@@ -3416,7 +3416,7 @@ pub const Node = struct {
             .inputs = .{
                 .{ .name = "gate", .short_name = "gate", .color = .fuschia_pink },
                 .{ .name = "velocity", .short_name = "vel", .color = .fuschia_pink },
-                .{},
+                .{ .name = "trigger", .short_name = "trig", .color = .fuschia_pink },
                 .{},
                 .{},
                 .{},
@@ -3433,7 +3433,7 @@ pub const Node = struct {
                 .{},
                 .{},
             },
-            .input_count = 2,
+            .input_count = 3,
         };
 
         /// Curves available for attack, decay, and release transitions.
@@ -3521,6 +3521,7 @@ pub const Node = struct {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const gate_connection = input_outlets[0];
             const velocity_connection = input_outlets[1];
+            const trigger_connection = input_outlets[2];
 
             // A severed gate means gate-off, allowing the envelope to release safely.
             const gate_buffer = if (gate_connection.isNoop())
@@ -3533,6 +3534,13 @@ pub const Node = struct {
                 null
             else
                 try dsp.getOutput(velocity_connection, into[0].sample_count);
+
+            // A trigger is an event signal, so it is intentionally separate
+            // from the level signal used to control release and sustain.
+            const trigger_buffer = if (trigger_connection.isNoop())
+                null
+            else
+                try dsp.getOutput(trigger_connection, into[0].sample_count);
 
             // Clamp the sustain level once because it is constant for the block.
             assert(into[0].sample_count % 2 == 0);
@@ -3551,6 +3559,10 @@ pub const Node = struct {
                 else
                     1;
                 const gate_on = gate >= 0.5;
+                const trigger_on = if (trigger_buffer) |buffer|
+                    buffer.samples[sample_index] >= 0.5
+                else
+                    false;
 
                 // First update the stage transitions from the current gate.
                 if (gate_on) {
@@ -3559,12 +3571,15 @@ pub const Node = struct {
                     // cut off the release tail.
                     state.velocity = @max(0.0, @min(1.0, velocity));
 
-                    // A high gate starts the attack, unless the envelope is
-                    // already in attack, decay, or sustain.
-                    if (state.stage == .idle or state.stage == .release) {
+                    // A trigger always restarts the attack from silence,
+                    // including when the voice is already in attack, decay,
+                    // sustain, or release. An unconnected trigger retains
+                    // the legacy idle-to-attack gate behavior.
+                    if (trigger_on or state.stage == .idle) {
                         state.stage = .attack;
                         state.stage_elapsed = 0;
-                        state.stage_start_level = state.level;
+                        state.stage_start_level = 0;
+                        state.level = 0;
                     }
                 } else if (state.stage != .idle and state.stage != .release) {
                     // Release starts from the current level, regardless of
@@ -4560,19 +4575,20 @@ pub const Node = struct {
             .short_name = "midi",
             .color = .carnation,
             .has_parameters = true,
+            .has_per_voice_state = true,
             .can_link_parameters = false,
             .duplicatable = false,
-            .output_count = 4,
+            .output_count = 5,
             .input_count = 0,
             .outputs = .{
                 .{ .name = "Frequency", .short_name = "freq", .color = .carnation },
                 .{ .name = "Gate", .short_name = "gate", .color = .carnation },
                 .{ .name = "Velocity", .short_name = "vel", .color = .carnation },
                 .{ .name = "Note", .short_name = "note", .color = .carnation },
+                .{ .name = "Trigger", .short_name = "trig", .color = .carnation },
                 .{}, // TODO: CC
                 .{}, // TODO: After touch
                 .{}, // TODO: Pitch bend (frequency offset)
-                .{},
             },
         };
 
@@ -4581,7 +4597,16 @@ pub const Node = struct {
             device: pm.DeviceId,
         };
 
+        /// Runtime PortMidi index selected for this node.
         parameters: Parameters,
+        /// Last note-on generation emitted for this voice.
+        last_trigger: u64 = 0,
+
+        /// Resets the per-voice trigger history while preserving device selection.
+        pub fn reset(self: *MIDI, _: u8) void {
+            const parameters = self.parameters;
+            self.* = .{ .parameters = parameters };
+        }
 
         pub fn create(name: []const u8, parameters: Parameters) Node {
             return .{
@@ -4605,15 +4630,22 @@ pub const Node = struct {
         }
 
         fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
-            const state: *MIDI = &dsp.nodes.items(.state)[node.idx].midi;
+            const state = &dsp.processingState(node).midi;
             const snapshot = dsp.midi_state.snapshot(state.parameters.device, dsp.render_voice);
             const note: u7 = @intCast(snapshot.note);
             const gate = @as(f32, @floatFromInt(snapshot.gate));
             const velocity = @as(f32, @floatFromInt(snapshot.velocity)) / 127;
+            const trigger = snapshot.trigger != state.last_trigger and snapshot.gate != 0;
+            state.last_trigger = snapshot.trigger;
             @memset(into[0].samples[0..into[0].sample_count], noteFrequency(note));
             @memset(into[1].samples[0..into[1].sample_count], gate);
             @memset(into[2].samples[0..into[2].sample_count], velocity);
             @memset(into[3].samples[0..into[3].sample_count], @floatFromInt(note));
+            @memset(into[4].samples[0..into[4].sample_count], 0);
+            if (trigger) {
+                into[4].samples[0] = 1;
+                into[4].samples[1] = 1;
+            }
         }
     };
 };
