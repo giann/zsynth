@@ -53,6 +53,10 @@ group_space: ?Space = null,
 active_group: ?DSP.Node.Index = null,
 /// Global piano controls, display state, and virtual input ownership.
 piano: PianoState = .{},
+/// Elapsed time since the last animated outlet refresh.
+outlet_refresh_elapsed_ms: u64 = 0,
+/// Playback state used to repaint outlets when entering or leaving playback.
+outlets_playing: bool = false,
 
 /// State-stack callbacks used by the synth editor context.
 pub const vtable = StateStack.State.VTable{
@@ -167,6 +171,8 @@ const parameters_pane_min_height: u32 = 7;
 const parameters_pane_max_content_height: u32 = 5;
 /// Maximum number of parameter rows packed into one selected-pane column.
 const parameters_pane_max_rows: u32 = 5;
+/// Target interval between animated outlet redraws while audio is playing.
+const outlet_refresh_interval_ms: u64 = 16;
 /// Label prefix used by the fixed playback status HUD.
 const output_status_label = "Playback: ";
 /// Longest playback state shown by the fixed playback status HUD.
@@ -560,6 +566,9 @@ fn write(self: *Self, gpa: std.mem.Allocator) !void {
     const draw_paths = !space.isSelectedNodeDragActive() or
         !self.zsynth.cursor.left_mouse_moved;
     try space.write(gpa, &self.zsynth.display, draw_paths);
+    try space.writeOutlets(gpa, &self.zsynth.display, self.dsp.isPlaying());
+    self.outlet_refresh_elapsed_ms = 0;
+    self.outlets_playing = self.dsp.isPlaying();
     if (self.zsynth.cursor.selection_dragging)
         try self.editorSpace().writeSelectionMarquee(
             gpa,
@@ -3122,8 +3131,18 @@ fn render(
 ) StateStack.State.Error!void {
     // Resolve the concrete editor context for this frame.
     const self: *Self = &state_stack.stack.items(.context)[state.idx].synth_editor;
-    // Redraw text before the runtime overlays the software cursor.
-    try self.write(gpa);
+    const playing = self.dsp.isPlaying();
+    if (playing != self.outlets_playing) {
+        try self.editorSpace().writeOutlets(gpa, &self.zsynth.display, playing);
+        self.outlets_playing = playing;
+        self.outlet_refresh_elapsed_ms = 0;
+    } else if (playing) {
+        self.outlet_refresh_elapsed_ms += dt;
+        if (self.outlet_refresh_elapsed_ms >= outlet_refresh_interval_ms) {
+            try self.editorSpace().writeOutlets(gpa, &self.zsynth.display, true);
+            self.outlet_refresh_elapsed_ms %= outlet_refresh_interval_ms;
+        }
+    }
     // Draw the remembered filename before transient editor overlays.
     try self.writeDocumentName(gpa);
     // Draw selected-node parameters in the editor-owned transparent overlay.

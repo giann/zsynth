@@ -1276,6 +1276,93 @@ pub fn write(
     }
 }
 
+/// Rewrites only the visible outlet cells using the current signal levels.
+pub fn writeOutlets(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    display: *Display,
+    playing: bool,
+) !void {
+    for (self.nodes.items(.dsp_node), 0..) |node, index| {
+        const visual_node = VisualNode.Index{ .idx = index };
+        if (node.isNoop() or self.isHiddenNode(visual_node)) continue;
+
+        const footprint = self.nodeFootprint(visual_node);
+        if (!self.intersectsViewport(footprint)) continue;
+
+        const x = @as(i64, footprint.x) - @as(i64, self.viewport.x);
+        const y = @as(i64, footprint.y) - @as(i64, self.viewport.y);
+        const outlet = [_]u8{0x09};
+
+        for (0..DSP.max_outlets) |slot| {
+            const port = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
+            const outlet_y = y + @as(i64, @intCast(self.outletYOffset(
+                footprint,
+                self.displayedPortCount(visual_node, .input),
+                slot,
+            )));
+            const color = self.outletColor(visual_node, .input, port, playing);
+            if (x >= 0 and outlet_y >= 0)
+                try display.write(gpa, &outlet, @intCast(x), @intCast(outlet_y), .black, color);
+        }
+
+        for (0..DSP.max_outlets) |slot| {
+            const port = self.displayedPortAtSlot(visual_node, .output, slot) orelse continue;
+            const outlet_y = y + @as(i64, @intCast(self.outletYOffset(
+                footprint,
+                self.displayedPortCount(visual_node, .output),
+                slot,
+            )));
+            const outlet_x = x + @as(i64, @intCast(footprint.width - 1));
+            const color = self.outletColor(visual_node, .output, port, playing);
+            if (outlet_x >= 0 and outlet_y >= 0)
+                try display.write(
+                    gpa,
+                    &outlet,
+                    @intCast(outlet_x),
+                    @intCast(outlet_y),
+                    .black,
+                    color,
+                );
+        }
+    }
+}
+
+/// Returns the animated color for one input or output audio outlet.
+fn outletColor(
+    self: *Self,
+    node: VisualNode.Index,
+    direction: PortDirection,
+    port: usize,
+    playing: bool,
+) Display.Color {
+    if (!playing) return .gray;
+
+    const metadata = self.outletMetadata(.{
+        .node = node,
+        .direction = if (direction == .input) .input else .output,
+        .port = @intCast(port),
+        .anchor = .{ .x = 0, .y = 0 },
+    });
+    const led = switch (direction) {
+        .input => blk: {
+            const input = self.dsp.nodes.items(.inputs)[node.idx][port];
+            if (input.isNoop()) break :blk null;
+            break :blk self.dsp.nodes.items(.led)[input.node.idx][input.output_port];
+        },
+        .output => blk: {
+            if (!self.isOutputReachable(node) or
+                !self.dsp.nodes.items(.output_connected)[node.idx][port])
+                break :blk null;
+            break :blk self.dsp.nodes.items(.led)[node.idx][port];
+        },
+    };
+    return if (led) |level|
+        Display.Color.dove_gray.interpolate(metadata.color, std.math.clamp(level, 0.0, 1.0))
+    else
+        .gray;
+}
+
 /// Draws the transient amber marquee used to select nodes in empty space.
 pub fn writeSelectionMarquee(
     self: *Self,
@@ -1460,34 +1547,26 @@ fn writeNodeBody(
     }
 
     const outlet = [_]u8{0x09};
-    const inputs = self.dsp.nodes.items(.inputs)[node.idx];
     for (0..DSP.max_outlets) |slot| {
-        const port = self.displayedPortAtSlot(node, .input, slot) orelse continue;
+        _ = self.displayedPortAtSlot(node, .input, slot) orelse continue;
         const outlet_y = y + @as(i64, @intCast(self.outletYOffset(
             footprint,
             self.displayedPortCount(node, .input),
             slot,
         )));
-        const color = if (!self.isOutputReachable(node) or inputs[port].isNoop())
-            Display.Color.gray
-        else
-            Display.Color.green;
+        const color = Display.Color.gray;
         if (x >= 0 and outlet_y >= 0)
             try display.write(gpa, &outlet, @intCast(x), @intCast(outlet_y), background, color);
     }
 
     for (0..DSP.max_outlets) |slot| {
-        const port = self.displayedPortAtSlot(node, .output, slot) orelse continue;
+        _ = self.displayedPortAtSlot(node, .output, slot) orelse continue;
         const outlet_y = y + @as(i64, @intCast(self.outletYOffset(
             footprint,
             self.displayedPortCount(node, .output),
             slot,
         )));
-        const color = if (self.isOutputReachable(node) and
-            self.dsp.nodes.items(.output_connected)[node.idx][port])
-            Display.Color.green
-        else
-            Display.Color.gray;
+        const color = Display.Color.gray;
         const outlet_x = x + @as(i64, @intCast(footprint.width - 1));
         if (outlet_x >= 0 and outlet_y >= 0)
             try display.write(gpa, &outlet, @intCast(outlet_x), @intCast(outlet_y), background, color);

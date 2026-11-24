@@ -1575,6 +1575,16 @@ fn processingState(self: *DSP, node: Node.Index) *Node.State {
     return self.stateForVoice(node, self.render_voice);
 }
 
+/// Returns the finite peak absolute level of one rendered output block.
+fn outputLedLevel(samples: []const f32) f32 {
+    var level: f32 = 0;
+    for (samples) |sample| {
+        if (std.math.isFinite(sample))
+            level = @max(level, @abs(sample));
+    }
+    return std.math.clamp(level, 0.0, 1.0);
+}
+
 /// Returns the voice count available from one node output port.
 fn outputVoiceCount(self: *DSP, node: Node.Index, port: u8) u8 {
     return self.nodes.items(.output_voice_counts)[node.idx][port];
@@ -1734,11 +1744,20 @@ fn renderNode(self: *DSP, node: Node.Index, voice: u8, sample_count: u32) !void 
             process_elapsed - process_child_time_ns,
         );
     };
+    if (self.render_voice == 0)
+        @memset(&self.nodes.items(.led)[node.idx], 0);
+    var process_leds: [max_outlets]f32 = @splat(0);
     try self.nodes.items(.process)[node.idx](
         self,
         node,
         process_outputs,
+        process_leds[0..],
     );
+    for (process_leds, 0..) |level, port|
+        self.nodes.items(.led)[node.idx][port] = @max(
+            self.nodes.items(.led)[node.idx][port],
+            level,
+        );
 
     // Publish the completed cache only after processing succeeds.
     cache.sample_count = sample_count;
@@ -1948,6 +1967,8 @@ pub const Node = struct {
     inputs: [max_outlets]Connection = @splat(.{}),
     /// Whether each output port is connected to a destination input.
     output_connected: [max_outlets]bool = @splat(false),
+    /// Peak signal level published by each output for the editor LED.
+    led: [max_outlets]f32 = @splat(0),
     /// Configured voice limit for this node; group and output wrappers derive theirs.
     polyphony: u8 = 1,
     /// Effective voice count cached after graph mutation.
@@ -2155,6 +2176,7 @@ pub const Node = struct {
         dsp: *DSP,
         node: Index,
         outputs: []Buffer,
+        leds: []f32,
     ) ProcessError!void;
     pub const InitializeError = error{OutOfMemory} || pm.Error || pa.Error;
     /// Initializes node-level resources when the node is added to the graph.
@@ -2213,6 +2235,7 @@ pub const Node = struct {
             _: *DSP,
             _: Index,
             _: []Buffer,
+            _: []f32,
         ) ProcessError!void {}
     };
 
@@ -2273,6 +2296,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             // Read the one input connection assigned to the output node.
             const input = dsp.nodes.items(.inputs)[node.idx][0];
@@ -2293,6 +2317,7 @@ pub const Node = struct {
                     source.samples[0..source.sample_count],
                 ) |*sample, voice_sample| sample.* += voice_sample;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..into[0].sample_count])), 0.0, 1.0);
         }
     };
 
@@ -2342,6 +2367,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             const voice = dsp.render_voice;
             const cache = dsp.cacheForVoice(node, voice);
@@ -2378,6 +2404,7 @@ pub const Node = struct {
                     into[port].samples[0..into[port].sample_count],
                     source.samples[0..source.sample_count],
                 );
+                leds[port] = std.math.clamp(@abs(dsp.nodes.items(.led)[selected.node.idx][selected.port]), 0.0, 1.0);
             }
         }
     };
@@ -2406,10 +2433,11 @@ pub const Node = struct {
         }
 
         /// Copies the owning group's materialized input buffer.
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, leds: []f32) ProcessError!void {
             const state = dsp.nodes.items(.state)[node.idx].group_input;
             const source = &dsp.cacheForVoice(state.group, dsp.render_voice).input_buffers[state.port];
             @memcpy(into[0].samples[0..source.sample_count], source.samples[0..source.sample_count]);
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..source.sample_count])), 0.0, 1.0);
         }
     };
 
@@ -2437,7 +2465,7 @@ pub const Node = struct {
         }
 
         /// Forwards the member signal into the endpoint cache.
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, _: []f32) ProcessError!void {
             const input = dsp.nodes.items(.inputs)[node.idx][0];
             if (input.isNoop()) return;
             const source = try dsp.getOutput(input, into[0].sample_count);
@@ -2492,6 +2520,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const output = &into[0];
@@ -2533,6 +2562,7 @@ pub const Node = struct {
 
                 output.samples[offset] = sum;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(output.samples[0..output.sample_count])), 0.0, 1.0);
         }
     };
 
@@ -2578,7 +2608,7 @@ pub const Node = struct {
         }
 
         /// Copies the input buffer only to output ports with graph connections.
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, leds: []f32) ProcessError!void {
             const input = dsp.nodes.items(.inputs)[node.idx][0];
             if (input.isNoop()) return;
 
@@ -2599,6 +2629,7 @@ pub const Node = struct {
                     into[output_port].samples[0..source.sample_count],
                     source.samples[0..source.sample_count],
                 );
+                leds[output_port] = std.math.clamp(@abs(outputLedLevel(into[output_port].samples[0..source.sample_count])), 0.0, 1.0);
             }
         }
     };
@@ -2650,6 +2681,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
             const output = &into[0];
@@ -2691,6 +2723,7 @@ pub const Node = struct {
 
                 output.samples[offset] = result;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(output.samples[0..output.sample_count])), 0.0, 1.0);
         }
     };
 
@@ -2739,10 +2772,16 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             @memset(
                 into[0].samples[0..],
                 dsp.nodes.items(.state)[node.idx].constant.parameters.constant,
+            );
+            leds[0] = std.math.clamp(
+                @abs(dsp.nodes.items(.state)[node.idx].constant.parameters.constant),
+                0.0,
+                1.0,
             );
         }
     };
@@ -2897,7 +2936,7 @@ pub const Node = struct {
         }
 
         /// Copies one captured block to every requested voice without blocking rendering.
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, leds: []f32) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].input;
             const sample_count: usize = @intCast(into[0].sample_count);
             assert(sample_count <= state.last_block.len and sample_count % 2 == 0);
@@ -2917,6 +2956,7 @@ pub const Node = struct {
             }
 
             @memcpy(into[0].samples[0..sample_count], state.last_block[0..sample_count]);
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..sample_count])), 0.0, 1.0);
         }
 
         /// Converts captured frames to stereo and publishes them without waiting for the renderer.
@@ -3024,7 +3064,7 @@ pub const Node = struct {
         }
 
         /// Renders one stereo block, applying optional per-sample modulation.
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, leds: []f32) ProcessError!void {
             // Load graph connections and persistent oscillator state.
             const state = &dsp.processingState(node).oscillator;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
@@ -3092,6 +3132,7 @@ pub const Node = struct {
                 if (state.phase < 0)
                     state.phase += tau;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..into[0].sample_count])), 0.0, 1.0);
         }
     };
 
@@ -3156,6 +3197,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             const state = &dsp.nodes.items(.state)[node.idx].mixer;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
@@ -3229,6 +3271,7 @@ pub const Node = struct {
                 output.samples[offset] = left * parameters.gain;
                 output.samples[offset + 1] = right * parameters.gain;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(output.samples[0..output.sample_count])), 0.0, 1.0);
         }
     };
 
@@ -3314,6 +3357,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             const state = &dsp.processingState(node).monophonic_sequencer;
             const parameters = state.parameters;
@@ -3403,6 +3447,12 @@ pub const Node = struct {
                 // Advance playback by one audio frame.
                 state.position += ticks_per_frame;
             }
+            const gate_level = outputLedLevel(into[1].samples[0..into[1].sample_count]);
+            const note_level = @min(@abs(into[3].samples[0]), 127.0) / 127.0;
+            leds[0] = std.math.clamp(@abs(gate_level), 0.0, 1.0);
+            leds[1] = std.math.clamp(@abs(gate_level), 0.0, 1.0);
+            leds[2] = std.math.clamp(@abs(outputLedLevel(into[2].samples[0..into[2].sample_count])), 0.0, 1.0);
+            leds[3] = std.math.clamp(@abs(note_level), 0.0, 1.0);
         }
     };
 
@@ -3516,6 +3566,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             // Resolve persistent state and the two control inputs.
             const state = &dsp.processingState(node).adsr;
@@ -3684,6 +3735,7 @@ pub const Node = struct {
                 into[0].samples[sample_index] = output;
                 into[0].samples[sample_index + 1] = output;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..into[0].sample_count])), 0.0, 1.0);
         }
 
         /// Shapes a normalized transition between two envelope levels.
@@ -3787,6 +3839,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             // Resolve persistent filter state and the three possible inputs.
             const state = &dsp.processingState(node).multimode_filter;
@@ -3856,6 +3909,7 @@ pub const Node = struct {
                     .notch => notch_output,
                 };
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..into[0].sample_count])), 0.0, 1.0);
         }
     };
 
@@ -4016,7 +4070,7 @@ pub const Node = struct {
         }
 
         /// Renders a dry/wet blend from the input and its requested delayed copies.
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, leds: []f32) ProcessError!void {
             const state = &dsp.processingState(node).delay;
             const parameters = state.parameters;
             const input_outlets = dsp.nodes.items(.inputs)[node.idx];
@@ -4108,6 +4162,7 @@ pub const Node = struct {
 
                 state.history_cursor = (state.history_cursor + 1) % frame_capacity;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(output.samples[0..output.sample_count])), 0.0, 1.0);
         }
 
         /// Reads both stored channels at an integer frame age from the cursor.
@@ -4186,6 +4241,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             // Derive quantization and frame-hold settings from the configuration.
             const output = &into[0];
@@ -4226,6 +4282,7 @@ pub const Node = struct {
                 if (state.held_frames >= frames_to_hold)
                     state.held_frames = 0;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(output.samples[0..output.sample_count])), 0.0, 1.0);
         }
     };
 
@@ -4342,6 +4399,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             const output = &into[0];
             const state = &dsp.processingState(node).compressor;
@@ -4418,6 +4476,7 @@ pub const Node = struct {
                 output.samples[sample] = left * gain;
                 output.samples[sample + 1] = right * gain;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(output.samples[0..output.sample_count])), 0.0, 1.0);
         }
     };
 
@@ -4512,6 +4571,7 @@ pub const Node = struct {
             dsp: *DSP,
             node: Index,
             into: []Buffer,
+            leds: []f32,
         ) ProcessError!void {
             // Resolve persistent generator/filter state and the optional amplitude input.
             const state = &dsp.processingState(node).noise;
@@ -4568,6 +4628,7 @@ pub const Node = struct {
                 // Scale the colored sample and write it to the interleaved buffer.
                 into[0].samples[sample] = noise * amplitude;
             }
+            leds[0] = std.math.clamp(@abs(outputLedLevel(into[0].samples[0..into[0].sample_count])), 0.0, 1.0);
         }
     };
 
@@ -4631,7 +4692,7 @@ pub const Node = struct {
             return concert_a_freq * std.math.pow(f32, 2.0, semitone_offset);
         }
 
-        fn process(dsp: *DSP, node: Index, into: []Buffer) ProcessError!void {
+        fn process(dsp: *DSP, node: Index, into: []Buffer, leds: []f32) ProcessError!void {
             const state = &dsp.processingState(node).midi;
             const snapshot = dsp.midi_state.snapshot(state.parameters.device, dsp.render_voice);
             const note: u7 = @intCast(snapshot.note);
@@ -4648,6 +4709,12 @@ pub const Node = struct {
                 into[4].samples[0] = 1;
                 into[4].samples[1] = 1;
             }
+            leds[0] = std.math.clamp(@abs(gate), 0.0, 1.0);
+            leds[1] = std.math.clamp(@abs(gate), 0.0, 1.0);
+            leds[2] = std.math.clamp(@abs(velocity), 0.0, 1.0);
+            leds[3] = std.math.clamp(@abs(@as(f32, @floatFromInt(note)) / 127.0), 0.0, 1.0);
+            const trigger_level: f32 = if (trigger) 1 else 0;
+            leds[4] = std.math.clamp(trigger_level, 0.0, 1.0);
         }
     };
 };
