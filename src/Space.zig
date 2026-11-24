@@ -90,6 +90,8 @@ pub const VisualNode = struct {
 
     dsp_node: DSP.Node.Index,
     position: Position,
+    /// Whether collapsable unplugged outlets are currently compacted.
+    outlets_collapsed: bool = false,
     /// Whether this node can contribute to the configured DSP output.
     output_reachable: bool = false,
     paths: [DSP.max_outlets]?Path = @splat(null),
@@ -438,6 +440,28 @@ fn canPlaceAt(self: *Self, node: VisualNode.Index, position: Position) bool {
     return true;
 }
 
+/// Tests a candidate footprint while ignoring occupancy belonging to `node`.
+fn canExpandAt(self: *Self, node: VisualNode.Index, position: Position) bool {
+    const footprint = self.nodeFootprintAt(node, position);
+    const left = @as(i64, position.x) - 2;
+    const top = @as(i64, position.y) - 1;
+    const right = @as(i64, position.x) + @as(i64, footprint.width);
+    const bottom = @as(i64, position.y) + @as(i64, footprint.height);
+
+    var y = top;
+    while (y <= bottom) : (y += 1) {
+        var x = left;
+        while (x <= right) : (x += 1) {
+            const occupied_by = self.occupied.get(.{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            }) orelse continue;
+            if (occupied_by.idx != node.idx) return false;
+        }
+    }
+    return true;
+}
+
 /// Shift the viewport minimally so a node and its selected labels are visible.
 pub fn revealNode(self: *Self, node: VisualNode.Index) bool {
     if (node.isNoop()) return false;
@@ -500,6 +524,50 @@ pub fn nodePosition(self: *Self, node: VisualNode.Index) Position {
     return self.nodes.items(.position)[node.idx];
 }
 
+/// Returns whether a node exposes at least one outlet that can be collapsed.
+pub fn hasCollapsableOutlets(self: *const Self, node: VisualNode.Index) bool {
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    if (state == .group) return false;
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+
+    for (metadata.inputs[0..metadata.input_count]) |outlet|
+        if (outlet.collapsable) return true;
+    for (metadata.outputs[0..metadata.output_count]) |outlet|
+        if (outlet.collapsable) return true;
+    return false;
+}
+
+/// Toggles a node's compact outlet layout, rejecting expansions that collide.
+pub fn toggleOutletsCollapsed(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    node: VisualNode.Index,
+) !bool {
+    if (!self.hasCollapsableOutlets(node)) return false;
+
+    const collapsed = &self.nodes.items(.outlets_collapsed)[node.idx];
+    const was_collapsed = collapsed.*;
+    if (was_collapsed) {
+        collapsed.* = false;
+        if (!self.canExpandAt(node, self.nodePosition(node))) {
+            collapsed.* = true;
+            return false;
+        }
+    }
+
+    collapsed.* = !was_collapsed;
+    const rebuilt = try self.rebuildOccupancy(gpa);
+    if (!rebuilt) {
+        collapsed.* = was_collapsed;
+        const restored = try self.rebuildOccupancy(gpa);
+        assert(restored);
+        return false;
+    }
+
+    try self.computePaths(gpa);
+    return true;
+}
+
 /// Returns whether a DSP node is a group wrapper.
 pub fn isGroup(self: *const Self, node: VisualNode.Index) bool {
     return std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx]) == .group;
@@ -546,9 +614,50 @@ fn displayedPortCount(self: *const Self, node: VisualNode.Index, direction: Port
         return count;
     }
     const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
-    return switch (direction) {
+    const port_count = switch (direction) {
         .input => metadata.input_count,
         .output => metadata.output_count,
+    };
+    var count: u8 = 0;
+    var marker_added = false;
+    for (0..port_count) |port| {
+        if (self.isDisplayedPort(node, direction, @intCast(port))) {
+            count += 1;
+        } else if (!marker_added) {
+            count += 1;
+            marker_added = true;
+        }
+    }
+    return count;
+}
+
+/// Returns whether a node port remains visible in the current collapse state.
+fn isDisplayedPort(
+    self: *const Self,
+    node: VisualNode.Index,
+    direction: PortDirection,
+    port: u8,
+) bool {
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const outlet = switch (direction) {
+        .input => metadata.inputs[port],
+        .output => metadata.outputs[port],
+    };
+    // A node can be measured while its DSP record exists but its visual record
+    // has not been appended yet, such as during palette-based node creation.
+    // New visual nodes start expanded, so use that default until the indexed
+    // visual record is available.
+    const outlets_collapsed = if (node.idx < self.nodes.len)
+        self.nodes.items(.outlets_collapsed)[node.idx]
+    else
+        false;
+    if (!outlets_collapsed or !outlet.collapsable)
+        return true;
+
+    return switch (direction) {
+        .input => !self.dsp.nodes.items(.inputs)[node.idx][port].isNoop(),
+        .output => self.dsp.nodes.items(.output_connected)[node.idx][port],
     };
 }
 
@@ -561,8 +670,24 @@ fn displayedPortSlot(
 ) ?usize {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (state != .group) {
-        const count = self.displayedPortCount(node, direction);
-        return if (port < count) port else null;
+        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const port_count = switch (direction) {
+            .input => metadata.input_count,
+            .output => metadata.output_count,
+        };
+        if (port >= port_count or !self.isDisplayedPort(node, direction, port)) return null;
+
+        var slot: usize = 0;
+        var marker_added = false;
+        for (0..port) |candidate| {
+            if (self.isDisplayedPort(node, direction, @intCast(candidate))) {
+                slot += 1;
+            } else if (!marker_added) {
+                slot += 1;
+                marker_added = true;
+            }
+        }
+        return slot;
     }
 
     const bindings = switch (direction) {
@@ -587,8 +712,26 @@ fn displayedPortAtSlot(
 ) ?u8 {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (state != .group) {
-        const count = self.displayedPortCount(node, direction);
-        return if (slot < count) @intCast(slot) else null;
+        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const port_count = switch (direction) {
+            .input => metadata.input_count,
+            .output => metadata.output_count,
+        };
+        var current_slot: usize = 0;
+        var marker_added = false;
+        for (0..port_count) |port| {
+            if (!self.isDisplayedPort(node, direction, @intCast(port))) {
+                if (!marker_added) {
+                    if (current_slot == slot) return null;
+                    current_slot += 1;
+                    marker_added = true;
+                }
+                continue;
+            }
+            if (current_slot == slot) return @intCast(port);
+            current_slot += 1;
+        }
+        return null;
     }
 
     const bindings = switch (direction) {
@@ -600,6 +743,30 @@ fn displayedPortAtSlot(
         if (binding == null) continue;
         if (current_slot == slot) return @intCast(port);
         current_slot += 1;
+    }
+    return null;
+}
+
+/// Returns the compact display slot reserved for hidden outlets on one side.
+fn collapsedMarkerSlot(
+    self: *const Self,
+    node: VisualNode.Index,
+    direction: PortDirection,
+) ?usize {
+    if (!self.nodes.items(.outlets_collapsed)[node.idx]) return null;
+
+    const state = self.dsp.nodes.items(.state)[node.idx];
+    if (state == .group) return null;
+    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const port_count = switch (direction) {
+        .input => metadata.input_count,
+        .output => metadata.output_count,
+    };
+
+    var slot: usize = 0;
+    for (0..port_count) |port| {
+        if (!self.isDisplayedPort(node, direction, @intCast(port))) return slot;
+        slot += 1;
     }
     return null;
 }
@@ -661,9 +828,21 @@ pub fn addNode(
     node: DSP.Node.Index,
     position: Position,
 ) !void {
+    return self.addNodeWithCollapse(gpa, node, position, false);
+}
+
+/// Adds one visual node with an explicit persisted outlet-collapse state.
+pub fn addNodeWithCollapse(
+    self: *Self,
+    gpa: std.mem.Allocator,
+    node: DSP.Node.Index,
+    position: Position,
+    outlets_collapsed: bool,
+) !void {
     try self.nodes.append(gpa, .{
         .dsp_node = node,
         .position = position,
+        .outlets_collapsed = outlets_collapsed,
     });
 
     // Hidden nodes remain in the index-aligned visual array, but do not take
@@ -1312,6 +1491,34 @@ fn writeNodeBody(
         const outlet_x = x + @as(i64, @intCast(footprint.width - 1));
         if (outlet_x >= 0 and outlet_y >= 0)
             try display.write(gpa, &outlet, @intCast(outlet_x), @intCast(outlet_y), background, color);
+    }
+
+    const collapsed_marker = [_]u8{'*'};
+    if (self.collapsedMarkerSlot(node, .input)) |slot| {
+        const marker_y = y + @as(i64, @intCast(self.outletYOffset(
+            footprint,
+            self.displayedPortCount(node, .input),
+            slot,
+        )));
+        if (x >= 0 and marker_y >= 0)
+            try display.write(gpa, &collapsed_marker, @intCast(x), @intCast(marker_y), background, .gray);
+    }
+    if (self.collapsedMarkerSlot(node, .output)) |slot| {
+        const marker_y = y + @as(i64, @intCast(self.outletYOffset(
+            footprint,
+            self.displayedPortCount(node, .output),
+            slot,
+        )));
+        const marker_x = x + @as(i64, @intCast(footprint.width - 1));
+        if (marker_x >= 0 and marker_y >= 0)
+            try display.write(
+                gpa,
+                &collapsed_marker,
+                @intCast(marker_x),
+                @intCast(marker_y),
+                background,
+                .gray,
+            );
     }
 
     if (metadata.can_link_parameters) {

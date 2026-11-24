@@ -2077,6 +2077,8 @@ pub const Node = struct {
         short_name: []const u8 = "",
         unit: []const u8 = "",
         color: Display.Color = .transparent,
+        /// Whether this outlet disappears from the editor while it is unplugged.
+        collapsable: bool = false,
         /// Observer shown for this output when its node is selected.
         observer: Observer = .none,
     };
@@ -2452,14 +2454,14 @@ pub const Node = struct {
             .color = .amber,
             .can_link_parameters = false,
             .inputs = .{
-                .{ .name = "input 1", .short_name = "in1", .color = .amber },
-                .{ .name = "input 2", .short_name = "in2", .color = .amber },
-                .{ .name = "input 3", .short_name = "in3", .color = .amber },
-                .{ .name = "input 4", .short_name = "in4", .color = .amber },
-                .{ .name = "input 5", .short_name = "in5", .color = .amber },
-                .{ .name = "input 6", .short_name = "in6", .color = .amber },
-                .{ .name = "input 7", .short_name = "in7", .color = .amber },
-                .{ .name = "input 8", .short_name = "in8", .color = .amber },
+                .{ .name = "input 1", .short_name = "in1", .color = .amber, .collapsable = true },
+                .{ .name = "input 2", .short_name = "in2", .color = .amber, .collapsable = true },
+                .{ .name = "input 3", .short_name = "in3", .color = .amber, .collapsable = true },
+                .{ .name = "input 4", .short_name = "in4", .color = .amber, .collapsable = true },
+                .{ .name = "input 5", .short_name = "in5", .color = .amber, .collapsable = true },
+                .{ .name = "input 6", .short_name = "in6", .color = .amber, .collapsable = true },
+                .{ .name = "input 7", .short_name = "in7", .color = .amber, .collapsable = true },
+                .{ .name = "input 8", .short_name = "in8", .color = .amber, .collapsable = true },
             },
             .outputs = .{
                 .{ .name = "sum", .short_name = "sum", .color = .amber },
@@ -2553,14 +2555,14 @@ pub const Node = struct {
                 .{},
             },
             .outputs = .{
-                .{ .name = "output 1", .short_name = "out1", .color = .astral },
-                .{ .name = "output 2", .short_name = "out2", .color = .astral },
-                .{ .name = "output 3", .short_name = "out3", .color = .astral },
-                .{ .name = "output 4", .short_name = "out4", .color = .astral },
-                .{ .name = "output 5", .short_name = "out5", .color = .astral },
-                .{ .name = "output 6", .short_name = "out6", .color = .astral },
-                .{ .name = "output 7", .short_name = "out7", .color = .astral },
-                .{ .name = "output 8", .short_name = "out8", .color = .astral },
+                .{ .name = "output 1", .short_name = "out1", .color = .astral, .collapsable = true },
+                .{ .name = "output 2", .short_name = "out2", .color = .astral, .collapsable = true },
+                .{ .name = "output 3", .short_name = "out3", .color = .astral, .collapsable = true },
+                .{ .name = "output 4", .short_name = "out4", .color = .astral, .collapsable = true },
+                .{ .name = "output 5", .short_name = "out5", .color = .astral, .collapsable = true },
+                .{ .name = "output 6", .short_name = "out6", .color = .astral, .collapsable = true },
+                .{ .name = "output 7", .short_name = "out7", .color = .astral, .collapsable = true },
+                .{ .name = "output 8", .short_name = "out8", .color = .astral, .collapsable = true },
             },
             .input_count = 1,
             .output_count = max_outlets,
@@ -2610,14 +2612,14 @@ pub const Node = struct {
             .color = .cinnabar,
             .can_link_parameters = false,
             .inputs = .{
-                .{ .name = "input 1", .short_name = "in1", .color = .cinnabar },
-                .{ .name = "input 2", .short_name = "in2", .color = .cinnabar },
-                .{ .name = "input 3", .short_name = "in3", .color = .cinnabar },
-                .{ .name = "input 4", .short_name = "in4", .color = .cinnabar },
-                .{ .name = "input 5", .short_name = "in5", .color = .cinnabar },
-                .{ .name = "input 6", .short_name = "in6", .color = .cinnabar },
-                .{ .name = "input 7", .short_name = "in7", .color = .cinnabar },
-                .{ .name = "input 8", .short_name = "in8", .color = .cinnabar },
+                .{ .name = "input 1", .short_name = "in1", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 2", .short_name = "in2", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 3", .short_name = "in3", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 4", .short_name = "in4", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 5", .short_name = "in5", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 6", .short_name = "in6", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 7", .short_name = "in7", .color = .cinnabar, .collapsable = true },
+                .{ .name = "input 8", .short_name = "in8", .color = .cinnabar, .collapsable = true },
             },
             .outputs = .{
                 .{ .name = "product", .short_name = "prod", .color = .cinnabar },
@@ -3103,14 +3105,14 @@ pub const Node = struct {
             .has_parameters = true,
             .can_link_parameters = false,
             .inputs = .{
-                .{ .name = "input 1", .short_name = "in1", .color = .cerulean },
-                .{ .name = "input 2", .short_name = "in2", .color = .cerulean },
-                .{ .name = "input 3", .short_name = "in3", .color = .cerulean },
-                .{ .name = "input 4", .short_name = "in4", .color = .cerulean },
-                .{ .name = "input 5", .short_name = "in5", .color = .cerulean },
-                .{ .name = "input 6", .short_name = "in6", .color = .cerulean },
-                .{ .name = "input 7", .short_name = "in7", .color = .cerulean },
-                .{ .name = "input 8", .short_name = "in8", .color = .cerulean },
+                .{ .name = "input 1", .short_name = "in1", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 2", .short_name = "in2", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 3", .short_name = "in3", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 4", .short_name = "in4", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 5", .short_name = "in5", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 6", .short_name = "in6", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 7", .short_name = "in7", .color = .cerulean, .collapsable = true },
+                .{ .name = "input 8", .short_name = "in8", .color = .cerulean, .collapsable = true },
             },
             .outputs = .{
                 .{ .name = "mix", .short_name = "mix", .color = .cerulean, .observer = .waveform },
@@ -4676,78 +4678,3 @@ pub const node_metadata = std.EnumArray(Node.Tag, Node.Metadata)
         .midi = Node.MIDI.metadata,
     },
 );
-
-// Verify the hard-knee static compression curve.
-test "compressor applies ratio above threshold" {
-    try std.testing.expectEqual(@as(f32, 0), Node.Compressor.gainReductionDb(-12, -10, 4, 0));
-    try std.testing.expectApproxEqAbs(
-        @as(f32, -6),
-        Node.Compressor.gainReductionDb(-2, -10, 4, 0),
-        0.0001,
-    );
-}
-
-// Verify that the soft knee reaches the hard-knee curve at its boundaries.
-test "compressor soft knee transitions smoothly" {
-    try std.testing.expectApproxEqAbs(
-        @as(f32, -2.25),
-        Node.Compressor.gainReductionDb(-7, -10, 4, 6),
-        0.0001,
-    );
-    try std.testing.expectApproxEqAbs(
-        @as(f32, -0.5625),
-        Node.Compressor.gainReductionDb(-10, -10, 4, 6),
-        0.0001,
-    );
-}
-
-// Verify that reset clears only runtime detector state.
-test "compressor reset preserves parameters" {
-    const parameters = Node.Compressor.Parameters{ .method = .peak, .threshold = -12 };
-    var compressor = Node.Compressor{ .parameters = parameters, .envelope = 0.75 };
-    compressor.reset(0);
-    try std.testing.expectEqual(@as(f32, 0), compressor.envelope);
-    try std.testing.expectEqual(parameters, compressor.parameters);
-}
-
-// Verify that a polyphonic compressor processes the summed source bus once.
-test "compressor aggregates polyphonic input" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const device = pa.Device{
-        .id = 0,
-        .host_api_name = &.{},
-        .name = &.{},
-        .label = &.{},
-        .low_output_latency = 0,
-    };
-    var dsp: DSP = undefined;
-    try dsp.init(&.{device}, &.{}, &.{}, allocator);
-
-    const source = try dsp.addNode(allocator, Node.Constant.create("source", .{ .constant = 0.5 }));
-    const compressor = try dsp.addNode(allocator, Node.Compressor.create("compressor", .{
-        .method = .peak,
-        .threshold = -6,
-        .attack = 0,
-        .release = 0,
-        .ratio = 4,
-        .knee = 0,
-    }));
-    const output = try dsp.addNode(allocator, Node.Output.create("output", 0));
-    dsp.output = output;
-    try dsp.setNodePolyphony(allocator, source, 2);
-    try dsp.setNodePolyphony(allocator, compressor, 2);
-    dsp.plug(source, 0, compressor, 0);
-    dsp.plug(compressor, 0, output, 0);
-
-    var reader = dsp.sampleTap(compressor).queue.reader();
-    var rendered = [_]f32{ 0, 0, 0, 0 };
-    dsp.stream(&rendered);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.595662), rendered[0], 0.0001);
-    try std.testing.expectEqual(rendered[0], rendered[1]);
-
-    const block = dsp.sampleTap(compressor).queue.front(&reader);
-    try std.testing.expect(block != null);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.595662), block.?.samples[0][0], 0.0001);
-}

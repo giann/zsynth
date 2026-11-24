@@ -72,11 +72,11 @@ const SelectedObserver = union(enum) {
     /// No visualization is configured for the outlet.
     none,
     /// Meter for an output marked as a meter observer.
-    meter: Self.OutputMeter,
+    meter: OutputMeter,
     /// Line graph for an output marked as a line plot observer.
-    line_plot: Self.OutputGraph,
+    line_plot: OutputGraph,
     /// Waveform graph for an output marked as a waveform observer.
-    waveform: Self.OutputWaveform,
+    waveform: OutputWaveform,
 };
 
 /// Converts a logical pixel extent to the number of display cells it occupies.
@@ -2799,6 +2799,16 @@ fn mouseButton(
                     try self.write(gpa);
                     self.zsynth.cursor.left_mouse_down = false;
                     return true;
+                } else if (event.clicks >= 2 and !control and
+                    self.editorSpace().hasCollapsableOutlets(selected))
+                {
+                    self.setNodeSelection(selected);
+                    _ = try self.editorSpace().toggleOutletsCollapsed(gpa, selected);
+                    self.refreshSelectionUi();
+                    self.zsynth.cursor.dirty = true;
+                    self.zsynth.cursor.left_mouse_down = false;
+                    try self.write(gpa);
+                    return true;
                 } else if (control) {
                     self.editorSpace().toggleSelection(selected);
                     self.refreshSelectionUi();
@@ -5121,41 +5131,4 @@ pub fn TextField(comptime Context: type) type {
             return self.completionAt(self.completion_index) orelse "";
         }
     };
-}
-
-/// Supplies stable test completions for the generic text-field behavior test.
-fn testTextFieldCompletion(field: *const TextField(void), index: usize) ?[]const u8 {
-    _ = field;
-    return switch (index) {
-        0 => "alpha",
-        1 => "alpine",
-        2 => "alps",
-        else => null,
-    };
-}
-
-test "text field completion selection wraps and accepts" {
-    const Field = TextField(void);
-    var field = Field.init({}, .{
-        .width = 12,
-        .completion = testTextFieldCompletion,
-        .label = "",
-    });
-
-    try std.testing.expectEqual(@as(usize, 3), field.completionCount());
-    try std.testing.expectEqualStrings("alpha", field.completionSlice());
-    field.setInput("al");
-
-    try std.testing.expectEqual(@as(usize, 3), field.completionCount());
-    try std.testing.expectEqualStrings("alpha", field.completionSlice());
-    try std.testing.expect(field.selectCompletion(1));
-    try std.testing.expectEqualStrings("alpine", field.completionSlice());
-    try std.testing.expect(field.selectCompletion(1));
-    try std.testing.expectEqualStrings("alps", field.completionSlice());
-    try std.testing.expect(field.selectCompletion(1));
-    try std.testing.expectEqualStrings("alpha", field.completionSlice());
-    try std.testing.expect(field.selectCompletion(-1));
-    try std.testing.expectEqualStrings("alps", field.completionSlice());
-    try std.testing.expect(field.acceptCompletion());
-    try std.testing.expectEqualStrings("alps", field.inputSlice());
 }

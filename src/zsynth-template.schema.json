@@ -47,6 +47,7 @@
         "color": { "$ref": "#/$defs/uint32" },
         "x": { "$ref": "#/$defs/int32" },
         "y": { "$ref": "#/$defs/int32" },
+        "outlets_collapsed": { "type": "boolean" },
         "inputs": { "type": "array", "items": { "$ref": "#/$defs/connection" } },
         "parameter_source": { "$ref": "#/$defs/uint32" },
         "polyphony": { "$ref": "#/$defs/uint32" },

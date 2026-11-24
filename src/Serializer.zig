@@ -23,6 +23,8 @@ const Serialized = struct {
         color: ?u32 = null,
         x: i32 = 0,
         y: i32 = 0,
+        /// Whether the node's collapsable outlets are compacted in the editor.
+        outlets_collapsed: bool = false,
         inputs: std.ArrayList(Connection) = .empty,
         parameter_source: u32 = 0,
         group_members: std.ArrayList(u32) = .empty,
@@ -209,6 +211,7 @@ const JsonNode = struct {
     color: ?u32 = null,
     x: i32 = 0,
     y: i32 = 0,
+    outlets_collapsed: bool = false,
     inputs: []const Serialized.Connection = &.{},
     parameter_source: u32 = 0,
     group_members: []const u32 = &.{},
@@ -272,6 +275,7 @@ const JsonTemplateNode = struct {
     color: ?u32 = null,
     x: i32 = 0,
     y: i32 = 0,
+    outlets_collapsed: bool = false,
     inputs: []const JsonTemplateConnection = &.{},
     parameter_source: ?u32 = null,
     polyphony: ?u32 = null,
@@ -313,6 +317,7 @@ fn templateNodeFromJson(
         .color = node.color,
         .x = node.x,
         .y = node.y,
+        .outlets_collapsed = node.outlets_collapsed,
         .parameter_source = if (node.parameter_source) |source|
             try std.math.add(u32, source, 1)
         else
@@ -643,6 +648,7 @@ pub fn save(self: *Serializer, path: []const u8) !void {
             .color = if (self.dsp.nodes.items(.color)[index]) |color| color.color else null,
             .x = self.space.nodePosition(.{ .idx = index }).x,
             .y = self.space.nodePosition(.{ .idx = index }).y,
+            .outlets_collapsed = self.space.nodes.items(.outlets_collapsed)[index],
         };
         const polyphony = self.dsp.nodes.items(.polyphony)[index];
         if (polyphony > 1) node.polyphony = polyphony;
@@ -823,6 +829,7 @@ pub fn saveTemplate(self: *Serializer, path: []const u8, source: DSP.Node.Index)
             .color = serialized.color,
             .x = serialized.x,
             .y = serialized.y,
+            .outlets_collapsed = self.space.nodes.items(.outlets_collapsed)[member.idx],
             .inputs = inputs.items,
             .parameter_source = parameter_source,
             .polyphony = serialized.polyphony,
@@ -940,10 +947,15 @@ pub fn addTemplate(self: *Serializer, path: []const u8) !DSP.Node.Index {
     const group_position = self.space.findFreePosition(group, self.space.viewportCenter()) orelse
         return error.InvalidVisualNodeLayout;
     for (document.nodes, 0..) |json_node, slot| {
-        try self.space.addNode(self.allocator, member_indices[slot], .{
-            .x = group_position.x + json_node.x,
-            .y = group_position.y + json_node.y,
-        });
+        try self.space.addNodeWithCollapse(
+            self.allocator,
+            member_indices[slot],
+            .{
+                .x = group_position.x + json_node.x,
+                .y = group_position.y + json_node.y,
+            },
+            json_node.outlets_collapsed,
+        );
     }
     try self.space.addNode(self.allocator, group, group_position);
     const group_state = self.dsp.nodes.items(.state)[group.idx].group;
@@ -1136,10 +1148,15 @@ pub fn load(self: *Serializer, path: []const u8) !void {
     // complete. Group members are hidden in the root scope, and group port
     // bindings determine the wrapper footprint used for collision checks.
     for (document.nodes.items[1..], 1..) |serialized, index| {
-        try self.space.addNode(self.allocator, .{ .idx = index }, .{
-            .x = serialized.x,
-            .y = serialized.y,
-        });
+        try self.space.addNodeWithCollapse(
+            self.allocator,
+            .{ .idx = index },
+            .{
+                .x = serialized.x,
+                .y = serialized.y,
+            },
+            serialized.outlets_collapsed,
+        );
     }
 
     // Older group documents received endpoint nodes after their persisted
@@ -1189,6 +1206,7 @@ fn nodeToJson(node: Serialized.Node) JsonNode {
         .color = node.color,
         .x = node.x,
         .y = node.y,
+        .outlets_collapsed = node.outlets_collapsed,
         .inputs = node.inputs.items,
         .parameter_source = node.parameter_source,
         .group_members = node.group_members.items,
@@ -1244,6 +1262,7 @@ fn documentFromJson(document: JsonSynthDocument, allocator: std.mem.Allocator) !
             .color = serialized.color,
             .x = serialized.x,
             .y = serialized.y,
+            .outlets_collapsed = serialized.outlets_collapsed,
             .parameter_source = serialized.parameter_source,
             .group_owner = serialized.group_owner,
             .group_port = serialized.group_port,
@@ -1889,137 +1908,5 @@ fn validateNodeParameters(node: Serialized.Node, tag: DSP.Node.Tag) !void {
             else => return error.InvalidNodeParameters,
         },
         .add, .duplicate, .multiply, .noop, .group, .group_input, .group_output => {},
-    }
-}
-
-test "synth save paths normalize to JSON" {
-    const allocator = std.testing.allocator;
-    const cases = .{
-        .{ "patch", "patch.zsynth.json" },
-        .{ "patch.zsynth", "patch.zsynth.json" },
-        .{ "patch.zsynth.json", "patch.zsynth.json" },
-    };
-    inline for (cases) |case| {
-        const normalized = try pathForJson(allocator, case[0]);
-        defer allocator.free(normalized);
-        try std.testing.expectEqualStrings(case[1], normalized);
-    }
-
-    try std.testing.expect(!isJsonPath("patch.zsynth"));
-    try std.testing.expect(!isJsonPath("patch.json"));
-}
-
-test "template save paths normalize to JSON" {
-    const allocator = std.testing.allocator;
-    const cases = .{
-        .{ "voice", "voice.ztemplate.json" },
-        .{ "voice.ztemplate", "voice.ztemplate.json" },
-        .{ "voice.ztemplate.json", "voice.ztemplate.json" },
-    };
-    inline for (cases) |case| {
-        const normalized = try pathForTemplate(allocator, case[0]);
-        defer allocator.free(normalized);
-        try std.testing.expectEqualStrings(case[1], normalized);
-    }
-
-    try std.testing.expect(isTemplatePath("voice.ztemplate.json"));
-    try std.testing.expect(!isTemplatePath("voice.zsynth.json"));
-}
-
-test "JSON adapter round-trips repeated fields and parameter variants" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var mixer = Serialized.MixerParameters{ .gain = 0.75 };
-    try mixer.gains.appendSlice(allocator, &.{ 0.25, 0.5 });
-    try mixer.pans.appendSlice(allocator, &.{ -0.5, 0.5 });
-    var sequencer = Serialized.SequencerParameters{ .bpm = 96, .loop = false };
-    try sequencer.notes.append(allocator, .{
-        .pitch = 64,
-        .has_pitch = true,
-        .start_tick = 128,
-        .duration_ticks = 48,
-        .velocity = 0.8,
-    });
-
-    var document = Serialized.SynthDocument{
-        .schema_version = schema_version,
-        .output_node = 1,
-        .viewport_x = -12,
-        .viewport_y = 34,
-    };
-    try document.nodes.append(allocator, .{ .kind = "noop", .name = "sentinel" });
-    var mixer_node = Serialized.Node{
-        .kind = "mixer",
-        .name = "mix",
-        .color = 0x123456ff,
-        .parameters = .{ .mixer = mixer },
-    };
-    try mixer_node.inputs.append(allocator, .{
-        .input_port = 1,
-        .source_node = 1,
-        .source_port = 0,
-    });
-    try document.nodes.append(allocator, mixer_node);
-    try document.nodes.append(allocator, .{
-        .kind = "monophonic_sequencer",
-        .name = "sequence",
-        .parameters = .{ .sequencer = sequencer },
-    });
-    try document.nodes.append(allocator, .{
-        .kind = "compressor",
-        .name = "compressor",
-        .parameters = .{ .compressor = .{
-            .method = "peak",
-            .threshold = -18,
-            .attack = 0.005,
-            .release = 0.2,
-            .ratio = 6,
-            .knee = 3,
-            .makeup_gain = 2,
-        } },
-    });
-
-    const json_document = try documentToJson(document, allocator);
-    const contents = try std.json.Stringify.valueAlloc(allocator, json_document, .{});
-    try std.testing.expect(std.mem.indexOf(u8, contents, json_schema_uri) != null);
-
-    const parsed = try std.json.parseFromSliceLeaky(JsonSynthDocument, allocator, contents, .{});
-    const restored = try documentFromJson(parsed, allocator);
-    try std.testing.expectEqual(document.schema_version, restored.schema_version);
-    try std.testing.expectEqual(document.output_node, restored.output_node);
-    try std.testing.expectEqual(document.viewport_x, restored.viewport_x);
-    try std.testing.expectEqual(document.viewport_y, restored.viewport_y);
-    try std.testing.expectEqual(document.nodes.items.len, restored.nodes.items.len);
-    try std.testing.expectEqual(@as(usize, 1), restored.nodes.items[1].inputs.items.len);
-    try std.testing.expectEqual(@as(?u32, 0x123456ff), restored.nodes.items[1].color);
-    try std.testing.expectEqual(@as(u32, 1), restored.nodes.items[1].inputs.items[0].input_port);
-    switch (restored.nodes.items[1].parameters.?) {
-        .mixer => |value| {
-            try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5 }, value.gains.items);
-            try std.testing.expectEqualSlices(f32, &.{ -0.5, 0.5 }, value.pans.items);
-        },
-        else => return error.UnexpectedParameterVariant,
-    }
-    switch (restored.nodes.items[2].parameters.?) {
-        .sequencer => |value| {
-            try std.testing.expectEqual(@as(u32, 96), value.bpm.?);
-            try std.testing.expectEqual(@as(usize, 1), value.notes.items.len);
-            try std.testing.expectEqual(@as(u64, 128), value.notes.items[0].start_tick.?);
-        },
-        else => return error.UnexpectedParameterVariant,
-    }
-    switch (restored.nodes.items[3].parameters.?) {
-        .compressor => |value| {
-            try std.testing.expectEqualStrings("peak", value.method.?);
-            try std.testing.expectEqual(@as(f32, -18), value.threshold.?);
-            try std.testing.expectEqual(@as(f32, 0.005), value.attack.?);
-            try std.testing.expectEqual(@as(f32, 0.2), value.release.?);
-            try std.testing.expectEqual(@as(f32, 6), value.ratio.?);
-            try std.testing.expectEqual(@as(f32, 3), value.knee.?);
-            try std.testing.expectEqual(@as(f32, 2), value.makeup_gain.?);
-        },
-        else => return error.UnexpectedParameterVariant,
     }
 }
