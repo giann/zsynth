@@ -27,14 +27,22 @@ pub const Source = struct {
             self.noteOff(note, 0);
             return;
         }
+        // Ignore repeated note-ons until the matching note-off arrives. Some
+        // physical keyboards can publish duplicate note-ons for one key press;
+        // treating those as new voices would retrigger the connected envelope.
+        var free_slot: ?*Held = null;
         for (&self.held) |*held| {
-            if (held.gate.load(.acquire) != 0) continue;
-            held.note.store(note, .monotonic);
-            held.velocity.store(velocity, .monotonic);
-            _ = held.trigger.fetchAdd(1, .monotonic);
-            held.gate.store(1, .release);
-            return;
+            if (held.gate.load(.acquire) != 0) {
+                if (held.note.load(.monotonic) == note) return;
+            } else if (free_slot == null) {
+                free_slot = held;
+            }
         }
+        const held = free_slot orelse return;
+        held.note.store(note, .monotonic);
+        held.velocity.store(velocity, .monotonic);
+        _ = held.trigger.fetchAdd(1, .monotonic);
+        held.gate.store(1, .release);
     }
 
     /// Releases the first active voice matching a MIDI note.
