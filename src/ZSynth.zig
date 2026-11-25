@@ -306,6 +306,15 @@ fn loop(self: *Self, allocator: std.mem.Allocator) !void {
         zgui.backend.newFrame(screen_width, screen_height, 1.0);
         // Let states write their display and rendering commands.
         try self.state_stack.render(allocator, &self.renderer, frame_delta);
+        // Submit the display after every state has finished writing it. This
+        // keeps its dirty-cell resource request in sync with the worker.
+        if (self.display.impl == .graphic)
+            try self.display.impl.graphic.render(
+                allocator,
+                &self.renderer,
+                frame_delta,
+                true,
+            );
         // Overlay the software cursor after the state has redrawn its display.
         try self.writeCursor(allocator);
         // Composite the transparent UI overlay above the regular display.

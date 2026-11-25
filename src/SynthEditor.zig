@@ -1588,7 +1588,9 @@ fn keyUpDown(
                     .waveform => |*waveform| waveform.reset(),
                 };
                 self.output_waveform.reset();
-                try self.writeSelectedParametersPane(gpa);
+                // The parameter pane owns ImGui windows and must be redrawn
+                // during the render phase after the next NewFrame call.
+                self.zsynth.cursor.dirty = true;
             }
         },
         .@"return", .kp_enter => {
@@ -3121,12 +3123,12 @@ fn mouseMoved(
     return true;
 }
 
-/// Rebuilds the text display and enqueues the graphic display renderer.
+/// Rebuilds the text display and prepares the graphic display contents.
 fn render(
     state_stack: *StateStack,
     gpa: std.mem.Allocator,
     state: StateStack.State.Index,
-    renderer: *Renderer,
+    _: *Renderer,
     dt: u64,
 ) StateStack.State.Error!void {
     // Resolve the concrete editor context for this frame.
@@ -3159,9 +3161,6 @@ fn render(
             try self.editorSpace().writeUiOverlay(gpa, &self.zsynth.ui_display, cell[0], cell[1]);
         }
     }
-    // Submit the graphic display only when that display backend is active.
-    if (self.zsynth.display.impl == .graphic)
-        try self.zsynth.display.impl.graphic.render(gpa, renderer, dt, true);
 }
 
 /// Removes a DSP node and its synchronized visual representation.
@@ -3683,8 +3682,10 @@ pub const OutletConnection = struct {
         _: *Renderer,
         _: u64,
     ) StateStack.State.Error!void {
-        // The editor rendered the base display first; this state only overlays the preview.
         const context = stateContext(state_stack, state);
+        // The display is retained between frames, so rebuild the base before
+        // drawing the new preview and thereby remove the previous route.
+        try context.editor.write(gpa);
         if (context.preview_path) |path|
             try context.editor.editorSpace().writePreviewPath(
                 gpa,
