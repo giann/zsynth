@@ -112,7 +112,7 @@ pub const Outlet = struct {
 /// Return the static metadata associated with a visual outlet.
 pub fn outletMetadata(self: *Self, outlet: Outlet) DSP.Node.OutletMetadata {
     const state = self.dsp.nodes.items(.state)[outlet.node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     if (std.meta.activeTag(state) == .group) {
         return switch (outlet.direction) {
             .input => self.dsp.groupOutletMetadata(outlet.node, .input, outlet.port),
@@ -179,7 +179,7 @@ fn writeSelectedOutletLabels(
 
     const footprint = self.nodeFootprint(node);
     const state = self.dsp.nodes.items(.state)[node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     const screen_left = @as(i64, footprint.x) - @as(i64, self.viewport.x);
     const screen_top = @as(i64, footprint.y) - @as(i64, self.viewport.y);
 
@@ -468,7 +468,7 @@ pub fn revealNode(self: *Self, node: VisualNode.Index) bool {
 
     const footprint = self.nodeFootprint(node);
     const state = self.dsp.nodes.items(.state)[node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     var input_label_width: i64 = 0;
     for (0..metadata.input_count) |port|
         input_label_width = @max(input_label_width, @as(i64, @intCast(metadata.inputs[port].short_name.len)));
@@ -528,7 +528,7 @@ pub fn nodePosition(self: *Self, node: VisualNode.Index) Position {
 pub fn hasCollapsableOutlets(self: *const Self, node: VisualNode.Index) bool {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (state == .group) return false;
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
 
     for (metadata.inputs[0..metadata.input_count]) |outlet|
         if (outlet.collapsable) return true;
@@ -613,7 +613,7 @@ fn displayedPortCount(self: *const Self, node: VisualNode.Index, direction: Port
         }
         return count;
     }
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     const port_count = switch (direction) {
         .input => metadata.input_count,
         .output => metadata.output_count,
@@ -639,7 +639,7 @@ fn isDisplayedPort(
     port: u8,
 ) bool {
     const state = self.dsp.nodes.items(.state)[node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     const outlet = switch (direction) {
         .input => metadata.inputs[port],
         .output => metadata.outputs[port],
@@ -670,7 +670,7 @@ fn displayedPortSlot(
 ) ?usize {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (state != .group) {
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
         const port_count = switch (direction) {
             .input => metadata.input_count,
             .output => metadata.output_count,
@@ -712,7 +712,7 @@ fn displayedPortAtSlot(
 ) ?u8 {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (state != .group) {
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
         const port_count = switch (direction) {
             .input => metadata.input_count,
             .output => metadata.output_count,
@@ -757,7 +757,7 @@ fn collapsedMarkerSlot(
 
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (state == .group) return null;
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     const port_count = switch (direction) {
         .input => metadata.input_count,
         .output => metadata.output_count,
@@ -1452,7 +1452,7 @@ fn writeNodeBody(
     const x: i64 = @as(i64, footprint.x) - @as(i64, self.viewport.x);
     const y: i64 = @as(i64, footprint.y) - @as(i64, self.viewport.y);
     const state = self.dsp.nodes.items(.state)[node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     const name = self.dsp.nodes.items(.name)[node.idx];
     var endpoint_name: [4]u8 = undefined;
     const displayed_node_name: []const u8 = switch (self.scope) {
@@ -1803,7 +1803,7 @@ fn parameterTargetX(self: *Self, node: VisualNode.Index) i32 {
 /// Returns the footprint a node would occupy at a candidate position.
 fn nodeFootprintAt(self: *Self, node: VisualNode.Index, position: Position) Bound {
     const state = self.dsp.nodes.items(.state)[node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
 
     const outlet_count = @max(
         @max(
@@ -1836,7 +1836,7 @@ pub fn nodeColor(self: *Self, node: VisualNode.Index) Display.Color {
     const state = self.dsp.nodes.items(.state)[node.idx];
     if (!self.isOutputReachable(node)) return Display.Color.gray;
     return self.dsp.nodes.items(.color)[node.idx] orelse
-        DSP.node_metadata.get(std.meta.activeTag(state)).color;
+        DSP.node_metadata.getPtrConst(std.meta.activeTag(state)).color;
 }
 
 fn outletYOffset(_: *const Self, footprint: Bound, outlet_count: u8, port: usize) i32 {
@@ -1887,7 +1887,7 @@ pub fn outletAt(self: *Self, position: Position) ?Outlet {
         const visual_node = VisualNode.Index{ .idx = node_index };
         const footprint = self.nodeFootprint(visual_node);
         const state = self.dsp.nodes.items(.state)[node_index];
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
 
         for (0..DSP.max_outlets) |slot| {
             const port = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
@@ -1981,7 +1981,7 @@ pub fn rebuildOccupancy(self: *Self, gpa: std.mem.Allocator) !bool {
 
         const footprint = self.nodeFootprint(visual_node);
         const state = self.dsp.nodes.items(.state)[node_index];
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
 
         for (0..DSP.max_outlets) |slot| {
             _ = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
@@ -2032,7 +2032,7 @@ pub fn occupyLinkAnchors(self: *Self, gpa: std.mem.Allocator) !void {
 
         const footprint = self.nodeFootprint(visual_node);
         const state = self.dsp.nodes.items(.state)[node_index];
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
 
         for (0..DSP.max_outlets) |slot| {
             _ = self.displayedPortAtSlot(visual_node, .input, slot) orelse continue;
@@ -2159,7 +2159,7 @@ pub fn computePaths(self: *Self, gpa: std.mem.Allocator) !void {
         const node = VisualNode.Index{ .idx = node_index };
         if (node.isNoop() or self.isHiddenNode(node)) continue;
         const state = self.dsp.nodes.items(.state)[node_index];
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
 
         for (0..metadata.input_count) |input_port| {
             const connection = node_inputs[input_port];
@@ -2288,7 +2288,7 @@ fn computePathForParameter(
     bound: SearchBound,
 ) !void {
     const source_state = self.dsp.nodes.items(.state)[source.idx];
-    if (!DSP.node_metadata.get(std.meta.activeTag(source_state)).can_link_parameters)
+    if (!DSP.node_metadata.getPtrConst(std.meta.activeTag(source_state)).can_link_parameters)
         return;
 
     const source_footprint = self.nodeFootprint(source);
@@ -2331,7 +2331,7 @@ pub fn recomputePathsForNode(self: *Self, gpa: std.mem.Allocator, node: VisualNo
         const destination = VisualNode.Index{ .idx = destination_index };
         if (destination.isNoop() or self.isHiddenNode(destination)) continue;
         const state = self.dsp.nodes.items(.state)[destination_index];
-        const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+        const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
         for (0..metadata.input_count) |input_port| {
             const connection = node_inputs[input_port];
             if (connection.isNoop() or self.isHiddenNode(connection.node)) continue;

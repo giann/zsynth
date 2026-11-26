@@ -1,0 +1,94 @@
+{
+  "$schema": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth-template.schema.json",
+  "schema_version": 1,
+  "name": "midi-osc",
+  "nodes": [
+    {
+      "kind": "midi",
+      "name": "midi",
+      "x": -17,
+      "y": -15,
+      "inputs": [],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "midi": {
+          "source": 0,
+          "interface_name": "CoreMIDI",
+          "device_name": "MidiKeys"
+        }
+      }
+    },
+    {
+      "kind": "oscillator",
+      "name": "voice",
+      "x": 0,
+      "y": -15,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 0,
+          "source_port": 0,
+          "group_input": null
+        },
+        {
+          "input_port": 1,
+          "source_node": 2,
+          "source_port": 0,
+          "group_input": null
+        }
+      ],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "oscillator": {
+          "waveform": "sine",
+          "phase_offset": 0,
+          "default_frequency": 440,
+          "default_amplitude": 1
+        }
+      }
+    },
+    {
+      "kind": "adsr",
+      "name": "adsr",
+      "x": -1,
+      "y": -8,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 0,
+          "source_port": 1,
+          "group_input": null
+        },
+        {
+          "input_port": 1,
+          "source_node": 0,
+          "source_port": 2,
+          "group_input": null
+        }
+      ],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "adsr": {
+          "attack": 0,
+          "attack_curve": "exponential",
+          "decay": 0,
+          "decay_curve": "exponential",
+          "sustain": 1,
+          "release": 1,
+          "release_curve": "exponential"
+        }
+      }
+    }
+  ],
+  "group_inputs": [],
+  "group_outputs": [
+    {
+      "group_port": 0,
+      "member_node": 1,
+      "member_port": 0
+    }
+  ]
+}

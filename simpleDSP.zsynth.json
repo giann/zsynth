@@ -1,0 +1,715 @@
+{
+  "$schema": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth.schema.json",
+  "schema_version": 1,
+  "output_node": 1,
+  "nodes": [
+    {
+      "kind": "noop",
+      "name": "noop",
+      "color": null,
+      "x": 0,
+      "y": 0,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "output",
+      "name": "output",
+      "color": null,
+      "x": 44,
+      "y": -10,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 29,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": null,
+      "parameters": {
+        "output": {
+          "host_api_name": "Core Audio",
+          "device_name": "MacBook Pro Speakers"
+        }
+      }
+    },
+    {
+      "kind": "midi",
+      "name": "midi",
+      "color": null,
+      "x": -73,
+      "y": -39,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "midi": {
+          "source": 0,
+          "interface_name": "CoreMIDI",
+          "device_name": "MidiKeys"
+        }
+      }
+    },
+    {
+      "kind": "multiply",
+      "name": "octave",
+      "color": null,
+      "x": -27,
+      "y": 4,
+      "outlets_collapsed": true,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 25,
+          "source_port": 1
+        },
+        {
+          "input_port": 1,
+          "source_node": 22,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": null
+    },
+    {
+      "kind": "adsr",
+      "name": "adsr",
+      "color": null,
+      "x": -57,
+      "y": -32,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 2,
+          "source_port": 1
+        },
+        {
+          "input_port": 1,
+          "source_node": 2,
+          "source_port": 2
+        },
+        {
+          "input_port": 2,
+          "source_node": 2,
+          "source_port": 4
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "adsr": {
+          "attack": 0.009999999776482582,
+          "attack_curve": "exponential",
+          "decay": 0,
+          "decay_curve": "exponential",
+          "sustain": 1,
+          "release": 0.6000000238418579,
+          "release_curve": "exponential"
+        }
+      }
+    },
+    {
+      "kind": "group",
+      "name": "midi-osc",
+      "color": 2775921151,
+      "x": -60,
+      "y": -11,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [
+        2,
+        4
+      ],
+      "group_inputs": [],
+      "group_outputs": [
+        {
+          "group_port": 0,
+          "member_node": 2,
+          "member_port": 0
+        },
+        {
+          "group_port": 1,
+          "member_node": 4,
+          "member_port": 0
+        }
+      ],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 0,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 2,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 0,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 1,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 4,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 1,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 2,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 2,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 3,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 3,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 4,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 4,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 5,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 5,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 6,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 6,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_input",
+      "name": "group input",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 7,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "group_output",
+      "name": "group output",
+      "color": null,
+      "x": -56,
+      "y": -24,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": 5,
+      "group_port": 7,
+      "polyphony": null,
+      "parameters": null
+    },
+    {
+      "kind": "constant",
+      "name": "oct-ratio",
+      "color": null,
+      "x": -46,
+      "y": 5,
+      "outlets_collapsed": false,
+      "inputs": [],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "constant": {
+          "constant": 0.5
+        }
+      }
+    },
+    {
+      "kind": "mixer",
+      "name": "mix",
+      "color": 3758104063,
+      "x": 8,
+      "y": -11,
+      "outlets_collapsed": true,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 28,
+          "source_port": 0
+        },
+        {
+          "input_port": 1,
+          "source_node": 26,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "mixer": {
+          "gain": 1,
+          "gains": [
+            0.5,
+            0.5,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "pans": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "kind": "duplicate",
+      "name": "dupe-amp",
+      "color": 2961570047,
+      "x": -43,
+      "y": -6,
+      "outlets_collapsed": true,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 5,
+          "source_port": 1
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": null
+    },
+    {
+      "kind": "duplicate",
+      "name": "dupe-freq",
+      "color": 1613866495,
+      "x": -44,
+      "y": -17,
+      "outlets_collapsed": true,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 5,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": null
+    },
+    {
+      "kind": "oscillator",
+      "name": "voice2",
+      "color": 3492126975,
+      "x": -24,
+      "y": -10,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 3,
+          "source_port": 0
+        },
+        {
+          "input_port": 1,
+          "source_node": 24,
+          "source_port": 1
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "oscillator": {
+          "waveform": "sawtooth",
+          "phase_offset": 0,
+          "default_frequency": 440,
+          "default_amplitude": 1
+        }
+      }
+    },
+    {
+      "kind": "oscillator",
+      "name": "voice1",
+      "color": 852502015,
+      "x": -24,
+      "y": -17,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 25,
+          "source_port": 0
+        },
+        {
+          "input_port": 1,
+          "source_node": 24,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "oscillator": {
+          "waveform": "sine",
+          "phase_offset": 0,
+          "default_frequency": 440,
+          "default_amplitude": 1
+        }
+      }
+    },
+    {
+      "kind": "multimode_filter",
+      "name": "filter",
+      "color": null,
+      "x": -9,
+      "y": -18,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 27,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "filter": {
+          "type": "notch",
+          "default_cutoff": 300,
+          "default_resonance": 0
+        }
+      }
+    },
+    {
+      "kind": "equalizer",
+      "name": "eql",
+      "color": null,
+      "x": 24,
+      "y": -15,
+      "outlets_collapsed": false,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 23,
+          "source_port": 0
+        }
+      ],
+      "parameter_source": 0,
+      "group_members": [],
+      "group_inputs": [],
+      "group_outputs": [],
+      "group_owner": null,
+      "group_port": null,
+      "polyphony": 8,
+      "parameters": {
+        "equalizer": {
+          "default_gains": [
+            10,
+            3,
+            0,
+            -1,
+            -3,
+            -5
+          ]
+        }
+      }
+    }
+  ],
+  "viewport_x": -57,
+  "viewport_y": -30
+}

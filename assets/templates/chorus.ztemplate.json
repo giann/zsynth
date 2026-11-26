@@ -1,0 +1,175 @@
+{
+  "$schema": "https://raw.githubusercontent.com/giann/zsynth/main/src/zsynth-template.schema.json",
+  "schema_version": 1,
+  "name": "chorus",
+  "nodes": [
+    {
+      "kind": "duplicate",
+      "name": "dupe",
+      "color": null,
+      "x": -36,
+      "y": -8,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": null,
+          "source_port": 0,
+          "group_input": 0
+        }
+      ],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": null
+    },
+    {
+      "kind": "delay",
+      "name": "delay",
+      "color": null,
+      "x": -11,
+      "y": 2,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 0,
+          "source_port": 1,
+          "group_input": null
+        },
+        {
+          "input_port": 2,
+          "source_node": 3,
+          "source_port": 0,
+          "group_input": null
+        }
+      ],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "delay": {
+          "delay_ms": 12,
+          "wetness": 1,
+          "feedback": 1,
+          "decay": 0
+        }
+      }
+    },
+    {
+      "kind": "constant",
+      "name": "cst",
+      "color": null,
+      "x": -36,
+      "y": 24,
+      "inputs": [],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "constant": {
+          "constant": 12
+        }
+      }
+    },
+    {
+      "kind": "add",
+      "name": "add",
+      "color": null,
+      "x": -24,
+      "y": 12,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 4,
+          "source_port": 0,
+          "group_input": null
+        },
+        {
+          "input_port": 1,
+          "source_node": 2,
+          "source_port": 0,
+          "group_input": null
+        }
+      ],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": null
+    },
+    {
+      "kind": "oscillator",
+      "name": "lfo",
+      "color": null,
+      "x": -45,
+      "y": 19,
+      "inputs": [],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "oscillator": {
+          "waveform": "sine",
+          "phase_offset": 0,
+          "default_frequency": 0.20000000298023224,
+          "default_amplitude": 5
+        }
+      }
+    },
+    {
+      "kind": "mixer",
+      "name": "mix",
+      "color": null,
+      "x": 15,
+      "y": -8,
+      "inputs": [
+        {
+          "input_port": 0,
+          "source_node": 0,
+          "source_port": 0,
+          "group_input": null
+        },
+        {
+          "input_port": 1,
+          "source_node": 1,
+          "source_port": 0,
+          "group_input": null
+        }
+      ],
+      "parameter_source": null,
+      "polyphony": 8,
+      "parameters": {
+        "mixer": {
+          "gain": 1,
+          "gains": [
+            0.699999988079071,
+            0.5,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "pans": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "group_inputs": [
+    {
+      "group_port": 0,
+      "member_node": 0,
+      "member_port": 0
+    }
+  ],
+  "group_outputs": [
+    {
+      "group_port": 0,
+      "member_node": 5,
+      "member_port": 0
+    }
+  ]
+}

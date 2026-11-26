@@ -315,9 +315,7 @@ pub fn MapBucketedPool(
 
         pub fn hasAvailable(self: *Self, key: Key, size: Pool.Size) bool {
             if (self.map.getPtr(key)) |pool| {
-                if (pool.buckets.get(size)) |bucket| {
-                    return bucket.hasAvailable();
-                }
+                return pool.buckets.getPtrConst(size).hasAvailable();
             }
 
             return false;

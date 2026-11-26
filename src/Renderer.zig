@@ -834,7 +834,7 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
         var it = self.buffers.map.iterator();
         while (it.next()) |entry| {
             inline for (std.enums.values(BufferMapBucketedPool.Pool.Size)) |size| {
-                var bucket = entry.value_ptr.buckets.get(size);
+                const bucket = entry.value_ptr.buckets.getPtr(size);
                 var it2 = bucket.pool.liveHandles();
                 while (it2.next()) |buffer| {
                     sdl.releaseGPUBuffer(
@@ -852,7 +852,7 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
         var it = self.transfer_buffers.map.iterator();
         while (it.next()) |entry| {
             inline for (std.enums.values(TransferBufferMapBucketedPool.Pool.Size)) |size| {
-                var bucket = entry.value_ptr.buckets.get(size);
+                const bucket = entry.value_ptr.buckets.getPtr(size);
                 var it2 = bucket.pool.liveHandles();
                 while (it2.next()) |buffer| {
                     sdl.releaseGPUTransferBuffer(
@@ -892,7 +892,7 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
 pub fn loadImageAssetToTexture(self: *Self, gpa: std.mem.Allocator, asset: a.Asset) !AssetResource {
     if (self.assets.get(asset)) |texture| return texture;
 
-    std.debug.assert(a.assets_metadata.get(asset) == .image);
+    std.debug.assert(a.assets_metadata.getPtrConst(asset).* == .image);
 
     const image = try asset.loadImage();
 

@@ -30,9 +30,9 @@ pub const Asset = enum {
     tergel,
 
     fn loadRaw(self: @This(), gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
-        const metadata = assets_metadata.get(self);
+        const metadata = assets_metadata.getPtrConst(self);
 
-        std.debug.assert(metadata == .image);
+        std.debug.assert(metadata.* == .image);
 
         const file = try std.Io.Dir.cwd().openFile(
             io,
@@ -48,9 +48,9 @@ pub const Asset = enum {
     }
 
     pub fn loadImage(self: @This()) !stbi.Image {
-        const metadata = assets_metadata.get(self);
+        const metadata = assets_metadata.getPtrConst(self);
 
-        std.debug.assert(metadata == .image);
+        std.debug.assert(metadata.* == .image);
 
         // All GPU image textures are created as RGBA8, so expand source
         // images with fewer channels before uploading their pixel data.

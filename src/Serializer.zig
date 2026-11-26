@@ -50,6 +50,7 @@ const Serialized = struct {
             output,
             delay,
             input,
+            equalizer,
         };
 
         /// Stores the typed parameters for a node.
@@ -67,6 +68,7 @@ const Serialized = struct {
             output: OutputParameters,
             delay: DelayParameters,
             input: InputParameters,
+            equalizer: EqualizerParameters,
         };
     };
 
@@ -141,6 +143,12 @@ const Serialized = struct {
         type: ?[]const u8 = null,
         default_cutoff: ?f32 = null,
         default_resonance: ?f32 = null,
+    };
+
+    /// Persisted six-band equalizer default gains.
+    pub const EqualizerParameters = struct {
+        /// Default gain values in decibels, ordered by frequency band.
+        default_gains: std.ArrayList(f32) = .empty,
     };
 
     /// Persisted bit crusher parameters.
@@ -238,6 +246,7 @@ const JsonParameters = union(enum) {
     output: Serialized.OutputParameters,
     delay: Serialized.DelayParameters,
     input: Serialized.InputParameters,
+    equalizer: JsonEqualizerParameters,
 };
 
 /// Slice-based JSON representation of mixer parameters.
@@ -252,6 +261,12 @@ const JsonSequencerParameters = struct {
     bpm: ?u32 = null,
     notes: []const Serialized.Note = &.{},
     loop: ?bool = null,
+};
+
+/// Slice-based JSON representation of equalizer parameters.
+const JsonEqualizerParameters = struct {
+    /// Default gain values in decibels, ordered by frequency band.
+    default_gains: []const f32 = &.{},
 };
 
 /// Current on-disk version of a reusable group template.
@@ -364,7 +379,7 @@ fn validateTemplate(document: JsonTemplateDocument) !void {
                 return error.InvalidNodeParameters;
         }
 
-        const metadata = DSP.node_metadata.get(tag);
+        const metadata = DSP.node_metadata.getPtrConst(tag);
         for (node.inputs, 0..) |connection, connection_index| {
             if (connection.input_port >= metadata.input_count or
                 (connection.source_node == null and connection.group_input == null) or
@@ -381,7 +396,7 @@ fn validateTemplate(document: JsonTemplateDocument) !void {
                     DSP.Node.Tag,
                     document.nodes[source].kind,
                 ) orelse return error.UnknownNodeKind;
-                if (connection.source_port >= DSP.node_metadata.get(source_tag).output_count)
+                if (connection.source_port >= DSP.node_metadata.getPtrConst(source_tag).output_count)
                     return error.InvalidGraphReference;
             } else if (connection.group_input.? >= DSP.max_outlets) {
                 return error.InvalidGraphReference;
@@ -467,7 +482,7 @@ fn validateTemplateBindings(
         used_ports[binding.group_port] = true;
         const tag = std.meta.stringToEnum(DSP.Node.Tag, nodes[binding.member_node].kind) orelse
             return error.UnknownNodeKind;
-        const metadata = DSP.node_metadata.get(tag);
+        const metadata = DSP.node_metadata.getPtrConst(tag);
         const port_count = if (input) metadata.input_count else metadata.output_count;
         if (binding.member_port >= port_count)
             return error.InvalidGraphReference;
@@ -1055,8 +1070,6 @@ pub fn load(self: *Serializer, path: []const u8) !void {
         const node = try nodeFromSerialized(self, serialized, name);
         const actual = try self.dsp.addNode(self.allocator, node);
         std.debug.assert(actual.idx == index);
-        if (serialized.polyphony) |polyphony|
-            try self.dsp.setNodePolyphony(self.allocator, actual, @intCast(polyphony));
     }
 
     // Endpoint nodes may precede their owner after swap removal. Register them
@@ -1142,6 +1155,13 @@ pub fn load(self: *Serializer, path: []const u8) !void {
             );
             std.debug.assert(linked);
         }
+    }
+
+    // Apply saved voice counts only after graph wiring is complete so member,
+    // group, and endpoint caches are allocated against the final topology.
+    for (document.nodes.items, 0..) |serialized, index| {
+        if (serialized.polyphony) |polyphony|
+            try self.dsp.setNodePolyphony(self.allocator, .{ .idx = index }, @intCast(polyphony));
     }
 
     // Delay visual insertion until group membership and port bindings are
@@ -1244,6 +1264,7 @@ fn parametersToJson(parameters: ?Serialized.Node.parameters_union) ?JsonParamete
         .output => |item| .{ .output = item },
         .delay => |item| .{ .delay = item },
         .input => |item| .{ .input = item },
+        .equalizer => |item| .{ .equalizer = .{ .default_gains = item.default_gains.items } },
     };
 }
 
@@ -1310,6 +1331,11 @@ fn parametersFromJson(
         .output => |item| .{ .output = item },
         .delay => |item| .{ .delay = item },
         .input => |item| .{ .input = item },
+        .equalizer => |item| blk: {
+            var equalizer = Serialized.EqualizerParameters{};
+            try equalizer.default_gains.appendSlice(allocator, item.default_gains);
+            break :blk .{ .equalizer = equalizer };
+        },
     };
 }
 
@@ -1423,6 +1449,12 @@ fn parametersToSerialized(
             .default_cutoff = value.parameters.default_cutoff,
             .default_resonance = value.parameters.default_resonance,
         } },
+        .equalizer => |value| blk: {
+            var result = Serialized.EqualizerParameters{};
+            for (value.parameters.default_gains) |gain|
+                try result.default_gains.append(gpa, gain);
+            break :blk .{ .equalizer = result };
+        },
         .bit_crusher => |value| .{ .bit_crusher = .{
             .target_sample_rate = value.parameters.target_sample_rate,
             .bit_depth = value.parameters.bit_depth,
@@ -1582,6 +1614,14 @@ fn nodeFromSerialized(
             .default_resonance = value.default_resonance orelse 0,
         }), serialized.color);
     }
+    if (std.mem.eql(u8, serialized.kind, "equalizer")) {
+        const value = try requiredParameters(serialized, .equalizer);
+        if (value.default_gains.items.len != DSP.Node.Equalizer.band_count)
+            return error.InvalidNodeParameters;
+        return nodeWithColor(DSP.Node.Equalizer.create(name, .{
+            .default_gains = value.default_gains.items[0..DSP.Node.Equalizer.band_count].*,
+        }), serialized.color);
+    }
     if (std.mem.eql(u8, serialized.kind, "bit_crusher")) {
         const value = try requiredParameters(serialized, .bit_crusher);
         const bit_depth = value.bit_depth orelse 8;
@@ -1704,7 +1744,7 @@ fn validateDocument(document: Serialized.SynthDocument) !void {
                 else => {},
             }
         }
-        const metadata = DSP.node_metadata.get(tag);
+        const metadata = DSP.node_metadata.getPtrConst(tag);
         if (index != 0) {
             switch (tag) {
                 .noop => unreachable,
@@ -1718,6 +1758,7 @@ fn validateDocument(document: Serialized.SynthDocument) !void {
                 .monophonic_sequencer,
                 .adsr,
                 .multimode_filter,
+                .equalizer,
                 .bit_crusher,
                 .compressor,
                 .delay,
@@ -1733,7 +1774,7 @@ fn validateDocument(document: Serialized.SynthDocument) !void {
             if (connection.source_node == 0 or
                 connection.input_port >= metadata.input_count or
                 connection.source_node >= document.nodes.items.len or
-                connection.source_port >= DSP.node_metadata.get(
+                connection.source_port >= DSP.node_metadata.getPtrConst(
                     std.meta.stringToEnum(DSP.Node.Tag, document.nodes.items[connection.source_node].kind) orelse
                         return error.UnknownNodeKind,
                 ).output_count)
@@ -1772,8 +1813,8 @@ fn validateDocument(document: Serialized.SynthDocument) !void {
                     return error.InvalidGraphReference;
                 if (source_hash != target_hash) return error.InvalidGraphReference;
             } else if (source_tag != tag or
-                !DSP.node_metadata.get(tag).has_parameters or
-                !DSP.node_metadata.get(tag).can_link_parameters)
+                !DSP.node_metadata.getPtrConst(tag).has_parameters or
+                !DSP.node_metadata.getPtrConst(tag).can_link_parameters)
                 return error.InvalidGraphReference;
 
             for (document.nodes.items, 0..) |other, other_index| {
@@ -1836,7 +1877,7 @@ fn validateGroupBinding(
         return error.InvalidGraphReference;
     const tag = std.meta.stringToEnum(DSP.Node.Tag, nodes[binding.member_node].kind) orelse
         return error.UnknownNodeKind;
-    const metadata = DSP.node_metadata.get(tag);
+    const metadata = DSP.node_metadata.getPtrConst(tag);
     const count = if (input) metadata.input_count else metadata.output_count;
     if (binding.member_port >= count) return error.InvalidGraphReference;
 }
@@ -1875,6 +1916,13 @@ fn validateNodeParameters(node: Serialized.Node, tag: DSP.Node.Tag) !void {
         .multimode_filter => {
             const value = try requiredParameters(node, .filter);
             _ = try enumFromString(DSP.Node.MultimodeFilter.Type, value.type orelse "low_pass");
+        },
+        .equalizer => {
+            const value = try requiredParameters(node, .equalizer);
+            if (value.default_gains.items.len != DSP.Node.Equalizer.band_count)
+                return error.InvalidNodeParameters;
+            for (value.default_gains.items) |gain|
+                if (!std.math.isFinite(gain)) return error.InvalidNodeParameters;
         },
         .bit_crusher => {
             const value = try requiredParameters(node, .bit_crusher);

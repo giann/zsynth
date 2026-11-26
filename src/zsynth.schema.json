@@ -96,7 +96,8 @@
         { "$ref": "#/$defs/midiVariant" },
         { "$ref": "#/$defs/outputVariant" },
         { "$ref": "#/$defs/delayVariant" },
-        { "$ref": "#/$defs/inputVariant" }
+        { "$ref": "#/$defs/inputVariant" },
+        { "$ref": "#/$defs/equalizerVariant" }
       ]
     },
     "constantVariant": {
@@ -150,6 +151,10 @@
     "inputVariant": {
       "type": "object", "additionalProperties": false, "required": ["input"],
       "properties": { "input": { "$ref": "#/$defs/inputParameters" } }
+    },
+    "equalizerVariant": {
+      "type": "object", "additionalProperties": false, "required": ["equalizer"],
+      "properties": { "equalizer": { "$ref": "#/$defs/equalizerParameters" } }
     },
     "constantParameters": {
       "type": "object", "additionalProperties": false,
@@ -262,6 +267,13 @@
     "inputParameters": {
       "type": "object", "additionalProperties": false,
       "properties": { "host_api_name": { "type": "string" }, "device_name": { "type": "string" } }
+    },
+    "equalizerParameters": {
+      "type": "object", "additionalProperties": false,
+      "required": ["default_gains"],
+      "properties": {
+        "default_gains": { "type": "array", "items": { "$ref": "#/$defs/number" }, "minItems": 6, "maxItems": 6 }
+      }
     }
   }
 }

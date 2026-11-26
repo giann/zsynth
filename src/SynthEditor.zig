@@ -97,10 +97,10 @@ fn outputMetadata(
 ) DSP.Node.OutletMetadata {
     const state = dsp.nodes.items(.state)[node.idx];
     if (node.idx == dsp.output.idx) {
-        return DSP.node_metadata.get(.output).outputs[0];
+        return DSP.node_metadata.getPtrConst(.output).outputs[0];
     }
 
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     if (std.meta.activeTag(state) == .group)
         return dsp.groupOutletMetadata(node, .output, output_port);
     return metadata.outputs[output_port];
@@ -464,7 +464,7 @@ fn refreshSelectionUi(self: *Self) void {
 
     const graphic = &self.zsynth.display.impl.graphic;
     const state = self.dsp.nodes.items(.state)[selected_node.idx];
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(state));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(state));
     const output_count: usize = if (selected_node.idx == self.dsp.output.idx)
         1
     else
@@ -1015,7 +1015,7 @@ fn writeReflectedParameters(
     cell_array_indices[0] = null;
 
     const node_color = self.dsp.nodes.items(.color)[node.idx] orelse
-        DSP.node_metadata.get(std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx])).color;
+        DSP.node_metadata.getPtrConst(std.meta.activeTag(self.dsp.nodes.items(.state)[node.idx])).color;
     items[1] = .{
         .label = "Color:",
         .value = " ",
@@ -1864,6 +1864,7 @@ fn duplicateNodeState(self: *Self, source: VisualNode.Index) DSP.Node {
         .mixer => |value| DSP.Node.Mixer.create(source_name, value.parameters),
         .monophonic_sequencer => |value| DSP.Node.MonophonicSequencer.create(source_name, value.parameters),
         .multimode_filter => |value| DSP.Node.MultimodeFilter.create(source_name, value.parameters),
+        .equalizer => |value| DSP.Node.Equalizer.create(source_name, value.parameters),
         .multiply => DSP.Node.Multiply.create(source_name),
         .noise => |value| DSP.Node.Noise.create(source_name, value.parameters),
         .noop => unreachable,
@@ -2018,7 +2019,7 @@ fn duplicateNodeAt(
     position: Space.Position,
     link_parameters: bool,
 ) !VisualNode.Index {
-    const metadata = DSP.node_metadata.get(std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]));
+    const metadata = DSP.node_metadata.getPtrConst(std.meta.activeTag(self.dsp.nodes.items(.state)[source.idx]));
     if (!metadata.duplicatable)
         return error.InvalidVisualNodeLayout;
     const duplicate_index = try self.dsp.addNode(gpa, self.duplicateNodeState(source));
@@ -3571,7 +3572,7 @@ pub const CommandPalette = struct {
     fn nodeName(tag: DSP.Node.Tag) []const u8 {
         return switch (tag) {
             .noop, .output, .group, .group_input, .group_output => "",
-            else => DSP.node_metadata.get(tag).name,
+            else => DSP.node_metadata.getPtrConst(tag).name,
         };
     }
 
@@ -3610,6 +3611,7 @@ pub const CommandPalette = struct {
                     .default_resonance = 0,
                 },
             ),
+            .equalizer => DSP.Node.Equalizer.create(name, .{}),
             .bit_crusher => DSP.Node.BitCrusher.create(name, .{}),
             .compressor => DSP.Node.Compressor.create(name, .{}),
             .delay => DSP.Node.Delay.create(name, .{}),

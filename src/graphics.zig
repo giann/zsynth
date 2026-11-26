@@ -115,7 +115,7 @@ pub const Shader = enum {
         _ = try file.readPositionalAll(io, code, 0);
 
         // Create shader
-        const info = shader_infos.get(self);
+        const info = shader_infos.getPtrConst(self);
         const shader_info = sdl.GPUShaderCreateInfo{
             .code = @ptrCast(code.ptr),
             .code_size = code.len,
@@ -323,7 +323,7 @@ pub const Sampler = enum {
     LinearClamp,
 
     pub fn create(self: Sampler, device: *sdl.GPUDevice) !*sdl.GPUSampler {
-        return sdl.createGPUSampler(device, &samplers.get(self));
+        return sdl.createGPUSampler(device, samplers.getPtrConst(self));
     }
 };
 
