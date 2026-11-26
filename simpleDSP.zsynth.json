@@ -24,8 +24,8 @@
       "kind": "output",
       "name": "output",
       "color": null,
-      "x": 44,
-      "y": -10,
+      "x": 24,
+      "y": -9,
       "outlets_collapsed": false,
       "inputs": [
         {
@@ -137,7 +137,7 @@
           "decay": 0,
           "decay_curve": "exponential",
           "sustain": 1,
-          "release": 0.6000000238418579,
+          "release": 0.20000000298023224,
           "release_curve": "exponential"
         }
       }
@@ -482,7 +482,7 @@
       "kind": "mixer",
       "name": "mix",
       "color": 3758104063,
-      "x": 8,
+      "x": 4,
       "y": -11,
       "outlets_collapsed": true,
       "inputs": [
@@ -679,9 +679,9 @@
       "kind": "equalizer",
       "name": "eql",
       "color": null,
-      "x": 24,
-      "y": -15,
-      "outlets_collapsed": false,
+      "x": 14,
+      "y": -9,
+      "outlets_collapsed": true,
       "inputs": [
         {
           "input_port": 0,
@@ -710,6 +710,6 @@
       }
     }
   ],
-  "viewport_x": -57,
-  "viewport_y": -30
+  "viewport_x": -71,
+  "viewport_y": -25
 }

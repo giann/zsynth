@@ -1443,7 +1443,7 @@ fn writeNodeBody(
     gpa: std.mem.Allocator,
     display: *Display,
     node: VisualNode.Index,
-    background: Display.Color,
+    base_background: Display.Color,
 ) !void {
     if (self.isHiddenNode(node)) return;
     const footprint = self.nodeFootprint(node);
@@ -1475,6 +1475,10 @@ fn writeNodeBody(
     };
     const content_width = footprint.width - 2;
     const node_color = self.nodeColor(node);
+    const background = if (std.meta.eql(base_background, Display.Color.black))
+        Display.Color.ebony.interpolate(node_color, 0.05)
+    else
+        base_background;
 
     for (0..footprint.width) |dx| {
         for (0..footprint.height) |dy| {
