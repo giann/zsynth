@@ -2716,7 +2716,7 @@ pub const Node = struct {
 
             // Multiply any samples that did not fill a complete SIMD vector.
             while (offset < output.sample_count) : (offset += 1) {
-                var result: f32 = 0;
+                var result: f32 = 1;
 
                 for (0..input_count) |i|
                     result *= inputs[i].samples[offset];
